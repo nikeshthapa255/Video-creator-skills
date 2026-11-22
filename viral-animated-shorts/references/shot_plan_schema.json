@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ViralAnimatedShortShotPlan",
+  "type": "object",
+  "required": [
+    "slug",
+    "title",
+    "mode",
+    "aspect_ratio",
+    "target_duration_sec",
+    "audio_mode",
+    "style_bible",
+    "hook_gate",
+    "characters",
+    "shots",
+    "loop_bridge"
+  ],
+  "properties": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "title": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["2d_stickman_in_3d", "stylized_3d"]
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "enum": ["9:16"]
+    },
+    "target_duration_sec": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 60
+    },
+    "audio_mode": {
+      "type": "string",
+      "enum": ["native_omni", "tts_plus_bgm"]
+    },
+    "style_bible": {
+      "type": "string",
+      "description": "Verbatim rendering, lighting, camera, and palette block appended to every shot prompt."
+    },
+    "hook_gate": {
+      "type": "object",
+      "required": ["visual_pattern_interrupt", "frame0_motion", "verbal_open_loop", "tos_2_3_words", "passed"],
+      "properties": {
+        "visual_pattern_interrupt": { "type": "string" },
+        "frame0_motion": { "type": "string" },
+        "verbal_open_loop": { "type": "string" },
+        "tos_2_3_words": { "type": "string" },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "characters": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "visual_traits", "no_held_props_confirmed"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "visual_traits": { "type": "string" },
+          "sheet_2d_path": { "type": "string" },
+          "sheet_3d_path": { "type": "string" },
+          "no_held_props_confirmed": { "type": "boolean", "const": true }
+        }
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "shot_id",
+          "duration_sec",
+          "characters",
+          "spatial_layout",
+          "beats",
+          "camera",
+          "dialogue_or_vo",
+          "sfx_cue",
+          "negative_constraints"
+        ],
+        "properties": {
+          "shot_id": { "type": "string" },
+          "duration_sec": { "type": "integer", "minimum": 3, "maximum": 15 },
+          "characters": { "type": "array", "items": { "type": "string" } },
+          "spatial_layout": { "type": "string" },
+          "beats": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["timecode", "action"],
+              "properties": {
+                "timecode": { "type": "string" },
+                "action": { "type": "string" }
+              }
+            }
+          },
+          "camera": { "type": "string" },
+          "dialogue_or_vo": { "type": "string" },
+          "sfx_cue": { "type": "string" },
+          "negative_constraints": { "type": "string" },
+          "chain_from_prev_last_frame": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "loop_bridge": {
+      "type": "string",
+      "description": "Final spoken phrase that flows syntactically into Shot 1's opening line."
+    }
+  }
+}
