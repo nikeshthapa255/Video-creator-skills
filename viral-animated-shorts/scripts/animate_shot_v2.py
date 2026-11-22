@@ -90,10 +90,11 @@ def animate_single(
     out_path: Path,
     fps: int = 30,
     flash_in: bool = False,
+    exact_frames: int = 0,
 ) -> None:
     if not image_path.exists():
         raise FileNotFoundError(f"Keyframe not found: {image_path}")
-    frames = max(1, int(round(duration * fps)))
+    frames = exact_frames if exact_frames > 0 else max(1, int(round(duration * fps)))
     z_expr, x_expr, y_expr = build_zoompan_expr(motion, frames)
 
     filters = [
@@ -104,14 +105,16 @@ def animate_single(
         f"scale={OUT_W}:{OUT_H}:flags=lanczos",
     ]
     if flash_in:
+        filters.append("setpts=PTS-STARTPTS")
         filters.append("eq=brightness='if(lt(t,0.07),0.55*(1-t/0.07),0)':eval=frame")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Feed single still image (no -loop 1) so zoompan emits exactly `frames` frames with zero frame-1 reset jump
     cmd = [
         "ffmpeg", "-y", "-v", "error",
-        "-loop", "1", "-i", str(image_path),
+        "-i", str(image_path),
         "-vf", ",".join(filters),
-        "-t", f"{duration:.4f}",
+        "-frames:v", str(frames),
         "-r", str(fps),
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-an",
@@ -152,17 +155,33 @@ def main() -> int:
         shots = data.get("shots", data) if isinstance(data, dict) else data
         scenes_dir = Path(args.scenes_dir)
         out_dir = Path(args.out_dir)
+        cum_sec = 0.0
+        cum_frames = 0
         for idx, shot in enumerate(shots, start=1):
             sid = shot["shot_id"]
             dur = float(shot["duration_sec"])
+            # Track cumulative frames so cuts stay locked within +/-1 frame of VO with zero drift
+            cum_sec += dur
+            target_cum_frames = max(cum_frames + 1, int(round(cum_sec * args.fps)))
+            shot_frames = target_cum_frames - cum_frames
+            cum_frames = target_cum_frames
+
             motion = shot.get("motion_preset", "zoom_in")
             if motion not in PRESETS:
                 motion = "zoom_in"
             flash = bool(shot.get("flash_in", False))
             img = find_scene_image(scenes_dir, sid)
             out_mp4 = out_dir / f"{idx:02d}_{sid}.mp4"
-            animate_single(img, dur, motion, out_mp4, fps=args.fps, flash_in=flash)
-            print(f"Animated {sid} ({dur:.2f}s, {motion}, flash={flash}) -> {out_mp4}")
+            animate_single(
+                img,
+                dur,
+                motion,
+                out_mp4,
+                fps=args.fps,
+                flash_in=flash,
+                exact_frames=shot_frames,
+            )
+            print(f"Animated {sid} ({shot_frames}f / {shot_frames/args.fps:.2f}s, {motion}, flash={flash}) -> {out_mp4}")
         return 0
 
     if args.image and args.duration and args.out:

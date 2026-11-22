@@ -35,6 +35,7 @@ check_ass_overlaps() {
   local ass_file="$1"
   awk -F',' '
     function to_cs(ts,   a, b) {
+      gsub(/^[ \t\r]+|[ \t\r]+$/, "", ts);
       split(ts, a, ":");
       split(a[3], b, ".");
       return (a[1] * 3600 + a[2] * 60 + b[1]) * 100 + b[2];

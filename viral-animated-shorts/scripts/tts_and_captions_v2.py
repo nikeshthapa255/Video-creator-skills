@@ -46,6 +46,14 @@ def int_to_words(n: int) -> str:
     return str(n)
 
 
+NON_NOUN_FOLLOWERS = {
+    "a", "an", "and", "are", "as", "at", "because", "before", "but", "by",
+    "each", "every", "for", "from", "if", "in", "into", "is", "just", "less",
+    "more", "of", "on", "or", "over", "per", "so", "than", "that", "the",
+    "then", "to", "under", "was", "were", "when", "while", "with", "without",
+}
+
+
 def lint_narration_text(text: str) -> List[Dict[str, str]]:
     """Detect common neural TTS mispronunciations before synthesis."""
     issues: List[Dict[str, str]] = []
@@ -54,6 +62,8 @@ def lint_narration_text(text: str) -> List[Dict[str, str]]:
     for m in re.finditer(r"\$(\d+(?:,\d{3})*)\s+([A-Za-z][A-Za-z0-9-]*)", text):
         num = m.group(1).replace(",", "")
         noun = m.group(2)
+        if noun.lower() in NON_NOUN_FOLLOWERS:
+            continue
         issues.append({
             "code": "TTS_MISREAD",
             "match": m.group(0),
@@ -89,11 +99,12 @@ def lint_narration_text(text: str) -> List[Dict[str, str]]:
 
 
 def autofix_narration_text(text: str) -> str:
-    fixed = re.sub(
-        r"\$(\d+(?:,\d{3})*)\s+([A-Za-z][A-Za-z0-9-]*)",
-        lambda m: f"{m.group(1).replace(',', '')}-dollar {m.group(2)}",
-        text,
-    )
+    def _dollar_repl(m: re.Match) -> str:
+        if m.group(2).lower() in NON_NOUN_FOLLOWERS:
+            return m.group(0)
+        return f"{m.group(1).replace(',', '')}-dollar {m.group(2)}"
+
+    fixed = re.sub(r"\$(\d+(?:,\d{3})*)\s+([A-Za-z][A-Za-z0-9-]*)", _dollar_repl, text)
     fixed = re.sub(
         r"\b(no)\s+(\d{1,3})\b",
         lambda m: f"{m.group(1)} {int_to_words(int(m.group(2)))}",
@@ -340,17 +351,38 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
             mp3_path = tmp_dir / f"{sid}.mp3"
             wav_path = tmp_dir / f"{sid}.wav"
 
-            words = asyncio.run(synth_shot_edge_tts(text, voice, args.rate, args.pitch, mp3_path))
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-v", "error",
-                    "-i", str(mp3_path),
-                    "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le",
-                    str(wav_path),
-                ],
-                check=True,
-            )
-            dur = probe_audio_duration(wav_path)
+            if not text:
+                silent_dur = max(0.5, float(shot.get("duration_sec", 2.0)))
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-v", "error",
+                        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-t", f"{silent_dur:.3f}", "-c:a", "pcm_s16le", str(wav_path),
+                    ],
+                    check=True,
+                )
+                words = []
+                dur = silent_dur
+            else:
+                words = asyncio.run(synth_shot_edge_tts(text, voice, args.rate, args.pitch, mp3_path))
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-v", "error",
+                        "-i", str(mp3_path),
+                        "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le",
+                        str(wav_path),
+                    ],
+                    check=True,
+                )
+                dur = probe_audio_duration(wav_path)
+                if not words:
+                    # Fallback if edge-tts emits no WordBoundary events for a very short interjection
+                    tokens = text.split()
+                    step = dur / max(1, len(tokens))
+                    words = [
+                        {"text": tok, "start_sec": round(i * step, 4), "end_sec": round((i + 1) * step, 4)}
+                        for i, tok in enumerate(tokens)
+                    ]
             shot_start = cursor
             shot_end = cursor + dur
 

@@ -1,6 +1,15 @@
 ---
 name: viral-animated-shorts
-description: End-to-end production pipeline for viral 2D stickman-in-3D and stylized 3D animated Shorts (9:16, 30-55s) with two production modes: Mode A (Gemini Omni 1.2 Flash generative video) and Mode B (zero-API-key keyframe + 2x-supersampled FFmpeg motion + edge-tts + procedural SFX/BGM). Includes 3-panel turnaround character sheets, audio-first timing, forensic multi-frame + audio QA, dual-anchor seamless loops, and deterministic 3-stem FFmpeg assembly. Use when the user wants to plan, storyboard, generate character sheets, animate, QA, upgrade from 2D to 3D, batch-produce, or assemble animated YouTube Shorts, Reels, or TikToks.
+description: >-
+  End-to-end production pipeline for viral 2D stickman-in-3D and stylized 3D
+  animated Shorts (9:16, 30-55s) with two production modes: Mode A (Gemini Omni
+  1.2 Flash generative video) and Mode B (zero-API-key keyframe + 2x-supersampled
+  FFmpeg motion + edge-tts + procedural SFX/BGM). Includes 3-panel turnaround
+  character sheets, audio-first timing, forensic multi-frame + audio QA,
+  dual-anchor seamless loops, and deterministic 3-stem FFmpeg assembly. Use when
+  the user wants to plan, storyboard, generate character sheets, animate, QA,
+  upgrade from 2D to 3D, batch-produce, or assemble animated YouTube Shorts,
+  Reels, or TikToks.
 ---
 
 # Viral Animated Shorts Pipeline (v2)

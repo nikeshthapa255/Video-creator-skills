@@ -195,6 +195,8 @@ def main() -> int:
     parser.add_argument("--bpm", type=int, default=0, help="Override mood default BPM.")
     parser.add_argument("--out", required=True, help="Output WAV path.")
     args = parser.parse_args()
+    if args.duration <= 0:
+        parser.error("--duration must be > 0")
 
     bpm = args.bpm if args.bpm > 0 else MOOD_CONFIGS[args.mood]["bpm"]
     left, right = synthesize_bgm(args.mood, args.duration, bpm)

@@ -19,6 +19,7 @@ import random
 import struct
 import sys
 import wave
+import zlib
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -298,7 +299,7 @@ def main() -> int:
                 print(f"Warning: skipping unknown SFX cue '{name}' at {cue['time_sec']:.2f}s", file=sys.stderr)
                 continue
             if name not in cache:
-                cache[name] = GENERATORS[name](random.Random(hash(name) & 0xFFFFFFFF))
+                cache[name] = GENERATORS[name](random.Random(zlib.crc32(name.encode("utf-8"))))
             clip = cache[name]
             gain = db_to_lin(cue["gain_db"])
             start_i = int(cue["time_sec"] * SR)

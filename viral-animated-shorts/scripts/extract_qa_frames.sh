@@ -19,6 +19,15 @@ CLIP="$1"
 OUT_DIR="$2"
 PREV_CLIP="${3:-}"
 
+if [[ ! -f "$CLIP" ]]; then
+  echo "Error: clip not found: $CLIP" >&2
+  exit 1
+fi
+if [[ -n "$PREV_CLIP" && ! -f "$PREV_CLIP" ]]; then
+  echo "Error: previous clip not found: $PREV_CLIP" >&2
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 
 get_video_duration() {
