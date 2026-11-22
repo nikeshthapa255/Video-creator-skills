@@ -5,12 +5,14 @@
   "required": [
     "slug",
     "title",
+    "production_mode",
     "mode",
     "aspect_ratio",
     "target_duration_sec",
     "audio_mode",
     "style_bible",
     "hook_gate",
+    "fun_pacing_gate",
     "characters",
     "shots",
     "loop_bridge"
@@ -23,6 +25,11 @@
     "title": {
       "type": "string"
     },
+    "production_mode": {
+      "type": "string",
+      "enum": ["omni_video", "keyframe_motion"],
+      "description": "omni_video = Gemini Omni 1.2 Flash video generation; keyframe_motion = zero-API-key 9:16 keyframes + 2x-supersampled FFmpeg motion."
+    },
     "mode": {
       "type": "string",
       "enum": ["2d_stickman_in_3d", "stylized_3d"]
@@ -32,17 +39,30 @@
       "enum": ["9:16"]
     },
     "target_duration_sec": {
-      "type": "integer",
+      "type": "number",
       "minimum": 10,
       "maximum": 60
     },
     "audio_mode": {
       "type": "string",
-      "enum": ["native_omni", "tts_plus_bgm"]
+      "enum": ["tts_plus_bgm", "native_omni"]
+    },
+    "voice": {
+      "type": "string",
+      "description": "Neural TTS voice (e.g., en-US-AvaNeural, en-US-EmmaNeural, en-US-JennyNeural)."
+    },
+    "bgm_mood": {
+      "type": "string",
+      "enum": ["miami_pop", "retro_drive", "tech_pulse", "comedy_quirk", "none"]
+    },
+    "bgm_bpm": {
+      "type": "integer",
+      "minimum": 80,
+      "maximum": 160
     },
     "style_bible": {
       "type": "string",
-      "description": "Verbatim rendering, lighting, camera, and palette block appended to every shot prompt."
+      "description": "Verbatim rendering, lighting, camera, and palette block appended to every shot prompt. Must forbid signage using 'unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage' (never 'blank signs')."
     },
     "hook_gate": {
       "type": "object",
@@ -53,6 +73,26 @@
         "verbal_open_loop": { "type": "string" },
         "tos_2_3_words": { "type": "string" },
         "passed": { "type": "boolean" }
+      }
+    },
+    "fun_pacing_gate": {
+      "type": "object",
+      "required": ["word_count", "avg_shot_length_sec", "sfx_cue_count", "visual_gag_every_2_3_shots", "tts_lint_passed", "passed"],
+      "properties": {
+        "word_count": { "type": "integer", "minimum": 30, "maximum": 160 },
+        "avg_shot_length_sec": { "type": "number", "minimum": 1.0, "maximum": 4.5 },
+        "sfx_cue_count": { "type": "integer", "minimum": 0 },
+        "visual_gag_every_2_3_shots": { "type": "boolean" },
+        "tts_lint_passed": { "type": "boolean" },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "series_metadata": {
+      "type": "object",
+      "properties": {
+        "episode_id": { "type": "string" },
+        "master_sheet_path": { "type": "string" },
+        "production_log_path": { "type": "string" }
       }
     },
     "characters": {
@@ -84,12 +124,12 @@
           "beats",
           "camera",
           "dialogue_or_vo",
-          "sfx_cue",
+          "sfx_type",
           "negative_constraints"
         ],
         "properties": {
           "shot_id": { "type": "string" },
-          "duration_sec": { "type": "integer", "minimum": 3, "maximum": 15 },
+          "duration_sec": { "type": "number", "minimum": 1.5, "maximum": 15 },
           "characters": { "type": "array", "items": { "type": "string" } },
           "spatial_layout": { "type": "string" },
           "beats": {
@@ -105,10 +145,27 @@
             }
           },
           "camera": { "type": "string" },
+          "motion_preset": {
+            "type": "string",
+            "enum": ["whip_zoom", "bounce_pop", "shake_zoom", "zoom_in", "zoom_out", "pan_left", "pan_right", "static_drift"],
+            "default": "zoom_in"
+          },
+          "flash_in": { "type": "boolean", "default": false },
           "dialogue_or_vo": { "type": "string" },
+          "sfx_type": {
+            "type": "string",
+            "enum": ["record_scratch", "vine_boom", "siren_chirp", "bonk_boing", "cash_ching", "ding_levelup", "laser_zap", "whoosh", "pop", "none"]
+          },
           "sfx_cue": { "type": "string" },
+          "sfx_offset_sec": { "type": "number", "default": 0.0 },
+          "sfx_gain_db": { "type": "number", "default": -3.0 },
           "negative_constraints": { "type": "string" },
-          "chain_from_prev_last_frame": { "type": "boolean", "default": false }
+          "chain_from_prev_last_frame": { "type": "boolean", "default": false },
+          "dual_anchor_loop": {
+            "type": "boolean",
+            "default": false,
+            "description": "True on the final shot to pass both the character sheet and shot_01 keyframe so the ending snaps seamlessly into Frame 0."
+          }
         }
       }
     },

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Pure-Python procedural BGM generator for Shorts series mood/BPM rotation.
+
+Outputs a 48 kHz 16-bit stereo WAV sized to the requested duration with smooth fades.
+Supported moods:
+  miami_pop    (default 122 BPM) — upbeat synth-pop chords, bouncy bass, crisp hats
+  retro_drive  (default 112 BPM) — synthwave arpeggio, punchy octave bass, snare pulse
+  tech_pulse   (default 128 BPM) — plucky minimal electronic arp, tight sub pulse
+  comedy_quirk (default 116 BPM) — playful staccato marimba plucks, bouncy bass
+
+Example:
+  python3 make_bgm.py --mood miami_pop --duration 40 --out audio/bgm.wav
+"""
+
+import argparse
+import math
+import random
+import struct
+import wave
+from pathlib import Path
+
+SR = 48000
+
+MOOD_CONFIGS = {
+    "miami_pop": {
+        "bpm": 122,
+        # Fmaj7 -> G6 -> Em7 -> Am7 (MIDI notes)
+        "chords": [(65, 69, 72, 76), (67, 71, 74, 76), (64, 67, 71, 74), (69, 72, 76, 79)],
+        "bass": [41, 43, 40, 45],
+        "hat_gain": 0.12,
+        "kick_gain": 0.42,
+        "snare_gain": 0.20,
+        "arp_gain": 0.16,
+        "pad_gain": 0.14,
+    },
+    "retro_drive": {
+        "bpm": 112,
+        # Am -> F -> C -> G
+        "chords": [(57, 60, 64, 69), (53, 57, 60, 65), (60, 64, 67, 72), (55, 59, 62, 67)],
+        "bass": [45, 41, 48, 43],
+        "hat_gain": 0.10,
+        "kick_gain": 0.46,
+        "snare_gain": 0.28,
+        "arp_gain": 0.22,
+        "pad_gain": 0.16,
+    },
+    "tech_pulse": {
+        "bpm": 128,
+        # Dm -> Bb -> C -> Am
+        "chords": [(62, 65, 69, 72), (58, 62, 65, 69), (60, 64, 67, 72), (57, 60, 64, 69)],
+        "bass": [38, 34, 36, 45],
+        "hat_gain": 0.14,
+        "kick_gain": 0.40,
+        "snare_gain": 0.14,
+        "arp_gain": 0.24,
+        "pad_gain": 0.10,
+    },
+    "comedy_quirk": {
+        "bpm": 116,
+        # C -> A7 -> Dm -> G7
+        "chords": [(60, 64, 67, 72), (57, 61, 64, 67), (62, 65, 69, 74), (55, 59, 62, 65)],
+        "bass": [48, 45, 50, 43],
+        "hat_gain": 0.08,
+        "kick_gain": 0.34,
+        "snare_gain": 0.16,
+        "arp_gain": 0.28,
+        "pad_gain": 0.06,
+    },
+}
+
+
+def midi_to_hz(note: int) -> float:
+    return 440.0 * (2.0 ** ((note - 69) / 12.0))
+
+
+def synthesize_bgm(mood: str, duration: float, bpm: int) -> tuple:
+    cfg = MOOD_CONFIGS[mood]
+    n_samples = int(math.ceil(duration * SR))
+    left = [0.0] * n_samples
+    right = [0.0] * n_samples
+
+    beat_sec = 60.0 / bpm
+    step_sec = beat_sec / 4.0  # 16th-note grid
+    rng = random.Random(101 + bpm)
+
+    n_steps = int(math.ceil(duration / step_sec))
+    chords = cfg["chords"]
+    bass_notes = cfg["bass"]
+
+    for step in range(n_steps):
+        bar = (step // 16) % len(chords)
+        sub = step % 16
+        t0 = step * step_sec
+        start_i = int(t0 * SR)
+        if start_i >= n_samples:
+            break
+
+        # 1. Kick drum (4-on-the-floor or syncopated)
+        if sub in (0, 4, 8, 12) or (mood == "comedy_quirk" and sub == 10):
+            k_len = min(int(0.16 * SR), n_samples - start_i)
+            phase = 0.0
+            for j in range(k_len):
+                t = j / SR
+                f = 46.0 + 115.0 * math.exp(-t * 36.0)
+                phase += 2.0 * math.pi * f / SR
+                v = math.sin(phase) * math.exp(-t * 16.0) * cfg["kick_gain"]
+                left[start_i + j] += v
+                right[start_i + j] += v
+
+        # 2. Snare / clap on beats 2 and 4
+        if sub in (4, 12):
+            s_len = min(int(0.11 * SR), n_samples - start_i)
+            for j in range(s_len):
+                t = j / SR
+                noise = rng.uniform(-1.0, 1.0)
+                body = math.sin(2.0 * math.pi * 190.0 * t) * 0.45
+                v = (noise * 0.6 + body) * math.exp(-t * 28.0) * cfg["snare_gain"]
+                left[start_i + j] += v * 0.95
+                right[start_i + j] += v * 1.05
+
+        # 3. Crisp closed hi-hat on 8th/16th offbeats
+        if sub % 2 == 1 or (mood == "tech_pulse" and sub % 2 == 0):
+            h_len = min(int(0.035 * SR), n_samples - start_i)
+            prev = 0.0
+            for j in range(h_len):
+                t = j / SR
+                raw = rng.uniform(-1.0, 1.0)
+                hp = raw - 0.85 * prev
+                prev = raw
+                accent = 1.0 if sub % 4 == 2 else 0.55
+                v = hp * math.exp(-t * 85.0) * cfg["hat_gain"] * accent
+                left[start_i + j] += v * 1.1
+                right[start_i + j] += v * 0.85
+
+        # 4. Octave bass pulse (8th notes)
+        if sub % 2 == 0:
+            b_note = bass_notes[bar] + (12 if (sub % 4 == 2 and mood != "comedy_quirk") else 0)
+            bf = midi_to_hz(b_note)
+            b_len = min(int(step_sec * 1.85 * SR), n_samples - start_i)
+            for j in range(b_len):
+                t = j / SR
+                env = min(1.0, t / 0.006) * math.exp(-t * 7.5)
+                v = (math.sin(2.0 * math.pi * bf * t) + 0.32 * math.sin(4.0 * math.pi * bf * t)) * env * 0.28
+                left[start_i + j] += v
+                right[start_i + j] += v
+
+        # 5. Melodic pluck / arpeggio
+        chord = chords[bar]
+        if (mood == "comedy_quirk" and sub in (0, 3, 6, 8, 11, 14)) or (mood != "comedy_quirk" and sub % 2 == 0):
+            a_note = chord[(sub // 2) % len(chord)]
+            af = midi_to_hz(a_note)
+            a_len = min(int(step_sec * 1.9 * SR), n_samples - start_i)
+            pan = 0.35 if (sub // 2) % 2 == 0 else 0.65
+            for j in range(a_len):
+                t = j / SR
+                decay = 14.0 if mood == "comedy_quirk" else 8.5
+                env = min(1.0, t / 0.004) * math.exp(-t * decay)
+                v = (math.sin(2.0 * math.pi * af * t) + 0.25 * math.sin(6.0 * math.pi * af * t)) * env * cfg["arp_gain"]
+                left[start_i + j] += v * (1.0 - pan + 0.2)
+                right[start_i + j] += v * (pan + 0.2)
+
+        # 6. Warm stereo pad on bar downbeat
+        if sub == 0 and cfg["pad_gain"] > 0:
+            p_len = min(int(step_sec * 16.0 * SR), n_samples - start_i)
+            freqs = [midi_to_hz(m) for m in chord[:3]]
+            for j in range(p_len):
+                t = j / SR
+                p_dur = p_len / SR
+                env = min(1.0, t / 0.12) * min(1.0, max(0.0, (p_dur - t) / 0.18))
+                sig_l = sum(math.sin(2.0 * math.pi * f * 1.001 * t) for f in freqs) / 3.0
+                sig_r = sum(math.sin(2.0 * math.pi * f * 0.999 * t) for f in freqs) / 3.0
+                left[start_i + j] += sig_l * env * cfg["pad_gain"]
+                right[start_i + j] += sig_r * env * cfg["pad_gain"]
+
+    # Smooth start/end fades + gentle headroom scaling
+    fade_in = min(int(0.05 * SR), n_samples)
+    fade_out = min(int(0.25 * SR), n_samples)
+    for i in range(fade_in):
+        g = i / fade_in
+        left[i] *= g
+        right[i] *= g
+    for i in range(fade_out):
+        g = i / fade_out
+        idx = n_samples - 1 - i
+        left[idx] *= g
+        right[idx] *= g
+
+    return left, right
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Procedural Shorts BGM generator (48 kHz stereo WAV).")
+    parser.add_argument("--mood", choices=sorted(MOOD_CONFIGS), default="miami_pop")
+    parser.add_argument("--duration", type=float, required=True, help="Target duration in seconds.")
+    parser.add_argument("--bpm", type=int, default=0, help="Override mood default BPM.")
+    parser.add_argument("--out", required=True, help="Output WAV path.")
+    args = parser.parse_args()
+
+    bpm = args.bpm if args.bpm > 0 else MOOD_CONFIGS[args.mood]["bpm"]
+    left, right = synthesize_bgm(args.mood, args.duration, bpm)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(SR)
+        buf = bytearray()
+        for l_val, r_val in zip(left, right):
+            lv = int(max(-1.0, min(1.0, math.tanh(l_val * 0.85))) * 32767.0)
+            rv = int(max(-1.0, min(1.0, math.tanh(r_val * 0.85))) * 32767.0)
+            buf.extend(struct.pack("<hh", lv, rv))
+        wf.writeframes(bytes(buf))
+
+    print(f"Generated {args.mood} BGM ({bpm} BPM, {args.duration:.2f}s) -> {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
