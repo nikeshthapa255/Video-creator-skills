@@ -53,12 +53,35 @@
     },
     "bgm_mood": {
       "type": "string",
-      "enum": ["miami_pop", "retro_drive", "tech_pulse", "comedy_quirk", "none"]
+      "enum": ["dramatic_news", "cinematic_tension", "miami_pop", "retro_drive", "tech_pulse", "comedy_quirk", "none"]
     },
     "bgm_bpm": {
       "type": "integer",
       "minimum": 80,
       "maximum": 160
+    },
+    "bgm_source": {
+      "type": "string",
+      "enum": ["retrieved_track", "procedural"],
+      "description": "retrieved_track = dramatic instrumental via retrieve_music.py; procedural = synthesized stem via make_bgm.py."
+    },
+    "bgm_query": {
+      "type": "string",
+      "description": "Optional search query or style hint used by retrieve_music.py when bgm_source is retrieved_track."
+    },
+    "caption_style": {
+      "type": "string",
+      "enum": ["kinetic_keyword", "karaoke_chunk"],
+      "description": "kinetic_keyword = dynamic word-by-word pop with highlight_keywords emphasized; karaoke_chunk = standard bounce-pop phrase chunks."
+    },
+    "highlight_keywords": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional top-level high-impact keywords, names, or numbers to emphasize in kinetic captions."
+    },
+    "character_references_path": {
+      "type": "string",
+      "description": "Optional path to Stage 0 character_references.json locking verified web/user portraits, visual traits, and official mascot specs."
     },
     "style_bible": {
       "type": "string",
@@ -84,6 +107,13 @@
         "sfx_cue_count": { "type": "integer", "minimum": 0 },
         "visual_gag_every_2_3_shots": { "type": "boolean" },
         "tts_lint_passed": { "type": "boolean" },
+        "max_caption_chars": {
+          "type": "integer",
+          "minimum": 12,
+          "maximum": 36,
+          "default": 24,
+          "description": "Maximum characters per caption chunk/line to prevent horizontal clipping on 1080px vertical frames (target <= 24)."
+        },
         "passed": { "type": "boolean" }
       }
     },
@@ -107,6 +137,14 @@
           "visual_traits": { "type": "string" },
           "sheet_2d_path": { "type": "string" },
           "sheet_3d_path": { "type": "string" },
+          "reference_image_path": {
+            "type": "string",
+            "description": "Optional path to Stage 0 verified portrait or official mascot reference image."
+          },
+          "likeness_verified": {
+            "type": "boolean",
+            "description": "True once the character's visual traits and turnaround sheet have been visually checked against Stage 0 references."
+          },
           "no_held_props_confirmed": { "type": "boolean", "const": true }
         }
       }
@@ -152,6 +190,11 @@
           },
           "flash_in": { "type": "boolean", "default": false },
           "dialogue_or_vo": { "type": "string" },
+          "highlight_keywords": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional per-shot high-impact keywords or numbers to pop/highlight in kinetic captions."
+          },
           "sfx_type": {
             "type": "string",
             "enum": ["record_scratch", "vine_boom", "siren_chirp", "bonk_boing", "cash_ching", "ding_levelup", "laser_zap", "whoosh", "pop", "none"]

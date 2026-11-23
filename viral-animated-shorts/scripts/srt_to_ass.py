@@ -7,90 +7,46 @@ use this script when converting Whisper/Gemini SRT transcripts.
 Features:
   - Auto-detects bold sans font via fc-match (Arial Black -> DejaVu Sans -> Liberation Sans)
     instead of hardcoding a font missing on Ubuntu.
-  - Phrase-entry bounce pop: {\\fscx109\\fscy109\\t(0,75,\\fscx100\\fscy100)}.
+  - Kinetic word-by-word reveals with automatic or explicit keyword highlighting
+    (--keywords, --keyword-color) and horizontal safe-width chunking (--max-chars 24).
   - Strict clamping to next_event_start - 0.01s (1 cs) + overlap assertion to eliminate
     CAPTION_OVERLAP stacking.
   - Positioned above the bottom 35% Shorts UI danger zone (MarginV=680 on 1080x1920).
 
 Usage:
-  python3 srt_to_ass.py <input.srt> <output.ass> [--font "DejaVu Sans"]
+  python3 srt_to_ass.py <input.srt> <output.ass> [--font "DejaVu Sans"] [--max-chars 24] [--keywords "OpenAI,leaked"]
 """
 
 import argparse
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-def detect_bold_font(preferred: str = "") -> str:
-    if preferred:
-        return preferred
-    candidates = ["Arial Black", "DejaVu Sans", "Liberation Sans", "Helvetica Neue"]
-    if shutil.which("fc-match"):
-        for cand in candidates:
-            try:
-                res = subprocess.run(
-                    ["fc-match", "-f", "%{family}", f"{cand}:style=Bold"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                matched = res.stdout.strip().split(",")[0].strip()
-                if matched and matched.lower() == cand.lower():
-                    return matched
-            except OSError:
-                break
-        try:
-            res = subprocess.run(
-                ["fc-match", "-f", "%{family}", "sans-serif:style=Bold"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            matched = res.stdout.strip().split(",")[0].strip()
-            if matched:
-                return matched
-        except OSError:
-            pass
-    return "DejaVu Sans"
-
-
-def build_ass_header(font_name: str) -> str:
-    return f"""[Script Info]
-Title: Viral Animated Short Captions
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortsHook,{font_name},74,&H00FFFFFF,&H0000FFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,6,2,2,80,80,680,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+from tts_and_captions_v2 import (  # noqa: E402
+    ACTIVE_WORD_COLOR,
+    DEFAULT_KEYWORD_COLOR,
+    NEUTRAL_WORD_COLOR,
+    assert_no_overlaps,
+    build_ass_header,
+    chunk_words,
+    cs_to_ass_time,
+    derive_subtle_tint,
+    detect_bold_font,
+    mark_keywords,
+    normalize_ass_color,
+    parse_keyword_list,
+)
 
 
 def srt_time_to_cs(ts: str) -> int:
     h, m, rest = ts.strip().split(":")
     s, ms = rest.replace(".", ",").split(",")
     return ((int(h) * 3600 + int(m) * 60 + int(s)) * 100) + round(int(ms) / 10)
-
-
-def cs_to_ass_time(cs: int) -> str:
-    cs = max(0, cs)
-    h = cs // 360000
-    cs %= 360000
-    m = cs // 6000
-    cs %= 6000
-    s = cs // 100
-    c = cs % 100
-    return f"{h}:{m:02d}:{s:02d}.{c:02d}"
 
 
 def parse_srt(content: str) -> List[Tuple[int, int, str]]:
@@ -112,8 +68,15 @@ def parse_srt(content: str) -> List[Tuple[int, int, str]]:
     return entries
 
 
-def build_word_events(entries: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
-    raw: List[Tuple[int, int, str]] = []
+def build_word_events(
+    entries: List[Tuple[int, int, str]],
+    caption_style: str = "kinetic_keyword",
+    keywords: Optional[Sequence[str]] = None,
+    keyword_color: str = DEFAULT_KEYWORD_COLOR,
+    max_chars: int = 24,
+) -> List[Tuple[int, int, str]]:
+    all_words: List[Dict] = []
+
     for entry_idx, (start_cs, end_cs, text) in enumerate(entries):
         # Clamp cue end strictly to next cue start - 1cs (0.01s)
         if entry_idx + 1 < len(entries):
@@ -123,30 +86,82 @@ def build_word_events(entries: List[Tuple[int, int, str]]) -> List[Tuple[int, in
             elif next_cue_start > start_cs:
                 end_cs = next_cue_start
 
-        words = text.split()
-        if not words:
+        tokens = text.split()
+        if not tokens:
             continue
-        chunks = [words[i : i + 3] for i in range(0, len(words), 3)]
-        n = len(words)
-        total_dur = max(end_cs - start_cs, n)
+        total_dur = max(end_cs - start_cs, len(tokens))
+        weights = [max(2, len(tok)) for tok in tokens]
+        total_w = sum(weights)
+        acc = 0
 
-        word_idx = 0
+        for idx, tok in enumerate(tokens):
+            w_start = start_cs + (acc * total_dur) // total_w
+            acc += weights[idx]
+            w_end = end_cs if idx == len(tokens) - 1 else start_cs + (acc * total_dur) // total_w
+            if w_end <= w_start:
+                w_end = w_start + 1
+            all_words.append({
+                "text": tok,
+                "start_sec": w_start / 100.0,
+                "end_sec": w_end / 100.0,
+                "cue_idx": entry_idx,
+            })
+
+    kw_color = normalize_ass_color(keyword_color)
+    subtle_kw_color = derive_subtle_tint(kw_color)
+    annotated = (
+        mark_keywords(all_words, global_keywords=keywords)
+        if caption_style == "kinetic_keyword"
+        else all_words
+    )
+
+    # Group back by cue_idx so chunks never bridge across separate SRT cues/pauses
+    cues_grouped: Dict[int, List[Dict]] = {}
+    for w in annotated:
+        cues_grouped.setdefault(int(w["cue_idx"]), []).append(w)
+
+    raw: List[Tuple[int, int, str]] = []
+    for cue_idx in sorted(cues_grouped):
+        chunks = chunk_words(cues_grouped[cue_idx], max_words=3, max_chars=max_chars)
         for chunk in chunks:
-            for active_idx in range(len(chunk)):
-                w_start = start_cs + (word_idx * total_dur) // n
-                w_end = end_cs if word_idx == n - 1 else start_cs + ((word_idx + 1) * total_dur) // n
-                if w_end <= w_start:
-                    w_end = w_start + 1
-                styled = []
-                for idx, word in enumerate(chunk):
-                    clean = word.replace("{", "").replace("}", "")
-                    if idx == active_idx:
-                        styled.append(r"{\c&H00FFFF&}" + clean + r"{\c&H00FFFFFF&}")
-                    else:
-                        styled.append(clean)
-                prefix = r"{\fscx109\fscy109\t(0,75,\fscx100\fscy100)}" if active_idx == 0 else ""
-                raw.append((w_start, w_end, prefix + " ".join(styled)))
-                word_idx += 1
+            for active_idx, active_word in enumerate(chunk):
+                w_start = max(0, int(round(active_word["start_sec"] * 100)))
+                w_end = max(w_start + 1, int(round(active_word["end_sec"] * 100)))
+                styled: List[str] = []
+
+                if caption_style == "kinetic_keyword":
+                    line_prefix = r"{\t(0,70,\fscx114\fscy114)\t(70,150,\fscx100\fscy100)}"
+                    for idx, w in enumerate(chunk):
+                        clean = w["text"].replace("{", "").replace("}", "")
+                        is_kw = bool(w.get("is_keyword", False))
+                        if idx == active_idx:
+                            if is_kw:
+                                styled.append(
+                                    rf"{{\c{kw_color}\t(0,70,\fscx120\fscy120)\t(70,150,\fscx104\fscy104)}}"
+                                    + clean
+                                    + rf"{{\c{NEUTRAL_WORD_COLOR}\fscx100\fscy100}}"
+                                )
+                            else:
+                                styled.append(
+                                    rf"{{\c{ACTIVE_WORD_COLOR}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}"
+                                )
+                        else:
+                            if is_kw:
+                                styled.append(
+                                    rf"{{\c{subtle_kw_color}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}"
+                                )
+                            else:
+                                styled.append(clean)
+                    raw.append((w_start, w_end, line_prefix + " ".join(styled)))
+                else:
+                    for idx, w in enumerate(chunk):
+                        clean = w["text"].replace("{", "").replace("}", "")
+                        if idx == active_idx:
+                            styled.append(rf"{{\c{ACTIVE_WORD_COLOR}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}")
+                        else:
+                            styled.append(clean)
+                    prefix = r"{\fscx109\fscy109\t(0,75,\fscx100\fscy100)}" if active_idx == 0 else ""
+                    raw.append((w_start, w_end, prefix + " ".join(styled)))
 
     # Global monotonic pass: guarantee zero overlap across every adjacent Dialogue line
     clamped: List[Tuple[int, int, str]] = []
@@ -173,30 +188,49 @@ def build_word_events(entries: List[Tuple[int, int, str]]) -> List[Tuple[int, in
     return clamped
 
 
-def assert_no_overlaps(events: List[Tuple[int, int, str]]) -> None:
-    for i in range(1, len(events)):
-        prev_s, prev_e, _ = events[i - 1]
-        cur_s, cur_e, _ = events[i]
-        if cur_s < prev_e:
-            raise AssertionError(
-                f"CAPTION_OVERLAP at event {i}: prev [{prev_s}, {prev_e}] overlaps cur [{cur_s}, {cur_e}]"
-            )
-        if cur_e < cur_s:
-            raise AssertionError(f"CAPTION_ORDER at event {i}: end {cur_e} < start {cur_s}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Convert SRT into zero-overlap Shorts safe-zone ASS captions.")
     parser.add_argument("input_srt", help="Input .srt path")
     parser.add_argument("output_ass", help="Output .ass path")
     parser.add_argument("--font", default="", help="Override bold font family (auto-detected via fc-match).")
+    parser.add_argument(
+        "--caption-style",
+        choices=("kinetic_keyword", "karaoke_chunk"),
+        default="kinetic_keyword",
+        help="Caption animation style (default: kinetic_keyword).",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=24,
+        help="Maximum visible characters per caption line for 1080px horizontal safety (default: 24).",
+    )
+    parser.add_argument(
+        "--keywords",
+        default="",
+        help="Optional comma-separated keywords to highlight (overrides auto-detection).",
+    )
+    parser.add_argument(
+        "--keyword-color",
+        default=DEFAULT_KEYWORD_COLOR,
+        help="ASS BGR highlight color for keywords (default: &H008CFF& electric orange-gold).",
+    )
     args = parser.parse_args()
+
+    if args.max_chars < 1:
+        parser.error("--max-chars must be >= 1")
 
     src = Path(args.input_srt)
     dst = Path(args.output_ass)
     font_name = detect_bold_font(args.font)
     entries = parse_srt(src.read_text(encoding="utf-8"))
-    events = build_word_events(entries)
+    events = build_word_events(
+        entries,
+        caption_style=args.caption_style,
+        keywords=parse_keyword_list(args.keywords),
+        keyword_color=args.keyword_color,
+        max_chars=args.max_chars,
+    )
 
     lines = [build_ass_header(font_name).rstrip()]
     for start_cs, end_cs, text in events:
@@ -204,7 +238,10 @@ def main() -> int:
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Wrote {len(events)} zero-overlap caption events (font='{font_name}') to {dst}")
+    print(
+        f"Wrote {len(events)} zero-overlap caption events "
+        f"(font='{font_name}', style={args.caption_style}, max_chars={args.max_chars}) to {dst}"
+    )
     return 0
 
 
