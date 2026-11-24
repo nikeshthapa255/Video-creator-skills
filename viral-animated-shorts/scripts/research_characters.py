@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 0 Pre-Production Character, Public Figure & Official Mascot Research Engine.
+"""Verify real people and official mascots before Stage 2 turnaround sheets or Stage 3 keyframes.
 
-Project-agnostic, pure Python stdlib tool that verifies real-world people and
-official product mascots BEFORE Stage 2 character turnaround sheets or Stage 3
-keyframes are generated — preventing off-model characters and likeness drift.
+Uses only the Python standard library to check a local character registry, user photos,
+or Wikipedia so downstream stages stay on-model.
 
 Capabilities:
   1. Looks up each entity (from --entities, --story-json, or --user-ref) in a
@@ -377,15 +376,15 @@ def query_wikipedia_entity(
 
     if local_ref_path:
         visual_traits = (
-            f"Official mascot design of {canonical_name} ({role_text}), strictly matching exact silhouette, proportions, and colors in the verified reference image"
+            f"Official mascot design of {canonical_name} ({role_text}), matching exact silhouette, proportions, and colors in the verified reference image"
             if is_mascot
-            else f"Stylized 3D/animated likeness of {canonical_name} ({role_text}), strictly matching facial features, hairstyle, eyewear, and signature attire in the verified reference portrait"
+            else f"Stylized 3D/animated likeness of {canonical_name} ({role_text}), matching facial features, hairstyle, eyewear, and signature attire in the verified reference portrait"
         )
     else:
         visual_traits = (
-            f"Official mascot design of {canonical_name} ({role_text}) — obtain and visually inspect an official reference image before Stage 2"
+            f"Official mascot design of {canonical_name} ({role_text}). Obtain and visually inspect an official reference image before Stage 2"
             if is_mascot
-            else f"Stylized likeness of {canonical_name} ({role_text}) — obtain and visually inspect a verified reference portrait before Stage 2"
+            else f"Stylized likeness of {canonical_name} ({role_text}). Obtain and visually inspect a verified reference portrait before Stage 2"
         )
 
     aliases = [canonical_name]
@@ -612,7 +611,7 @@ def research_characters(
         entry["verified_utc"] = utc_now_iso()
         entry.setdefault(
             "visual_traits",
-            f"Strictly match exact appearance, silhouette, colors, and details in user-supplied reference image ({entry['name']})",
+            f"Match exact appearance, silhouette, colors, and details in user-supplied reference image ({entry['name']})",
         )
         entry.setdefault("attire", "Match user-supplied reference image exactly; zero invented props or text")
         entry.setdefault(
@@ -792,9 +791,8 @@ def parse_entities_csv(raw: str) -> List[str]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage 0 Character, Public Figure & Official Mascot Researcher. "
-            "Verifies real-world people and official mascots via local registry, "
-            "user-supplied reference photos, or Wikipedia REST API before Stage 2 turnaround sheets."
+            "Verify real people and official mascots before Stage 2 turnaround sheets or Stage 3 "
+            "keyframes, using a local registry, user photos, or Wikipedia."
         )
     )
     parser.add_argument(
@@ -824,7 +822,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ID=PATH",
-        help="Repeatable user-supplied reference image override for official mascots or people (e.g. --user-ref meta_muse=./muse.png)",
+        help="Supply a local reference image for a person or mascot; repeat for multiple (e.g. --user-ref meta_muse=./muse.png).",
     )
     parser.add_argument(
         "--copy-user-refs",

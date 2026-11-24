@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert an SRT file into a YouTube Shorts v3.1 Fun Kinetic safe-zone ASS subtitle file.
+"""Convert an SRT file into zero-overlap v3.1 Fun Kinetic ASS captions for 9:16 Shorts.
 
 Prefer tts_and_captions_v2.py (exact edge-tts WordBoundary timestamps) when synthesizing VO;
 use this script when converting Whisper/Gemini SRT transcripts.
@@ -8,12 +8,12 @@ Features (v3.1 Fun Kinetic):
   - Auto-detects bold sans font via fc-match (Arial Black -> DejaVu Sans -> Liberation Sans).
   - 86px bold typography, Outline=8, Shadow=4.5, deeper #30000000 drop shadow.
   - Lower-third safe placement (--margin-v 420: clear of character torsos and Shorts UI).
-  - Punchy 18-char chunks (--max-chars 18) flushed cleanly on every SRT cue boundary.
+  - Punchy 18-char chunks (--max-chars 18) reset on every SRT cue boundary.
   - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + alternating
     +/-2.5 deg micro-tilt on keyword punchlines.
   - Semantic neon palette (--keyword-color auto): Neon Lime (money/numbers), Fiery
     Coral-Orange (drama/danger/action), Electric Cyan (brands/tech/AI), Bright Yellow (active).
-  - Strict clamping to next_event_start - 0.01s (1 cs) + overlap assertion.
+  - Clamps each event to next_event_start - 0.01s (1 cs) and verifies zero overlaps.
 
 Usage:
   python3 srt_to_ass.py <input.srt> <output.ass> [--font-size 86] [--max-chars 18] [--margin-v 420] [--keyword-color auto]
@@ -79,7 +79,7 @@ def build_word_events(
     all_words: List[Dict] = []
 
     for entry_idx, (start_cs, end_cs, text) in enumerate(entries):
-        # Clamp cue end strictly to next cue start - 1cs (0.01s)
+        # Clamp cue end to next cue start - 1cs (0.01s)
         if entry_idx + 1 < len(entries):
             next_cue_start = entries[entry_idx + 1][0]
             if next_cue_start > start_cs + 1:
@@ -121,7 +121,9 @@ def build_word_events(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Convert SRT into v3.1 Fun Kinetic zero-overlap Shorts ASS captions.")
+    parser = argparse.ArgumentParser(
+        description="Convert an SRT file into zero-overlap v3.1 Fun Kinetic ASS captions for 9:16 Shorts."
+    )
     parser.add_argument("input_srt", help="Input .srt path")
     parser.add_argument("output_ass", help="Output .ass path")
     parser.add_argument("--font", default="", help="Override bold font family (auto-detected via fc-match).")
@@ -141,7 +143,7 @@ def main() -> int:
         "--tilt",
         type=float,
         default=DEFAULT_TILT_DEG,
-        help=f"Alternating micro-tilt degrees on keyword punchlines; 0 disables (default: {DEFAULT_TILT_DEG}).",
+        help=f"Alternating tilt in degrees on keyword lines; set 0 to disable (default: {DEFAULT_TILT_DEG}).",
     )
     parser.add_argument(
         "--caption-style",
@@ -153,7 +155,7 @@ def main() -> int:
         "--max-chars",
         type=int,
         default=DEFAULT_MAX_CHARS,
-        help=f"Maximum visible characters per caption line for 1080px horizontal safety (default: {DEFAULT_MAX_CHARS}).",
+        help=f"Maximum visible characters per caption line (default: {DEFAULT_MAX_CHARS}).",
     )
     parser.add_argument(
         "--keywords",

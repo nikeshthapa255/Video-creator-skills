@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""2x-supersampled FFmpeg keyframe animator for Mode B (Keyframe + Motion) Shorts.
+"""Animate still keyframes into 1080x1920 MP4 clips using 2x-supersampled FFmpeg zoompan.
 
-Renders crisp 1080x1920 MP4 clips at exact spoken durations (from shot_timings.json)
-by applying zoompan on a 2160x3840 (2x) working canvas and Lanczos downscaling to
-eliminate 1-pixel integer jitter.
+Matches exact spoken durations from shot_timings.json by running zoompan on a
+2160x3840 (2x) working canvas, then downscaling with Lanczos to remove 1-pixel jitter.
 
 Motion presets:
   whip_zoom, bounce_pop, shake_zoom, zoom_in, zoom_out, pan_left, pan_right, static_drift
@@ -132,10 +131,17 @@ def find_scene_image(scenes_dir: Path, shot_id: str) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="2x-supersampled FFmpeg keyframe animator.")
+    parser = argparse.ArgumentParser(
+        description="Animate still keyframes into 1080x1920 MP4 clips using 2x-supersampled FFmpeg zoompan."
+    )
     parser.add_argument("--image", help="Single keyframe image path.")
     parser.add_argument("--duration", type=float, help="Clip duration in seconds.")
-    parser.add_argument("--motion", choices=PRESETS, default="zoom_in")
+    parser.add_argument(
+        "--motion",
+        choices=PRESETS,
+        default="zoom_in",
+        help="Camera motion preset (default: zoom_in).",
+    )
     parser.add_argument("--flash-in", action="store_true", help="Add 2-frame white exposure flash on entry.")
     parser.add_argument("--fps", type=int, default=30, help="Output FPS (default: 30).")
     parser.add_argument("--out", help="Output MP4 path (single mode).")

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Retrieve or synthesize speech-friendly background music for animated Shorts.
 
-Zero required API keys. Uses pure Python stdlib + ffmpeg/ffprobe.
+Zero required API keys. Uses the Python standard library and ffmpeg/ffprobe.
 
 Retrieval cascade:
   1. Explicit --track-file (local instrumental file)
-  2. Explicit --url (downloads and caches cleanly)
+  2. Explicit --url (downloads and caches locally)
   3. Local royalty-free library match in --library-dir / $SHORTS_MUSIC_DIR
      (.wav, .mp3, .m4a, .ogg, .flac matched against mood + --query tokens)
   4. Optional Pixabay / Freesound royalty-free search ONLY when PIXABAY_API_KEY
-     or FREESOUND_API_KEY is set in the environment (fails gracefully to step 5)
+     or FREESOUND_API_KEY is set in the environment (falls back to step 5 on error)
   5. Deterministic zero-API-key fallback: calls sibling make_bgm.py
 
 Post-processing (applied to EVERY track source):
-  - Loops seamlessly if shorter or trims cleanly if longer to exact --duration
+  - Loops shorter tracks or trims longer ones to exact --duration
   - Converts to 48 kHz 16-bit stereo PCM WAV
   - Applies gentle speech-friendly warmth (highpass=f=45, lowpass=f=7000)
   - Normalizes to consistent subtle loudness (--target-lufs, default -22.0 LUFS)
@@ -98,7 +98,7 @@ def download_cached(url: str, cache_dir: Path, timeout: int = 25) -> Path:
         shutil.copyfileobj(resp, out_f)
     if tmp_path.stat().st_size < 1024:
         tmp_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Downloaded file from {url} was unexpectedly small")
+        raise RuntimeError(f"Downloaded file from {url} is under 1 KB and may not be valid audio.")
     tmp_path.replace(cached_path)
     return cached_path
 
@@ -190,7 +190,7 @@ def try_optional_api_search(mood: str, query: str, cache_dir: Path) -> Optional[
             if res:
                 return res[0], "pixabay_api", res[1]
         except Exception as exc:
-            print(f"Warning: Pixabay search failed ({exc}); falling back.", file=sys.stderr)
+            print(f"Warning: Pixabay search failed ({exc}); falling back to the next music source.", file=sys.stderr)
 
     freesound_key = os.environ.get("FREESOUND_API_KEY", "").strip()
     if freesound_key:
@@ -199,7 +199,7 @@ def try_optional_api_search(mood: str, query: str, cache_dir: Path) -> Optional[
             if res:
                 return res[0], "freesound_api", res[1]
         except Exception as exc:
-            print(f"Warning: Freesound search failed ({exc}); falling back.", file=sys.stderr)
+            print(f"Warning: Freesound search failed ({exc}); falling back to the next music source.", file=sys.stderr)
 
     return None
 
@@ -383,7 +383,7 @@ def main() -> int:
                 selected_source = "url"
                 selected_detail = args.url
             except Exception as exc:
-                print(f"Warning: failed to download --url ({exc}); falling back.", file=sys.stderr)
+                print(f"Warning: failed to download --url ({exc}); falling back to the next music source.", file=sys.stderr)
 
         # 3. Local royalty-free library match (--library-dir and/or $SHORTS_MUSIC_DIR)
         if raw_path is None:

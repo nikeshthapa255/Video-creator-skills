@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Procedural comedic SFX synthesizer and timeline renderer (48 kHz 16-bit stereo WAV).
 
-Pure Python standard library — zero third-party audio dependencies.
+Uses only the Python standard library (no third-party audio packages).
 Supported cues:
   record_scratch, vine_boom, siren_chirp, bonk_boing,
   cash_ching, ding_levelup, laser_zap, whoosh, pop
@@ -238,7 +238,7 @@ def load_cues(timings_path: Path) -> Tuple[List[Dict], float]:
     elif isinstance(data, list):
         items = data
     else:
-        raise ValueError("Unsupported timings JSON structure")
+        raise ValueError("Unsupported timings JSON format: expected an object with 'shots'/'cues' or a list of cues.")
 
     for item in items:
         sfx = item.get("sfx_type") or item.get("sfx") or item.get("sfx_cue") or "none"
@@ -260,7 +260,7 @@ def main() -> int:
     parser.add_argument("--cue", help="Render a single SFX cue to --out.")
     parser.add_argument("--timings", help="Path to shot_timings.json or cue list JSON.")
     parser.add_argument("--duration", type=float, default=0.0, help="Override timeline duration in seconds.")
-    parser.add_argument("--gain-db", type=float, default=-2.0, help="Single-cue gain in dB.")
+    parser.add_argument("--gain-db", type=float, default=-2.0, help="Single-cue gain in dB (default: -2.0).")
     parser.add_argument("--out", help="Output WAV path.")
     args = parser.parse_args()
 

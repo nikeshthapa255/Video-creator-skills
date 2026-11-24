@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
-"""Audio-first neural TTS synthesizer, narration linter, and v3.1 Fun Kinetic ASS caption builder.
+"""Synthesize voiceover with edge-tts, lint narration scripts, and build v3.1 Fun Kinetic ASS captions.
 
 Features:
-  1. Pre-TTS Narration Linter (--lint-plan): catches TTS_MISREAD triggers such as
-     "$700 PS5 Pro" (-> "700-dollar PS5 Pro") and "no 60 FPS" (-> "no sixty FPS").
-  2. Audio-First Synthesis (edge-tts with boundary="WordBoundary"): generates per-shot
+  1. Pre-TTS Narration Linter (--lint-plan): catches TTS_MISREAD errors such as
+     "$700 PS5 Pro" (-> "700-dollar PS5 Pro") and "no 60 FPS" (-> "no sixty FPS"),
+     plus soft AI_SLOP_SCRIPT warnings (--strict-slop escalates to exit 2;
+     --no-slop-check disables slop checks).
+  2. Phonetic-vs-Display Separation: supports top-level tts_pronunciations and
+     per-shot tts_text so TTS speaks phonetic forms ("A W S", "GTA Six", "nine-one-one")
+     while captions render clean display English ("AWS", "GTA 6", "911").
+  3. Audio-First Synthesis (edge-tts with boundary="WordBoundary"): generates per-shot
      VO clips, concatenates voiceover.wav (48 kHz stereo), writes exact shot_timings.json.
-  3. v3.1 Fun Kinetic Captions & Horizontal Safety:
+  4. v3.1 Fun Kinetic Captions & Horizontal Safety:
      - 86px bold sans font (auto-detected via fc-match), Outline=8, Shadow=4.5, #30000000 shadow.
      - Lower-third safe placement (--margin-v 420: clear of character torsos and Shorts UI).
-     - Punchy 18-char chunks (--max-chars 18) flushed cleanly on every shot_id/cue_idx cut.
+     - Punchy 18-char chunks (--max-chars 18) reset on every shot_id/cue_idx cut.
      - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + alternating
        +/-2.5 deg micro-tilt on keyword punchlines.
      - Semantic neon keyword palette (--keyword-color auto): Neon Lime (money/numbers),
        Fiery Coral-Orange (drama/danger/action), Electric Cyan (brands/tech/AI), Bright Yellow
        (active spoken word).
-     - Strict zero-overlap clamping (next_start - 0.01s) with overlap assertion.
+     - Zero-overlap clamping (next_start - 0.01s) with overlap assertion.
 
 Examples:
   python3 tts_and_captions_v2.py --lint-plan shot_plan.json
+  python3 tts_and_captions_v2.py --lint-plan shot_plan.json --strict-slop
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --voice en-US-AvaNeural
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --caption-style kinetic_keyword --font-size 86 --max-chars 18 --margin-v 420 --keyword-color auto
 """
 
 import argparse
 import asyncio
+import difflib
 import json
 import re
 import shutil
@@ -188,6 +195,378 @@ def autofix_narration_text(text: str) -> str:
     fixed = re.sub(r"\bw/", "with ", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bvs\.(?=\s)", "versus", fixed, flags=re.IGNORECASE)
     return fixed
+
+
+SLOP_CLUSTER_TERMS = {
+    "crucial", "pivotal", "paramount", "robust", "multifaceted",
+    "meticulous", "realm", "garner", "bolster", "revolutionize",
+    "groundbreaking", "synergy", "leverage",
+}
+
+# Tuple format: (category, compiled_regex, hint, last_shot_only)
+# Every regex uses capturing group 1 for the reported match so leading sentence
+# punctuation is excluded from warnings.
+SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool]] = [
+    (
+        "fake_contrast",
+        re.compile(
+            r"\b((?:(?:it|this|that|he|she)\s+isn['’]t|(?:they|we)\s+aren['’]t"
+            r"|(?:it['’]s|this\s+is|that['’]s|they['’]re|we['’]re|he['’]s|she['’]s)\s+not|not)"
+            r"\s+(?:just|merely|only)\s+(?:a|an|the|[\w$'’-]+)(?:\s+[\w$'’-]+){0,6}"
+            r"\s*[,;:—–-]\s*(?:it['’]s|this\s+is|that['’]s|but\s+(?:also\s+)?(?:a|an|the|about|how|why|what)))\b",
+            flags=re.IGNORECASE,
+        ),
+        "State what happened directly instead of a 'not just X, it's Y' contrast.",
+        False,
+    ),
+    (
+        "fake_contrast",
+        re.compile(
+            r"\b((?:this|that|it)\s+(?:doesn['’]t|does\s+not)\s+(?:just\s+)?mean\b[^.!?]{2,60}[.!?;]\s*it\s+means)\b",
+            flags=re.IGNORECASE,
+        ),
+        "State what happened directly instead of a 'not just X, it's Y' contrast.",
+        False,
+    ),
+    (
+        "fake_contrast",
+        re.compile(
+            r"(?:^|[.!?]\s+)(forget\s+[\w\s'’-]{2,35}(?:[—–:]|\s+-{1,2}\s+))",
+            flags=re.IGNORECASE,
+        ),
+        "State what happened directly instead of an ad-copy 'Forget X' contrast.",
+        False,
+    ),
+    (
+        "throat_clearing",
+        re.compile(
+            r"\b(in\s+today['’]s\s+(?:world|fast[- ]paced|ever[- ]evolving"
+            r"|rapidly\s+(?:changing|evolving)|digital\s+(?:age|world|era)"
+            r"|modern\s+(?:world|era)|ai[- ]driven|hyper[- ]connected))\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the warm-up phrase and open directly on the fact or action.",
+        False,
+    ),
+    (
+        "throat_clearing",
+        re.compile(
+            r"\b(let['’]s\s+dive\s+(?:right\s+)?in(?:to)?|without\s+further\s+ado"
+            r"|buckle\s+up|strap\s+in|have\s+you\s+ever\s+wondered)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the warm-up phrase and open directly on the fact or action.",
+        False,
+    ),
+    (
+        "throat_clearing",
+        re.compile(
+            r"\b((?:here['’]s|here\s+is)\s+the\s+(?:thing|catch|kicker"
+            r"|wild\s+part|crazy\s+part|scary\s+part|truth))\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the warm-up phrase and open directly on the fact or action.",
+        False,
+    ),
+    (
+        "colon_reveal",
+        re.compile(
+            r"\b((?:the\s+(?:best|worst|crazy|wild|scary|funny)\s+part"
+            r"|the\s+(?:secret|catch|twist|truth|reality)"
+            r"|one\s+thing\s+is\s+clear|plot\s+twist)\s*:)",
+            flags=re.IGNORECASE,
+        ),
+        "Fold the point into a direct spoken sentence instead of a staged colon reveal.",
+        False,
+    ),
+    (
+        "dramatic_filler",
+        re.compile(
+            r"\b(let\s+that\s+sink\s+in|(?:and\s+)?that\s+changes\s+everything(?=[.!?]|\s*$)"
+            r"|nothing\s+will\s+ever\s+be\s+the\s+same"
+            r"|that(?:['’]s|\s+is)\s+the\s+real\s+(?:win|shift|game[- ]changer))\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the dramatic echo; let the concrete fact carry the punch.",
+        False,
+    ),
+    (
+        "dramatic_filler",
+        re.compile(
+            r"(?:^|[.!?]\s+)((?:total|complete|utter|pure)\s+(?:\w+\s+){0,2}(?:disaster|chaos|madness|nightmare)[.!]?)\s*$",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the dramatic echo fragment; let the concrete fact carry the punch.",
+        False,
+    ),
+    (
+        "fake_deep",
+        re.compile(
+            r"\b(at\s+its\s+core|a\s+paradigm\s+shift"
+            r"|(?:marks?|represents?)\s+a\s+(?:pivotal|defining|watershed)\s+(?:moment|shift|milestone)"
+            r"|(?:stands?|serves?)\s+as\s+a\s+(?:testament|beacon|reminder)"
+            r"|(?:rich|intricate|complex)\s+tapestry)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Replace grand framing with the concrete fact or consequence.",
+        False,
+    ),
+    (
+        "ai_buzzword",
+        re.compile(
+            r"\b(delv(?:e|es|ed|ing)|game[- ]changer"
+            r"|(?:ever[- ]evolving|rapidly\s+evolving)\s+landscape"
+            r"|(?:seamlessly|effortlessly)\s+(?:integrat|blend|combin|connect|transform)\w*"
+            r"|unlock(?:s|ed|ing)?\s+(?:the\s+)?(?:full\s+)?(?:power|potential|secrets?)\s+of"
+            r"|underscor(?:e|es|ed|ing)\s+(?:the\s+)?(?:importance|significance|need|fact|commitment)"
+            r"|navigat(?:e|es|ed|ing)\s+the\s+(?:complex|intricate|ever[- ]changing|shifting))\b",
+            flags=re.IGNORECASE,
+        ),
+        "Replace AI-cliche wording with plain spoken English.",
+        False,
+    ),
+    (
+        "wrapup_summary",
+        re.compile(
+            r"\b(in\s+summary|to\s+sum\s+up|in\s+conclusion|all\s+in\s+all"
+            r"|at\s+the\s+end\s+of\s+the\s+day|only\s+time\s+will\s+tell)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the wrap-up phrase; end on a concrete beat that loops into Shot 1.",
+        False,
+    ),
+    (
+        "wrapup_summary",
+        re.compile(
+            r"^\s*((?:overall|ultimately)\s*,)",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the wrap-up phrase; end on a concrete beat that loops into Shot 1.",
+        True,
+    ),
+    (
+        "wrapup_summary",
+        re.compile(
+            r"(?:^|[.!?]\s+)((?:which\s+is|and\s+that['’]s)\s+(?:the\s+exact\s+reason|why)\s*(?:\.{0,3}|…))\s*$",
+            flags=re.IGNORECASE,
+        ),
+        "Avoid overusing flat 'Which is why...' loop bridges; end on a concrete beat or rotate loop callbacks.",
+        True,
+    ),
+]
+
+
+def _extract_slop_cluster_terms(text: str) -> List[str]:
+    terms: List[str] = []
+    seen = set()
+    for tok in re.findall(r"[a-z]+", text.lower()):
+        if tok in SLOP_CLUSTER_TERMS and tok not in seen:
+            seen.add(tok)
+            terms.append(tok)
+    return terms
+
+
+def lint_slop_text(text: str, is_last_shot: bool = False) -> List[Dict[str, str]]:
+    """Detect low-false-positive AI-slop patterns in spoken Shorts narration."""
+    if not text or not text.strip():
+        return []
+
+    issues: List[Dict[str, str]] = []
+    seen_spans: List[Tuple[int, int]] = []
+
+    for category, pattern, hint, last_shot_only in SLOP_PATTERNS:
+        if last_shot_only and not is_last_shot:
+            continue
+        for m in pattern.finditer(text):
+            grp = 1 if m.lastindex else 0
+            s, e = m.start(grp), m.end(grp)
+            if any(s < es and ss < e for ss, es in seen_spans):
+                continue
+            matched = m.group(grp).strip()
+            if not matched:
+                continue
+            seen_spans.append((s, e))
+            issues.append({
+                "code": "AI_SLOP_SCRIPT",
+                "category": category,
+                "match": matched,
+                "hint": hint,
+            })
+
+    cluster_terms = _extract_slop_cluster_terms(text)
+    if len(cluster_terms) >= 2:
+        issues.append({
+            "code": "AI_SLOP_SCRIPT",
+            "category": "ai_buzzword_cluster",
+            "match": ", ".join(cluster_terms),
+            "hint": "Replace clustered AI buzzwords with plain spoken English.",
+        })
+
+    return issues
+
+
+def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
+    """Run AI_SLOP_SCRIPT checks across every shot plus a plan-wide buzzword cluster check."""
+    shots = plan.get("shots", []) or []
+    warnings: List[Dict[str, str]] = []
+    plan_cluster_terms: List[str] = []
+    seen_plan_terms = set()
+    shot_cluster_warned = False
+
+    for idx, shot in enumerate(shots):
+        sid = str(shot.get("shot_id", f"shot_{idx + 1:02d}"))
+        text = str(shot.get("dialogue_or_vo", "") or "")
+        is_last = idx == len(shots) - 1
+        for iss in lint_slop_text(text, is_last_shot=is_last):
+            if iss["category"] == "ai_buzzword_cluster":
+                shot_cluster_warned = True
+            warnings.append({
+                "code": iss["code"],
+                "shot_id": sid,
+                "category": iss["category"],
+                "match": iss["match"],
+                "hint": iss["hint"],
+            })
+        for term in _extract_slop_cluster_terms(text):
+            if term not in seen_plan_terms:
+                seen_plan_terms.add(term)
+                plan_cluster_terms.append(term)
+
+    if len(plan_cluster_terms) >= 3 and not shot_cluster_warned:
+        warnings.append({
+            "code": "AI_SLOP_SCRIPT",
+            "shot_id": "plan",
+            "category": "ai_buzzword_cluster",
+            "match": ", ".join(plan_cluster_terms),
+            "hint": "Replace clustered AI buzzwords across the script with plain spoken English.",
+        })
+
+    return warnings
+
+
+def apply_tts_pronunciations(text: str, pronunciations: Optional[Dict[str, str]]) -> str:
+    """Apply top-level display -> phonetic TTS overrides longest-key-first with safe boundaries."""
+    if not text or not isinstance(pronunciations, dict) or not pronunciations:
+        return text
+
+    clean_map: Dict[str, str] = {}
+    for raw_k, raw_v in pronunciations.items():
+        if isinstance(raw_k, str) and isinstance(raw_v, str) and raw_k.strip():
+            clean_map[raw_k] = raw_v
+    if not clean_map:
+        return text
+
+    sorted_keys = sorted(clean_map.keys(), key=lambda k: (-len(k), k))
+    pattern = re.compile(
+        "|".join(r"(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])" for k in sorted_keys)
+    )
+    return pattern.sub(lambda m: clean_map[m.group(0)], text)
+
+
+def resolve_tts_text(
+    shot: Dict,
+    pronunciations: Optional[Dict[str, str]] = None,
+    autofix: bool = False,
+) -> str:
+    """Derive the spoken TTS string for a shot while leaving display dialogue_or_vo untouched."""
+    override = shot.get("tts_text")
+    if isinstance(override, str) and override.strip():
+        spoken = override.strip()
+    else:
+        spoken = str(shot.get("dialogue_or_vo", "") or "").strip()
+        if spoken and pronunciations:
+            spoken = apply_tts_pronunciations(spoken, pronunciations)
+    if autofix and spoken:
+        spoken = autofix_narration_text(spoken)
+    return spoken
+
+
+def _align_norm(token: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", token.lower())
+
+
+def _distribute_tokens_in_span(tokens: List[str], start_sec: float, end_sec: float) -> List[Dict]:
+    if not tokens:
+        return []
+    start_s = max(0.0, float(start_sec))
+    min_span = 0.02 * len(tokens)
+    end_s = max(start_s + min_span, float(end_sec))
+    total_dur = end_s - start_s
+    weights = [max(2, len(_clean_token(tok)) or len(tok)) for tok in tokens]
+    total_w = max(1, sum(weights))
+    out: List[Dict] = []
+    cursor = start_s
+    for idx, (tok, w) in enumerate(zip(tokens, weights)):
+        t_end = end_s if idx == len(tokens) - 1 else cursor + total_dur * (w / total_w)
+        out.append({
+            "text": tok,
+            "start_sec": round(cursor, 4),
+            "end_sec": round(max(cursor + 0.01, t_end), 4),
+        })
+        cursor = t_end
+    return out
+
+
+def align_words_to_display(
+    tts_words: List[Dict],
+    display_text: str,
+    total_dur: float,
+) -> List[Dict]:
+    """Map spoken WordBoundary timings onto clean display tokens via SequenceMatcher.
+
+    Unchanged words keep their exact WordBoundary timestamps; replaced phonetic spans
+    (e.g. ["A", "W", "S"] -> ["AWS"]) inherit [first.start_sec, last.end_sec] and split
+    proportionally by character length when mapping to multiple display tokens.
+    """
+    display_tokens = display_text.split()
+    if not display_tokens:
+        return []
+    if not tts_words:
+        return _distribute_tokens_in_span(display_tokens, 0.0, max(0.05, total_dur))
+
+    tts_norm = [_align_norm(str(w.get("text", ""))) for w in tts_words]
+    disp_norm = [_align_norm(tok) for tok in display_tokens]
+
+    matcher = difflib.SequenceMatcher(None, tts_norm, disp_norm, autojunk=False)
+    aligned: List[Dict] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(j2 - j1):
+                src = tts_words[i1 + offset]
+                s = float(src["start_sec"])
+                e = max(s + 0.01, float(src["end_sec"]))
+                aligned.append({
+                    "text": display_tokens[j1 + offset],
+                    "start_sec": round(s, 4),
+                    "end_sec": round(e, 4),
+                })
+        elif tag == "replace":
+            span_start = float(tts_words[i1]["start_sec"])
+            raw_end = max(float(w["end_sec"]) for w in tts_words[i1:i2])
+            span_end = max(span_start + 0.02, raw_end)
+            aligned.extend(_distribute_tokens_in_span(display_tokens[j1:j2], span_start, span_end))
+        elif tag == "insert":
+            prev_end = float(tts_words[i1 - 1]["end_sec"]) if i1 > 0 else 0.0
+            if i1 < len(tts_words):
+                next_start = float(tts_words[i1]["start_sec"])
+            else:
+                next_start = max(float(total_dur), prev_end + 0.05 * (j2 - j1))
+            if next_start <= prev_end + 0.01:
+                span_start = prev_end
+                span_end = prev_end + 0.02 * (j2 - j1)
+            else:
+                span_start = prev_end
+                span_end = next_start
+            aligned.extend(_distribute_tokens_in_span(display_tokens[j1:j2], span_start, span_end))
+        # tag == "delete": extra spoken tokens with no display counterpart are omitted
+
+    if not aligned:
+        s0 = float(tts_words[0]["start_sec"])
+        e0 = max(float(tts_words[-1]["end_sec"]), float(total_dur))
+        return _distribute_tokens_in_span(display_tokens, s0, e0)
+
+    return aligned
 
 
 def detect_bold_font(preferred: str = "") -> str:
@@ -376,7 +755,7 @@ def mark_keywords(words: List[Dict], global_keywords: Optional[Sequence[str]] = 
     result = [dict(w) for w in words]
     g_kw = [k for k in (global_keywords or []) if k]
 
-    # Identify shot spans so per-shot highlight_keywords override cleanly per shot
+    # Identify shot spans so per-shot highlight_keywords override per shot
     spans: List[Tuple[int, int, List[str]]] = []
     i = 0
     n = len(result)
@@ -517,7 +896,7 @@ def split_long_word(word: Dict, max_chars: int) -> List[Dict]:
 
 
 def chunk_words(words: List[Dict], max_words: int = 3, max_chars: int = DEFAULT_MAX_CHARS) -> List[List[Dict]]:
-    """Group words into bold punchy chunks strictly within max_chars, flushing cleanly on every shot_id/cue_idx boundary."""
+    """Group words into bold punchy chunks within max_chars, resetting on every shot_id/cue_idx boundary."""
     expanded: List[Dict] = []
     for w in words:
         expanded.extend(split_long_word(w, max_chars))
@@ -532,7 +911,7 @@ def chunk_words(words: List[Dict], max_words: int = 3, max_chars: int = DEFAULT_
         if not w_text:
             continue
 
-        # Flush cleanly on every shot_id or SRT cue_idx transition (fixes cross-cut word merging)
+        # Reset on every shot_id or SRT cue_idx transition (fixes cross-cut word merging)
         boundary = (w.get("shot_id"), w.get("cue_idx"))
         if cur and boundary != cur_boundary:
             chunks.append(cur)
@@ -630,7 +1009,7 @@ def build_zero_overlap_events(
                 prefix = r"{\fscx84\fscy84\t(0,65,\fscx122\fscy122)\t(65,155,\fscx100\fscy100)}" if active_idx == 0 else ""
                 raw.append((w_start, w_end, prefix + " ".join(styled)))
 
-    # Strict monotonic clamp: every event ends <= next_start - 1cs (0.01s)
+    # Monotonic clamp: every event ends <= next_start - 1cs (0.01s)
     clamped: List[Tuple[int, int, str]] = []
     for i, (s, e, text) in enumerate(raw):
         if clamped and s < clamped[-1][1]:
@@ -707,23 +1086,59 @@ async def synth_shot_edge_tts(text: str, voice: str, rate: str, pitch: str, mp3_
     return words
 
 
-def lint_plan(plan: Dict) -> int:
+def lint_plan(
+    plan: Dict,
+    check_slop: bool = True,
+    strict_slop: bool = False,
+    check_tts_misread: bool = True,
+) -> int:
     found = 0
-    for shot in plan.get("shots", []):
-        sid = shot.get("shot_id", "unknown")
-        text = shot.get("dialogue_or_vo", "")
-        issues = lint_narration_text(text)
-        for iss in issues:
-            found += 1
+    if check_tts_misread:
+        pronunciations = plan.get("tts_pronunciations")
+        if not isinstance(pronunciations, dict):
+            pronunciations = None
+        for shot in plan.get("shots", []):
+            sid = shot.get("shot_id", "unknown")
+            spoken_text = resolve_tts_text(shot, pronunciations=pronunciations, autofix=False)
+            issues = lint_narration_text(spoken_text)
+            for iss in issues:
+                found += 1
+                print(
+                    f"[TTS_MISREAD] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
+                    file=sys.stderr,
+                )
+
+    slop_warnings: List[Dict[str, str]] = []
+    if check_slop:
+        slop_warnings = lint_plan_slop(plan)
+        for w in slop_warnings:
             print(
-                f"[TTS_MISREAD] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
+                f"WARNING [AI_SLOP_SCRIPT] {w['shot_id']} ({w['category']}): '{w['match']}' -> {w['hint']}",
                 file=sys.stderr,
             )
-    if found == 0:
-        print("TTS lint passed: 0 misread risks found.")
-        return 0
-    print(f"TTS lint failed: {found} issue(s) found. Fix shot_plan.json or pass --autofix.", file=sys.stderr)
-    return 2
+
+    slop_count = len(slop_warnings)
+    if check_tts_misread and found > 0:
+        extra = f" and {slop_count} AI_SLOP_SCRIPT warning(s)" if slop_count > 0 else ""
+        print(
+            f"TTS lint failed: {found} misread issue(s){extra} found. Fix shot_plan.json or pass --autofix.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if strict_slop and slop_count > 0:
+        print(
+            f"Narration lint failed (--strict-slop): {slop_count} AI_SLOP_SCRIPT warning(s) found.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if check_tts_misread:
+        if slop_count > 0:
+            print(f"TTS lint passed: 0 misread risks found ({slop_count} AI_SLOP_SCRIPT warning(s)).")
+        else:
+            print("TTS lint passed: 0 misread risks found.")
+    return 0
 
 
 def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
@@ -735,10 +1150,20 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     voice = args.voice or plan.get("voice") or "en-US-AvaNeural"
 
+    check_slop = not getattr(args, "no_slop_check", False)
+    strict_slop = bool(getattr(args, "strict_slop", False))
     if not args.autofix:
-        rc = lint_plan(plan)
+        rc = lint_plan(plan, check_slop=check_slop, strict_slop=strict_slop, check_tts_misread=True)
         if rc != 0:
             return rc
+    elif check_slop:
+        rc = lint_plan(plan, check_slop=True, strict_slop=strict_slop, check_tts_misread=False)
+        if rc != 0:
+            return rc
+
+    pronunciations = plan.get("tts_pronunciations")
+    if not isinstance(pronunciations, dict):
+        pronunciations = None
 
     all_words: List[Dict] = []
     shot_timings: List[Dict] = []
@@ -759,16 +1184,18 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 check=True,
             )
 
-        for idx, shot in enumerate(plan.get("shots", [])):
+        shots = plan.get("shots", [])
+        for idx, shot in enumerate(shots):
             sid = shot["shot_id"]
-            text = shot.get("dialogue_or_vo", "").strip()
-            if args.autofix:
-                text = autofix_narration_text(text)
+            display_text = str(shot.get("dialogue_or_vo", "") or "").strip()
+            tts_spoken_text = resolve_tts_text(shot, pronunciations=pronunciations, autofix=args.autofix)
+            if not display_text and tts_spoken_text:
+                display_text = tts_spoken_text
 
             mp3_path = tmp_dir / f"{sid}.mp3"
             wav_path = tmp_dir / f"{sid}.wav"
 
-            if not text:
+            if not tts_spoken_text:
                 silent_dur = max(0.5, float(shot.get("duration_sec", 2.0)))
                 subprocess.run(
                     [
@@ -781,7 +1208,9 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 words = []
                 dur = silent_dur
             else:
-                words = asyncio.run(synth_shot_edge_tts(text, voice, args.rate, args.pitch, mp3_path))
+                spoken_words = asyncio.run(
+                    synth_shot_edge_tts(tts_spoken_text, voice, args.rate, args.pitch, mp3_path)
+                )
                 subprocess.run(
                     [
                         "ffmpeg", "-y", "-v", "error",
@@ -792,13 +1221,7 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                     check=True,
                 )
                 dur = probe_audio_duration(wav_path)
-                if not words:
-                    tokens = text.split()
-                    step = dur / max(1, len(tokens))
-                    words = [
-                        {"text": tok, "start_sec": round(i * step, 4), "end_sec": round((i + 1) * step, 4)}
-                        for i, tok in enumerate(tokens)
-                    ]
+                words = align_words_to_display(spoken_words, display_text, dur)
             shot_start = cursor
             shot_end = cursor + dur
             shot_kw = parse_keyword_list(shot.get("highlight_keywords"))
@@ -817,24 +1240,27 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                     cw["shot_keywords"] = shot_kw
                 all_words.append(cw)
 
-            shot_timings.append({
+            timing_entry: Dict = {
                 "shot_id": sid,
                 "start_sec": round(shot_start, 4),
                 "end_sec": round(shot_end, 4),
-                "duration_sec": round(dur + (args.gap if idx < len(plan["shots"]) - 1 else 0.0), 4),
+                "duration_sec": round(dur + (args.gap if idx < len(shots) - 1 else 0.0), 4),
                 "spoken_duration_sec": round(dur, 4),
                 "motion_preset": shot.get("motion_preset", "zoom_in"),
                 "flash_in": bool(shot.get("flash_in", False)),
                 "sfx_type": shot.get("sfx_type", "none"),
                 "sfx_offset_sec": float(shot.get("sfx_offset_sec", 0.0)),
                 "sfx_gain_db": float(shot.get("sfx_gain_db", -2.5)),
-                "dialogue_or_vo": text,
-                "words": shifted_words,
-            })
+                "dialogue_or_vo": display_text,
+            }
+            if tts_spoken_text and tts_spoken_text != display_text:
+                timing_entry["tts_text"] = tts_spoken_text
+            timing_entry["words"] = shifted_words
+            shot_timings.append(timing_entry)
 
             concat_lines.append(f"file '{wav_path}'")
             cursor = shot_end
-            if args.gap > 0 and idx < len(plan["shots"]) - 1:
+            if args.gap > 0 and idx < len(shots) - 1:
                 concat_lines.append(f"file '{gap_wav}'")
                 cursor += args.gap
 
@@ -895,13 +1321,15 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Audio-first TTS synthesizer, linter, and v3.1 Fun Kinetic ASS caption builder.")
+    parser = argparse.ArgumentParser(
+        description="Synthesize voiceover with edge-tts, lint narration scripts, and build v3.1 Fun Kinetic ASS captions."
+    )
     parser.add_argument("--lint-plan", help="Run Pre-TTS narration linter on shot_plan.json and exit.")
     parser.add_argument("--shot-plan", help="Path to shot_plan.json for full audio-first synthesis.")
     parser.add_argument("--out-dir", help="Output directory for voiceover.wav, shot_timings.json, captions.ass.")
     parser.add_argument("--voice", default="", help="Override neural voice (default: plan.voice or en-US-AvaNeural).")
     parser.add_argument("--rate", default="+6%", help="Speech rate adjustment (default: +6%% for Shorts energy).")
-    parser.add_argument("--pitch", default="+0Hz", help="Pitch adjustment.")
+    parser.add_argument("--pitch", default="+0Hz", help="Pitch adjustment (default: +0Hz).")
     parser.add_argument("--gap", type=float, default=0.06, help="Inter-shot silence gap in seconds (default: 0.06).")
     parser.add_argument("--font", default="", help="Override caption font family (auto-detected via fc-match).")
     parser.add_argument(
@@ -920,7 +1348,7 @@ def main() -> int:
         "--tilt",
         type=float,
         default=DEFAULT_TILT_DEG,
-        help=f"Alternating micro-tilt degrees on keyword punchlines; 0 disables (default: {DEFAULT_TILT_DEG}).",
+        help=f"Alternating tilt in degrees on keyword lines; set 0 to disable (default: {DEFAULT_TILT_DEG}).",
     )
     parser.add_argument(
         "--caption-style",
@@ -942,9 +1370,19 @@ def main() -> int:
         "--max-chars",
         type=int,
         default=None,
-        help=f"Maximum visible characters per caption line for 1080px horizontal safety (default: plan max_caption_chars or {DEFAULT_MAX_CHARS}).",
+        help=f"Maximum visible characters per caption line (default: plan max_caption_chars or {DEFAULT_MAX_CHARS}).",
     )
     parser.add_argument("--autofix", action="store_true", help="Auto-rewrite TTS_MISREAD patterns during synthesis.")
+    parser.add_argument(
+        "--strict-slop",
+        action="store_true",
+        help="Fail with exit code 2 if any AI_SLOP_SCRIPT warning is found.",
+    )
+    parser.add_argument(
+        "--no-slop-check",
+        action="store_true",
+        help="Skip AI_SLOP_SCRIPT narration warnings.",
+    )
     args = parser.parse_args()
 
     if args.max_chars is not None and args.max_chars < 1:
@@ -958,7 +1396,12 @@ def main() -> int:
 
     if args.lint_plan:
         plan = json.loads(Path(args.lint_plan).read_text(encoding="utf-8"))
-        return lint_plan(plan)
+        return lint_plan(
+            plan,
+            check_slop=not args.no_slop_check,
+            strict_slop=args.strict_slop,
+            check_tts_misread=True,
+        )
 
     if args.shot_plan:
         if not args.out_dir:

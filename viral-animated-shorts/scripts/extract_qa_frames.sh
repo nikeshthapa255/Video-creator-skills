@@ -5,8 +5,21 @@ set -euo pipefail
 # Uses video-stream duration + -sseof to avoid empty f_end.png caused by AAC audio padding.
 # Usage: extract_qa_frames.sh <clip.mp4> <out_dir> [prev_clip.mp4]
 
+usage() {
+  cat <<EOF
+Extract sampled QA frames (start, mid, action peak, end) from a video clip, plus an optional previous clip end frame.
+
+Usage: $0 <clip.mp4> <out_dir> [prev_clip.mp4]
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 <clip.mp4> <out_dir> [prev_clip.mp4]" >&2
+  usage >&2
   exit 2
 fi
 

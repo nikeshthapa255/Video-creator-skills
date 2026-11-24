@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Pure-Python procedural BGM generator for Shorts series mood/BPM rotation.
+"""Generate procedural background music for Shorts (48 kHz 16-bit stereo WAV).
 
-Outputs a 48 kHz 16-bit stereo WAV sized to the requested duration with smooth fades.
+Sizes the output to the requested duration with smooth fades.
 Supported moods:
-  dramatic_news     (default 104 BPM) — warm newsroom D-minor sub-bass pulse, string/synth swells, soft rim-tick
-  cinematic_tension (default  96 BPM) — dark investigative cello/drone bed, slow tension swells, heartbeat pulse
-  miami_pop         (default 122 BPM) — upbeat synth-pop chords, bouncy bass, crisp hats
-  retro_drive       (default 112 BPM) — synthwave arpeggio, punchy octave bass, snare pulse
-  tech_pulse        (default 128 BPM) — plucky minimal electronic arp, tight sub pulse
-  comedy_quirk      (default 116 BPM) — playful staccato marimba plucks, bouncy bass
+  dramatic_news     (default 104 BPM): warm newsroom D-minor sub-bass pulse, string/synth swells, soft rim-tick
+  cinematic_tension (default  96 BPM): dark investigative cello/drone bed, slow tension swells, heartbeat pulse
+  miami_pop         (default 122 BPM): upbeat synth-pop chords, bouncy bass, crisp hats
+  retro_drive       (default 112 BPM): synthwave arpeggio, punchy octave bass, snare pulse
+  tech_pulse        (default 128 BPM): plucky minimal electronic arp, tight sub pulse
+  comedy_quirk      (default 116 BPM): playful staccato marimba plucks, bouncy bass
 
 Example:
   python3 make_bgm.py --mood dramatic_news --duration 40 --out audio/bgm.wav
@@ -432,8 +432,15 @@ def synthesize_bgm(mood: str, duration: float, bpm: int) -> tuple:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Procedural Shorts BGM generator (48 kHz stereo WAV).")
-    parser.add_argument("--mood", choices=sorted(MOOD_CONFIGS), default="miami_pop")
+    parser = argparse.ArgumentParser(
+        description="Generate procedural background music for Shorts (48 kHz 16-bit stereo WAV)."
+    )
+    parser.add_argument(
+        "--mood",
+        choices=sorted(MOOD_CONFIGS),
+        default="miami_pop",
+        help="Music mood preset (default: miami_pop).",
+    )
     parser.add_argument("--duration", type=float, required=True, help="Target duration in seconds.")
     parser.add_argument("--bpm", type=int, default=0, help="Override mood default BPM.")
     parser.add_argument("--out", required=True, help="Output WAV path.")

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Deterministic v2.1 Shorts assembler:
 #   ASS overlap gate + horizontal width warning -> probe & conform (1080x1920, 48kHz stereo) -> concat ->
-#   dialogue-prioritized 3-stem audio mix (clarity-enhanced VO/native + subtle speech-carved sidechain-ducked BGM + controlled SFX) ->
+#   dialogue-prioritized 3-stem audio mix (clarity-enhanced VO/native + speech-carved BGM ducked under dialogue + controlled SFX) ->
 #   safe-zone ASS caption burn -> 2-pass -14 LUFS (LRA=7) loudnorm -> ffprobe verify.
 #
 # Usage:
@@ -12,20 +12,22 @@ set -euo pipefail
 # Environment:
 #   SHORTS_FPS                Output framerate (default: 30)
 #   SHORTS_VO_CLARITY         Enable dialogue clarity EQ/leveling chain: 1 or 0 (default: 1)
-#   SHORTS_BGM_GAIN_DB        Background music gain in dB before ducking (default: -16)
-#   SHORTS_SFX_GAIN_DB        SFX stem gain in dB (default: -3)
-#   SHORTS_MAX_CAPTION_CHARS  Warn if any caption line exceeds this char count (default: 20)
+#   SHORTS_BGM_GAIN_DB        BGM gain in dB before ducking (default: -16)
+#   SHORTS_SFX_GAIN_DB        SFX track gain in dB (default: -3)
+#   SHORTS_MAX_CAPTION_CHARS  Warn if any caption line exceeds this character count (default: 20)
 
 usage() {
   cat <<EOF
+Assemble 1080x1920 Shorts from shot clips, 3-stem audio, and ASS captions, normalized to -14 LUFS.
+
 Usage: $0 <clips_dir> <captions.ass|none> <out.mp4> [voiceover.wav|none] [bgm.wav|none] [sfx.wav|none]
 
 Environment overrides:
   SHORTS_FPS                Output framerate (default: 30)
   SHORTS_VO_CLARITY         Dialogue clarity chain (highpass/EQ/compressor): 1 or 0 (default: 1)
-  SHORTS_BGM_GAIN_DB        Subtle BGM gain in dB before sidechain ducking (default: -16)
-  SHORTS_SFX_GAIN_DB        Non-intrusive SFX stem gain in dB (default: -3)
-  SHORTS_MAX_CAPTION_CHARS  Horizontal width warning threshold in chars for 86px v3.1 captions (default: 20)
+  SHORTS_BGM_GAIN_DB        BGM gain in dB before ducking (default: -16)
+  SHORTS_SFX_GAIN_DB        SFX track gain in dB (default: -3)
+  SHORTS_MAX_CAPTION_CHARS  Warn if any caption line exceeds this character count (default: 20)
 EOF
 }
 
@@ -89,7 +91,7 @@ check_ass_overlaps() {
   ' "$ass_file"
 }
 
-# Warn clearly if any stripped visual caption line exceeds SHORTS_MAX_CAPTION_CHARS
+# Warn if any stripped visual caption line exceeds SHORTS_MAX_CAPTION_CHARS
 check_ass_line_widths() {
   local ass_file="$1"
   local max_chars="$2"
@@ -161,7 +163,7 @@ for clip in "$CLIPS_DIR"/*.mp4; do
 done
 
 if [[ "$idx" -eq 0 ]]; then
-  echo "Error: No .mp4 clips found in $CLIPS_DIR" >&2
+  echo "Error: no .mp4 clips found in $CLIPS_DIR" >&2
   exit 1
 fi
 
@@ -169,9 +171,9 @@ STITCHED="$WORK_DIR/stitched.mp4"
 ffmpeg -y -v error -f concat -safe 0 -i "$CONCAT_LIST" -c copy "$STITCHED"
 
 # Dialogue-prioritized 3-stem audio mix:
-#   Primary (VO_WAV if provided, else stitched native audio) — clarity-enhanced & front-and-center
-#   BGM_WAV (if provided) — speech-carved (HP 60 Hz, LP 6.5 kHz, -3 dB dip @ 2.8 kHz), subtle gain, sidechain-ducked under dialogue
-#   SFX_WAV (if provided) — controlled punch without overwhelming dialogue
+#   Primary (VO_WAV if provided, else stitched native audio): clarity-enhanced lead dialogue
+#   BGM_WAV (if provided): speech-carved (HP 60 Hz, LP 6.5 kHz, -3 dB dip @ 2.8 kHz), ducked under dialogue
+#   SFX_WAV (if provided): controlled punch without overwhelming dialogue
 HAS_VO=0;  [[ -n "$VO_WAV"  && "$VO_WAV"  != "none" ]] && HAS_VO=1
 HAS_BGM=0; [[ -n "$BGM_WAV" && "$BGM_WAV" != "none" ]] && HAS_BGM=1
 HAS_SFX=0; [[ -n "$SFX_WAV" && "$SFX_WAV" != "none" ]] && HAS_SFX=1
