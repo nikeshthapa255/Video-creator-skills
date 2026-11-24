@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Convert an SRT file into zero-overlap v3.1 Fun Kinetic ASS captions for 9:16 Shorts.
+"""Convert an SRT file into zero-overlap v4.0 Fun Kinetic ASS captions for 9:16 Shorts or 16:9 Long-Form videos.
 
 Prefer tts_and_captions_v2.py (exact edge-tts WordBoundary timestamps) when synthesizing VO;
 use this script when converting Whisper/Gemini SRT transcripts.
 
-Features (v3.1 Fun Kinetic):
+Features (v4.0 Fun Kinetic):
   - Auto-detects bold sans font via fc-match (Arial Black -> DejaVu Sans -> Liberation Sans).
-  - 86px bold typography, Outline=8, Shadow=4.5, deeper #30000000 drop shadow.
-  - Lower-third safe placement (--margin-v 420: clear of character torsos and Shorts UI).
-  - Punchy 18-char chunks (--max-chars 18) reset on every SRT cue boundary.
-  - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + alternating
-    +/-2.5 deg micro-tilt on keyword punchlines.
-  - Semantic neon palette (--keyword-color auto): Neon Lime (money/numbers), Fiery
-    Coral-Orange (drama/danger/action), Electric Cyan (brands/tech/AI), Bright Yellow (active).
+  - Aspect-ratio-aware layout (--aspect-ratio 9:16|16:9, default 9:16):
+      * 9:16 (PlayRes 1080x1920): 86px bold, Outline=8, Shadow=4.5, MarginV=420,
+        max_chars=18, tilt=+/-2.5 deg (100% identical to v3.1/v3.2 Shorts).
+      * 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=72,
+        max_chars=36, tilt=0.0 deg (horizontal subtitle framing).
+  - Resets caption chunks cleanly on every SRT cue boundary.
+  - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + optional
+    alternating micro-tilt on keyword punchlines.
+  - Semantic keyword palettes (--keyword-color auto|palace|<BGR hex>).
   - Clamps each event to next_event_start - 0.01s (1 cs) and verifies zero overlaps.
 
 Usage:
-  python3 srt_to_ass.py <input.srt> <output.ass> [--font-size 86] [--max-chars 18] [--margin-v 420] [--keyword-color auto]
+  python3 srt_to_ass.py <input.srt> <output.ass> [--aspect-ratio 9:16|16:9] [--font-size 86] [--max-chars 18] [--margin-v 420] [--keyword-color auto]
 """
 
 import argparse
@@ -39,6 +41,7 @@ from tts_and_captions_v2 import (  # noqa: E402
     build_zero_overlap_events,
     cs_to_ass_time,
     detect_bold_font,
+    get_aspect_preset,
     parse_keyword_list,
 )
 
@@ -108,8 +111,8 @@ def build_word_events(
                 "cue_idx": entry_idx,
             })
 
-    # Delegate directly to v3.1 engine so SRT and edge-tts captions share identical physics,
-    # semantic neon colors, +/-2.5 deg tilt, cue_idx boundary flush, and zero-overlap clamping.
+    # Delegate directly to v4.0 engine so SRT and edge-tts captions share identical physics,
+    # semantic colors, micro-tilt, cue_idx boundary flush, and zero-overlap clamping.
     return build_zero_overlap_events(
         all_words,
         caption_style=caption_style,
@@ -122,28 +125,34 @@ def build_word_events(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert an SRT file into zero-overlap v3.1 Fun Kinetic ASS captions for 9:16 Shorts."
+        description="Convert an SRT file into zero-overlap v4.0 Fun Kinetic ASS captions (9:16 or 16:9)."
     )
     parser.add_argument("input_srt", help="Input .srt path")
     parser.add_argument("output_ass", help="Output .ass path")
+    parser.add_argument(
+        "--aspect-ratio",
+        choices=("9:16", "16:9"),
+        default="9:16",
+        help="Target aspect ratio canvas & defaults (default: 9:16).",
+    )
     parser.add_argument("--font", default="", help="Override bold font family (auto-detected via fc-match).")
     parser.add_argument(
         "--font-size",
         type=int,
-        default=DEFAULT_FONT_SIZE,
-        help=f"Caption font size in px on 1080x1920 canvas (default: {DEFAULT_FONT_SIZE}).",
+        default=None,
+        help=f"Caption font size in px (default: {DEFAULT_FONT_SIZE} for 9:16, 62 for 16:9).",
     )
     parser.add_argument(
         "--margin-v",
         type=int,
-        default=DEFAULT_MARGIN_V,
-        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V}).",
+        default=None,
+        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V} for 9:16, 72 for 16:9).",
     )
     parser.add_argument(
         "--tilt",
         type=float,
-        default=DEFAULT_TILT_DEG,
-        help=f"Alternating tilt in degrees on keyword lines; set 0 to disable (default: {DEFAULT_TILT_DEG}).",
+        default=None,
+        help=f"Alternating tilt in degrees on keyword lines; 0 disables (default: {DEFAULT_TILT_DEG} for 9:16, 0.0 for 16:9).",
     )
     parser.add_argument(
         "--caption-style",
@@ -154,8 +163,8 @@ def main() -> int:
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=DEFAULT_MAX_CHARS,
-        help=f"Maximum visible characters per caption line (default: {DEFAULT_MAX_CHARS}).",
+        default=None,
+        help=f"Maximum visible characters per caption line (default: {DEFAULT_MAX_CHARS} for 9:16, 36 for 16:9).",
     )
     parser.add_argument(
         "--keywords",
@@ -165,17 +174,23 @@ def main() -> int:
     parser.add_argument(
         "--keyword-color",
         default=DEFAULT_KEYWORD_COLOR,
-        help="Keyword color: 'auto' for semantic neon palette (lime/coral/cyan) or ASS BGR hex (default: auto).",
+        help="Keyword color: 'auto' (v3.1 neon), 'palace' (gold/crimson/jade), or ASS BGR hex (default: auto).",
     )
     args = parser.parse_args()
 
-    if args.max_chars < 1:
+    preset = get_aspect_preset(args.aspect_ratio)
+    font_size = args.font_size if args.font_size is not None else int(preset["font_size"])
+    margin_v = args.margin_v if args.margin_v is not None else int(preset["margin_v"])
+    max_chars = args.max_chars if args.max_chars is not None else int(preset["max_chars"])
+    tilt_deg = args.tilt if args.tilt is not None else float(preset["tilt"])
+
+    if max_chars < 1:
         parser.error("--max-chars must be >= 1")
-    if args.font_size < 12:
+    if font_size < 12:
         parser.error("--font-size must be >= 12")
-    if args.margin_v < 0:
+    if margin_v < 0:
         parser.error("--margin-v must be >= 0")
-    if args.tilt < 0:
+    if tilt_deg < 0:
         parser.error("--tilt must be >= 0")
 
     src = Path(args.input_srt)
@@ -187,11 +202,18 @@ def main() -> int:
         caption_style=args.caption_style,
         keywords=parse_keyword_list(args.keywords),
         keyword_color=args.keyword_color,
-        max_chars=args.max_chars,
-        tilt_deg=args.tilt,
+        max_chars=max_chars,
+        tilt_deg=tilt_deg,
     )
 
-    lines = [build_ass_header(font_name, font_size=args.font_size, margin_v=args.margin_v).rstrip()]
+    lines = [
+        build_ass_header(
+            font_name,
+            font_size=font_size,
+            margin_v=margin_v,
+            aspect_ratio=args.aspect_ratio,
+        ).rstrip()
+    ]
     for start_cs, end_cs, text in events:
         lines.append(f"Dialogue: 0,{cs_to_ass_time(start_cs)},{cs_to_ass_time(end_cs)},ShortsHook,,0,0,0,,{text}")
 
@@ -199,8 +221,8 @@ def main() -> int:
     dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(
         f"Wrote {len(events)} zero-overlap caption events "
-        f"(font='{font_name}' {args.font_size}px, margin_v={args.margin_v}, style={args.caption_style}, "
-        f"max_chars={args.max_chars}, kw_color={args.keyword_color}, tilt=+/-{args.tilt:g}deg) to {dst}"
+        f"({args.aspect_ratio}, font='{font_name}' {font_size}px, margin_v={margin_v}, style={args.caption_style}, "
+        f"max_chars={max_chars}, kw_color={args.keyword_color}, tilt=+/-{tilt_deg:g}deg) to {dst}"
     )
     return 0
 

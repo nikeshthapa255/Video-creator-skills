@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ViralAnimatedShortShotPlan",
+  "title": "ViralAnimatedVideoShotPlan",
   "type": "object",
   "required": [
     "slug",
@@ -14,9 +14,25 @@
     "hook_gate",
     "fun_pacing_gate",
     "characters",
-    "shots",
-    "loop_bridge"
+    "shots"
   ],
+  "if": {
+    "properties": {
+      "video_format": { "const": "long_form" }
+    },
+    "required": ["video_format"]
+  },
+  "then": {
+    "properties": {
+      "target_duration_sec": { "minimum": 60, "maximum": 1800 }
+    }
+  },
+  "else": {
+    "required": ["loop_bridge"],
+    "properties": {
+      "target_duration_sec": { "minimum": 10, "maximum": 60 }
+    }
+  },
   "properties": {
     "slug": {
       "type": "string",
@@ -25,10 +41,16 @@
     "title": {
       "type": "string"
     },
+    "video_format": {
+      "type": "string",
+      "enum": ["short", "long_form"],
+      "default": "short",
+      "description": "short = 30-55s 9:16 Short with replay loop; long_form = 3-15+ min multi-act episode (9:16 vertical micro-drama or 16:9 horizontal YouTube video) with multi-voice cast, Act-aware BGM, and chunked QA."
+    },
     "production_mode": {
       "type": "string",
-      "enum": ["omni_video", "keyframe_motion"],
-      "description": "omni_video = Gemini Omni 1.2 Flash video generation; keyframe_motion = zero-API-key 9:16 keyframes with 2x-supersampled FFmpeg motion."
+      "enum": ["omni_video", "keyframe_motion", "hybrid"],
+      "description": "omni_video = Gemini Omni 1.2 Flash video generation; keyframe_motion = zero-API-key keyframes with 2x-supersampled FFmpeg motion; hybrid = mixes Mode A hero clips with Mode B motion shots via per-shot production_mode."
     },
     "mode": {
       "type": "string",
@@ -36,12 +58,18 @@
     },
     "aspect_ratio": {
       "type": "string",
-      "enum": ["9:16"]
+      "enum": ["9:16", "16:9"],
+      "description": "9:16 = 1080x1920 vertical Shorts or serialized micro-dramas; 16:9 = 1920x1080 horizontal long-form YouTube episodes or explainers."
     },
     "target_duration_sec": {
       "type": "number",
       "minimum": 10,
-      "maximum": 60
+      "maximum": 1800
+    },
+    "ending_style": {
+      "type": "string",
+      "enum": ["replay_loop", "cliffhanger", "outro"],
+      "description": "replay_loop = Shorts dual-anchor loop back to Shot 1; cliffhanger = serialized multi-episode drama hook; outro = standalone long-form conclusion/CTA."
     },
     "audio_mode": {
       "type": "string",
@@ -49,26 +77,62 @@
     },
     "voice": {
       "type": "string",
-      "description": "Neural TTS voice (e.g., en-US-AvaNeural, en-US-EmmaNeural, en-US-JennyNeural)."
+      "description": "Default/fallback neural TTS voice (e.g., en-US-AvaNeural, en-US-EmmaNeural, en-GB-SoniaNeural)."
+    },
+    "voice_cast": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["voice"],
+        "properties": {
+          "voice": {
+            "type": "string",
+            "description": "WordBoundary-verified edge-tts neural voice (e.g., en-GB-SoniaNeural, en-US-AvaNeural, en-GB-RyanNeural, en-US-EmmaNeural, en-GB-ThomasNeural)."
+          },
+          "rate": {
+            "type": "string",
+            "description": "Speech rate offset such as '+14%' or '+0%'."
+          },
+          "pitch": {
+            "type": "string",
+            "description": "Pitch offset such as '-2Hz' or '+4Hz'."
+          },
+          "keyword_color": {
+            "type": "string",
+            "description": "Optional speaker-specific ASS BGR hex accent color (e.g., '&H00D7FF&') for kinetic captions."
+          }
+        }
+      },
+      "description": "Multi-voice speaker map for long-form episodes (maps shot.speaker to voice, rate, pitch, and optional caption accent color)."
     },
     "tts_pronunciations": {
       "type": "object",
       "additionalProperties": { "type": "string" },
-      "description": "Optional map of clean display strings to phonetic TTS strings (e.g., {\"AWS\": \"A W S\", \"GTA 6\": \"GTA Six\", \"911\": \"nine-one-one\"}). Applied during TTS synthesis while captions render dialogue_or_vo."
+      "description": "Optional map of clean display strings to phonetic TTS strings (e.g., {\"AWS\": \"A W S\", \"Pei Xuan\": \"Pay Shwen\", \"911\": \"nine-one-one\"}). Applied during TTS synthesis while captions render dialogue_or_vo."
     },
     "bgm_mood": {
       "type": "string",
-      "enum": ["dramatic_news", "cinematic_tension", "miami_pop", "retro_drive", "tech_pulse", "comedy_quirk", "none"]
+      "enum": [
+        "dramatic_news",
+        "cinematic_tension",
+        "miami_pop",
+        "retro_drive",
+        "tech_pulse",
+        "comedy_quirk",
+        "palace_drama",
+        "epic_story",
+        "none"
+      ]
     },
     "bgm_bpm": {
       "type": "integer",
-      "minimum": 80,
+      "minimum": 60,
       "maximum": 160
     },
     "bgm_source": {
       "type": "string",
-      "enum": ["retrieved_track", "procedural"],
-      "description": "retrieved_track = dramatic instrumental via retrieve_music.py; procedural = synthesized stem via make_bgm.py."
+      "enum": ["retrieved_track", "procedural", "procedural_act_aware"],
+      "description": "retrieved_track = instrumental via retrieve_music.py; procedural = synthesized stem via make_bgm.py; procedural_act_aware = multi-act score locked to shot_timings.json act boundaries."
     },
     "bgm_query": {
       "type": "string",
@@ -76,27 +140,27 @@
     },
     "caption_style": {
       "type": "string",
-      "enum": ["kinetic_keyword", "karaoke_chunk"],
-      "description": "kinetic_keyword = v3.1 word-by-word pop with color-coded highlight_keywords, +/-2.5 deg tilt, and elastic bounce; karaoke_chunk = bounce-pop phrase chunks."
+      "enum": ["kinetic_keyword", "karaoke_chunk", "clean_subtitle", "none"],
+      "description": "kinetic_keyword = word-by-word pop with semantic highlights; karaoke_chunk = bounce-pop phrase chunks; clean_subtitle = 16:9 widescreen lower-third subtitles without tilt; none = no burned-in captions (use --export-srt for YouTube CC)."
     },
     "caption_font_size": {
       "type": "integer",
-      "minimum": 48,
+      "minimum": 36,
       "maximum": 120,
       "default": 86,
-      "description": "ASS caption font size on the 1080x1920 vertical canvas (v3.1 default: 86)."
+      "description": "ASS caption font size (defaults: 86 on 1080x1920, 62 on 1920x1080)."
     },
     "caption_margin_v": {
       "type": "integer",
-      "minimum": 200,
+      "minimum": 40,
       "maximum": 800,
       "default": 420,
-      "description": "ASS MarginV offset from the bottom in px (v3.1 default: 420; sits in the lower third, above Shorts UI and below character torsos)."
+      "description": "ASS MarginV offset from bottom in px (defaults: 420 on 1080x1920 vertical, 72 on 1920x1080 horizontal)."
     },
     "caption_keyword_color": {
       "type": "string",
       "default": "auto",
-      "description": "Keyword highlight mode: 'auto' for v3.1 semantic neon palette (Neon Lime for money/numbers, Fiery Coral-Orange for drama/danger, Electric Cyan for brands/tech) or an ASS BGR hex code."
+      "description": "Keyword highlight mode: 'auto' (semantic neon), 'palace' (Imperial Gold / Fiery Crimson-Coral / Pearl Cyan-Jade), or an ASS BGR hex code."
     },
     "highlight_keywords": {
       "type": "array",
@@ -110,6 +174,25 @@
     "style_bible": {
       "type": "string",
       "description": "Verbatim rendering, lighting, camera, and palette block appended to every shot prompt. Forbid signage with 'unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage' (never 'blank signs')."
+    },
+    "acts": {
+      "type": "array",
+      "description": "Optional multi-act / chapter outline for long-form episodes (used for modular act authoring, Act-aware BGM dynamics, and YouTube chapter export).",
+      "items": {
+        "type": "object",
+        "required": ["act", "title"],
+        "properties": {
+          "act": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string" },
+          "act_file": { "type": "string", "description": "Optional modular act JSON path (e.g., acts/act_01.json)." },
+          "target_duration_sec": { "type": "number", "minimum": 10 },
+          "bgm_intensity": {
+            "type": "string",
+            "enum": ["sparse", "tense", "escalating", "climax", "epilogue"]
+          },
+          "summary": { "type": "string" }
+        }
+      }
     },
     "hook_gate": {
       "type": "object",
@@ -126,8 +209,8 @@
       "type": "object",
       "required": ["word_count", "avg_shot_length_sec", "sfx_cue_count", "visual_gag_every_2_3_shots", "tts_lint_passed", "passed"],
       "properties": {
-        "word_count": { "type": "integer", "minimum": 30, "maximum": 160 },
-        "avg_shot_length_sec": { "type": "number", "minimum": 1.0, "maximum": 4.5 },
+        "word_count": { "type": "integer", "minimum": 30, "maximum": 4500 },
+        "avg_shot_length_sec": { "type": "number", "minimum": 1.0, "maximum": 8.0 },
         "sfx_cue_count": { "type": "integer", "minimum": 0 },
         "visual_gag_every_2_3_shots": { "type": "boolean" },
         "tts_lint_passed": { "type": "boolean" },
@@ -138,9 +221,9 @@
         "max_caption_chars": {
           "type": "integer",
           "minimum": 10,
-          "maximum": 36,
+          "maximum": 48,
           "default": 18,
-          "description": "Max characters per caption line to prevent horizontal clipping on 1080px frames at 86px font, 126% pop, and +/-2.5 deg tilt (v3.1 default: 18)."
+          "description": "Max characters per caption line (defaults: 18 on 1080x1920 at 86px; 36 on 1920x1080 at 62px)."
         },
         "passed": { "type": "boolean" }
       }
@@ -148,7 +231,9 @@
     "series_metadata": {
       "type": "object",
       "properties": {
+        "series_name": { "type": "string" },
         "episode_id": { "type": "string" },
+        "series_bible_path": { "type": "string" },
         "master_sheet_path": { "type": "string" },
         "production_log_path": { "type": "string" }
       }
@@ -165,6 +250,15 @@
           "visual_traits": { "type": "string" },
           "sheet_2d_path": { "type": "string" },
           "sheet_3d_path": { "type": "string" },
+          "state_sheets": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Optional map of costume/visual states to locked turnaround sheet paths (e.g., {\"veiled\": \"sheets/hero_veiled.png\", \"unveiled\": \"sheets/hero.png\"})."
+          },
+          "continuity_notes": {
+            "type": "string",
+            "description": "Optional progressive damage, wardrobe, or prop continuity notes tracked across Acts and into the next episode."
+          },
           "reference_image_path": {
             "type": "string",
             "description": "Optional path to Stage 0 verified portrait or official mascot reference image."
@@ -195,8 +289,23 @@
         ],
         "properties": {
           "shot_id": { "type": "string" },
-          "duration_sec": { "type": "number", "minimum": 1.5, "maximum": 15 },
+          "act": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Act or chapter number (1..N) for long-form episodes."
+          },
+          "production_mode": {
+            "type": "string",
+            "enum": ["omni_video", "keyframe_motion"],
+            "description": "Optional per-shot override when top-level production_mode is hybrid."
+          },
+          "duration_sec": { "type": "number", "minimum": 1.0, "maximum": 15 },
           "characters": { "type": "array", "items": { "type": "string" } },
+          "character_states": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Optional per-character state sheet selector for this shot (e.g., {\"lin_wanyin\": \"veiled\"})."
+          },
           "spatial_layout": { "type": "string" },
           "beats": {
             "type": "array",
@@ -213,13 +322,46 @@
           "camera": { "type": "string" },
           "motion_preset": {
             "type": "string",
-            "enum": ["whip_zoom", "bounce_pop", "shake_zoom", "zoom_in", "zoom_out", "pan_left", "pan_right", "static_drift"],
+            "enum": [
+              "whip_zoom",
+              "bounce_pop",
+              "shake_zoom",
+              "zoom_in",
+              "zoom_out",
+              "pan_left",
+              "pan_right",
+              "static_drift",
+              "slow_dolly_in",
+              "tilt_up"
+            ],
             "default": "zoom_in"
           },
           "flash_in": { "type": "boolean", "default": false },
+          "speaker": {
+            "type": "string",
+            "description": "Optional speaker key referencing top-level voice_cast for multi-voice episodes."
+          },
+          "voice": {
+            "type": "string",
+            "description": "Optional per-shot neural TTS voice override."
+          },
+          "rate": {
+            "type": "string",
+            "description": "Optional per-shot TTS speech rate override (e.g., '+14%')."
+          },
+          "pitch": {
+            "type": "string",
+            "description": "Optional per-shot TTS pitch override (e.g., '-2Hz')."
+          },
+          "post_gap_sec": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 3.0,
+            "description": "Optional silence pause after this shot (e.g., 0.25 at Act breaks, 0.0 on the final shot)."
+          },
           "dialogue_or_vo": {
             "type": "string",
-            "description": "Spoken narration or dialogue in clean display English (e.g., AWS, GTA 6, 911, $75,000, Nov 24) and natural speech without AI slop or dropped grammar; drives captions (see references/spoken_english_guide.md)."
+            "description": "Spoken narration or dialogue in clean display English and natural speech without AI slop or dropped grammar; drives captions (see references/spoken_english_guide.md)."
           },
           "tts_text": {
             "type": "string",
@@ -232,7 +374,29 @@
           },
           "sfx_type": {
             "type": "string",
-            "enum": ["record_scratch", "vine_boom", "siren_chirp", "bonk_boing", "cash_ching", "ding_levelup", "laser_zap", "whoosh", "pop", "none"]
+            "enum": [
+              "record_scratch",
+              "vine_boom",
+              "siren_chirp",
+              "bonk_boing",
+              "cash_ching",
+              "ding_levelup",
+              "laser_zap",
+              "whoosh",
+              "pop",
+              "palace_gong",
+              "war_drum_hit",
+              "silk_whoosh",
+              "jade_clink",
+              "porcelain_shatter",
+              "blade_unsheathe",
+              "guzheng_gliss",
+              "fire_crackle_burst",
+              "court_gasp_swell",
+              "cinematic_riser",
+              "heartbeat_pulse",
+              "none"
+            ]
           },
           "sfx_cue": { "type": "string" },
           "sfx_offset_sec": { "type": "number", "default": 0.0 },
@@ -242,14 +406,14 @@
           "dual_anchor_loop": {
             "type": "boolean",
             "default": false,
-            "description": "True on the final shot to pass both the character sheet and shot_01 keyframe so the ending cuts smoothly into Frame 0."
+            "description": "True on the final shot of a Short to pass both the character sheet and shot_01 keyframe for replay loops. Keep false on long-form episodes."
           }
         }
       }
     },
     "loop_bridge": {
       "type": "string",
-      "description": "Final spoken phrase that connects naturally into Shot 1's opening line."
+      "description": "Final spoken phrase that connects naturally into Shot 1's opening line (required for Shorts; omit for long-form episodes)."
     }
   }
 }

@@ -67,10 +67,19 @@ Do not strip the script down into stiff, robotic telegraphese. Keep:
 - **Voice and real escalations:** Keep character attitude and real comedic rule-of-three escalations (three escalating gags are comedy; three filler adjectives like `"fast, sleek, and innovative"` are slop).
 - **Real contrasts:** Keep a contrast when both halves add new facts or correct a real misconception.
 
+## Long-form multi-character dialogue and Act pacing
+
+When writing 3-15+ minute multi-act episodes (`video_format: "long_form"`):
+- **Differentiate character rhythm, not just TTS voice:** Give each character distinct sentence length and diction (for example, crisp measured commands for authority figures, clipped taunts for rivals, economical narration between dialogue beats) so scenes play like a real screenplay rather than one narrator reading every part.
+- **Let Act breaks breathe:** End each Act on a concrete turning point or question and give that final shot `post_gap_sec: 0.25` (vertical drama) or `0.35` (16:9 episode) so the viewer absorbs the turn before the next Act starts.
+- **Keep foreign, historical, and brand names clean in `dialogue_or_vo`:** Put phonetic hints (`"Lin Wanyin": "Lin Wahn-yeen"`, `"Pei Xuan": "Pay Shwen"`, `"Hanfu": "Hahn-foo"`) in top-level `tts_pronunciations` so every Act uses the same pronunciation while captions stay cleanly spelled.
+- **Skip forced Shorts loops:** Close long-form episodes on a concrete cliffhanger (`ending_style: "cliffhanger"`) or a crisp closing thought (`ending_style: "outro"`), never a mechanical `"Which is why..."` loop back to Shot 1.
+
 ## Four-point read-aloud check
 
-Run `python3 scripts/tts_and_captions_v2.py --lint-plan shot_plan.json`, then read the script aloud in 35 to 40 seconds before Stage 2 TTS:
-1. **Friend test:** Would you say every line out loud to a friend without tripping over legalese, missing words, buzzwords, or fast-TTS slurs (like `"legend hid"` blurring into `"legend did"`)?
+Run `python3 scripts/tts_and_captions_v2.py --lint-plan shot_plan.json`, then read the script (or each Act) aloud before Stage 2 TTS:
+1. **Friend test:** Would you say every line out loud without tripping over legalese, missing words, buzzwords, or fast-TTS slurs (like `"legend hid"` blurring into `"legend did"`)?
 2. **Cadence:** Do shot lengths move between quick punchlines and fuller setups instead of repeating the same 10-word beat?
-3. **Display vs. TTS:** Does `dialogue_or_vo` look right on screen, with awkward acronyms, numbers, and dates moved into `tts_pronunciations` or `tts_text`?
-4. **Cold open and loop:** Does Shot 1 hit cold at `0:00`, and does the last beat loop back without a dead-drop `"Which is why..."` or a moral lecture?
+3. **Display vs. TTS:** Does `dialogue_or_vo` look right on screen, with awkward acronyms, foreign names, numbers, and dates moved into `tts_pronunciations` or `tts_text`?
+4. **Opening and ending:** Does Shot 1 hit cold at `0:00`, and does the closing beat land cleanly (a natural loop for Shorts, or a sharp cliffhanger/outro for long-form episodes)?
+
