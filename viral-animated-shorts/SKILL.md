@@ -12,7 +12,7 @@ description: >-
   Reels, or TikToks.
 ---
 
-# Viral Animated Shorts Pipeline (v3)
+# Viral Animated Shorts Pipeline (v3.1)
 
 Produce upload-ready `1080x1920` (9:16) animated Shorts (2D stickman-in-3D or stylized 3D) in two official production modes:
 
@@ -54,7 +54,7 @@ Store all artifacts inside `<project_dir>/` (e.g., `shorts/<slug>/`):
    - Set `production_mode` (`omni_video` or `keyframe_motion`), `audio_mode` (`tts_plus_bgm` recommended for audio-first pacing, or `native_omni` for Mode A comedic dialogue), and `character_references_path` pointing to `<project_dir>/character_references.json`.
    - Lock one verbatim `style_bible` string reused across every shot prompt. **Never write `"blank signs"`** (models render the literal word `"BLANK"`). Always use `"unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage"`.
    - Define every character with `no_held_props_confirmed: true`, `reference_image_path` (from Stage 0), and `likeness_verified: true` (after inspecting references/sheets).
-   - Configure kinetic captions (`caption_style: "kinetic_keyword"`, `fun_pacing_gate.max_caption_chars: 24`) and optional `highlight_keywords` (top-level and/or per-shot high-impact words, dollar amounts, or punchline nouns).
+   - Configure v3.1 Fun Kinetic captions (`caption_style: "kinetic_keyword"`, `fun_pacing_gate.max_caption_chars: 18`, `caption_font_size: 86`, `caption_margin_v: 420`, `caption_keyword_color: "auto"`) and optional `highlight_keywords` (top-level and/or per-shot high-impact words, dollar amounts, or punchline nouns).
    - Configure music fit (`bgm_source`: `"retrieved_track"` or `"procedural"`, `bgm_mood`: `"dramatic_news"` or `"cinematic_tension"` for news/commentary, or `"miami_pop"` / `"retro_drive"` / `"tech_pulse"` / `"comedy_quirk"` for comedy/upbeat Shorts; optional `bgm_query`).
    - Assign a synced `sfx_type` cue to punchline/transition beats (`record_scratch`, `vine_boom`, `siren_chirp`, `bonk_boing`, `cash_ching`, `ding_levelup`, `laser_zap`, `whoosh`, `pop`).
    - Write `loop_bridge` so the final line flows syntactically into Shot 1's opening line.
@@ -68,16 +68,19 @@ Store all artifacts inside `<project_dir>/` (e.g., `shorts/<slug>/`):
 1. **Turnaround Sheets Anchored to Stage 0 References:** Generate one 16:9 3-panel sheet per character (`Front | 3/4 Side | Back`) using `references/sheet_prompt_templates.md` (Template 1A for 2D stickman, Template 1B for official product mascots anchored directly to the Stage 0 image, Template 1C for stylized 3D real people — plain light-gray background, neutral pose, zero held props). Save to `<project_dir>/sheets/<char>_2d.png` (or `<char>_3d.png`) and inspect side-by-side against the Stage 0 reference image with `read_file` / `view_file`.
    - **Celebrity Photo-to-Image Fallback:** If an image model refuses direct photo-to-image on a public figure portrait, (a) visually inspect the Stage 0 portrait via `read_file`, (b) encode exact observable likeness traits (hairline/color, facial structure, eyewear, age, signature jacket/attire) into Template 1C without passing the raw photo, (c) visually verify the generated 3-panel turnaround sheet side-by-side against the Stage 0 portrait, and (d) anchor **all** Stage 3 scenes exclusively to that locked turnaround sheet.
    - For Mode A, upload approved turnaround sheets once with `gemini-api files upload <sheet> --wait`.
-2. **Audio-First Synthesis + Kinetic Word-by-Word Keyword Captions (Standard for Mode B & `tts_plus_bgm` Mode A):** Synthesize per-shot VO first so every clip is animated to its exact spoken duration (eliminates `AUDIO_DESYNC`), while generating horizontal-safe kinetic captions (`--max-chars 24` prevents `CAPTION_CLIP_HORIZONTAL` on `1080px` width):
+2. **Audio-First Synthesis + v3.1 Fun Kinetic Captions (Standard for Mode B & `tts_plus_bgm` Mode A):** Synthesize per-shot VO first so every clip is animated to its exact spoken duration (eliminates `AUDIO_DESYNC`), while generating bold `86px` lower-third kinetic captions (`--margin-v 420` off character torsos & above Shorts UI, `--max-chars 18` for zero clipping at `126%` pop + `+/-2.5 deg` tilt, `Outline=8`, `Shadow=4.5`, semantic neon `--keyword-color auto`, and clean chunk flush on every `shot_id` cut):
    ```sh
    python3 scripts/tts_and_captions_v2.py \
      --shot-plan <project_dir>/shot_plan.json \
      --out-dir <project_dir>/audio \
      --voice en-US-AvaNeural \
      --caption-style kinetic_keyword \
-     --max-chars 24
+     --font-size 86 \
+     --max-chars 18 \
+     --margin-v 420 \
+     --keyword-color auto
    ```
-   This outputs `audio/voiceover.wav`, exact `audio/shot_timings.json`, and zero-overlap kinetic word-pop `audio/captions.ass` with `highlight_keywords` emphasized from exact `edge-tts` `WordBoundary` timestamps.
+   This outputs `audio/voiceover.wav`, exact `audio/shot_timings.json`, and zero-overlap v3.1 Fun Kinetic `audio/captions.ass` built from exact `edge-tts` `WordBoundary` timestamps.
 3. **SFX + Dramatic Instrumental Music Retrieval / Procedural BGM:**
    ```sh
    python3 scripts/sfx_engine.py \
@@ -133,7 +136,8 @@ Store all artifacts inside `<project_dir>/` (e.g., `shorts/<slug>/`):
 ### Stage 6: Dialogue-Prioritized Balanced Audio 3-Stem Assembly & Audio Watch-Through
 1. If building captions from an `.srt` instead of `tts_and_captions_v2.py`:
    ```sh
-   python3 scripts/srt_to_ass.py <input.srt> <project_dir>/audio/captions.ass --max-chars 24
+   python3 scripts/srt_to_ass.py <input.srt> <project_dir>/audio/captions.ass \
+     --font-size 86 --max-chars 18 --margin-v 420 --keyword-color auto
    ```
 2. Run the dialogue-prioritized 3-stem assembler (verifies zero `CAPTION_OVERLAP`, conforms to `1080x1920`, applies vocal clarity EQ on VO via `SHORTS_VO_CLARITY=1`, places subtle speech-band frequency-carved & sidechain-ducked BGM at `-16 dB` via `SHORTS_BGM_GAIN_DB=-16`, layers non-ducked SFX, burns safe-zone kinetic `.ass` captions, applies 2-pass `-14 LUFS` `loudnorm`, and probes output):
    ```sh

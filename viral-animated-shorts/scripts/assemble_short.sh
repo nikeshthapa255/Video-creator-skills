@@ -14,7 +14,7 @@ set -euo pipefail
 #   SHORTS_VO_CLARITY         Enable dialogue clarity EQ/leveling chain: 1 or 0 (default: 1)
 #   SHORTS_BGM_GAIN_DB        Background music gain in dB before ducking (default: -16)
 #   SHORTS_SFX_GAIN_DB        SFX stem gain in dB (default: -3)
-#   SHORTS_MAX_CAPTION_CHARS  Warn if any caption line exceeds this char count (default: 26)
+#   SHORTS_MAX_CAPTION_CHARS  Warn if any caption line exceeds this char count (default: 20)
 
 usage() {
   cat <<EOF
@@ -25,7 +25,7 @@ Environment overrides:
   SHORTS_VO_CLARITY         Dialogue clarity chain (highpass/EQ/compressor): 1 or 0 (default: 1)
   SHORTS_BGM_GAIN_DB        Subtle BGM gain in dB before sidechain ducking (default: -16)
   SHORTS_SFX_GAIN_DB        Non-intrusive SFX stem gain in dB (default: -3)
-  SHORTS_MAX_CAPTION_CHARS  Horizontal width warning threshold in chars (default: 26)
+  SHORTS_MAX_CAPTION_CHARS  Horizontal width warning threshold in chars for 86px v3.1 captions (default: 20)
 EOF
 }
 
@@ -55,7 +55,7 @@ SHORTS_FPS="${SHORTS_FPS:-30}"
 SHORTS_VO_CLARITY="${SHORTS_VO_CLARITY:-1}"
 SHORTS_BGM_GAIN_DB="${SHORTS_BGM_GAIN_DB:--16}"
 SHORTS_SFX_GAIN_DB="${SHORTS_SFX_GAIN_DB:--3}"
-SHORTS_MAX_CAPTION_CHARS="${SHORTS_MAX_CAPTION_CHARS:-26}"
+SHORTS_MAX_CAPTION_CHARS="${SHORTS_MAX_CAPTION_CHARS:-20}"
 
 BGM_GAIN_DB="${SHORTS_BGM_GAIN_DB%dB}"
 SFX_GAIN_DB="${SHORTS_SFX_GAIN_DB%dB}"

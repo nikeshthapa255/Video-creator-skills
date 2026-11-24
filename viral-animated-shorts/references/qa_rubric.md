@@ -23,7 +23,7 @@ Avoid slow 50-second "explainer slideshow" pacing. Target:
 2. **Rapid Cuts:** `10-14 shots` with **Average Shot Length `<= 3.5s`** (sweet spot: `2.5-3.5s` per shot in Mode B; `<= 2.5s` per beat in Mode A).
 3. **Comedic / News SFX Density:** Synced SFX cues (`vine_boom`, `record_scratch`, `bonk_boing`, `cash_ching`, `siren_chirp`, `ding_levelup`, `laser_zap`, `whoosh`, `pop`) across punchlines and transitions — never voice + flat music alone.
 4. **Visual Gag Cadence:** A visual gag, prop reaction, extreme pose change, or tonal shift every **2-3 shots** (never a single-pose lecture).
-5. **Pre-TTS Linter & Caption Width Cap:** `tts_and_captions_v2.py --lint-plan shot_plan.json` exits 0 with zero `TTS_MISREAD` risks, and `max_caption_chars` is set to `<= 24` (`--max-chars 24`).
+5. **Pre-TTS Linter & v3.1 Caption Width Cap:** `tts_and_captions_v2.py --lint-plan shot_plan.json` exits 0 with zero `TTS_MISREAD` risks, and `max_caption_chars` is set to `<= 18` (`--font-size 86 --max-chars 18 --margin-v 420 --keyword-color auto`).
 
 ## Part B: Context-Aware Multi-Frame Clip / Keyframe QA
 
@@ -70,7 +70,7 @@ Return a JSON verdict per shot:
 - `LITERAL_BLANK_SIGN`: Model literally prints `"BLANK"`, `"EMPTY"`, or `"ADSPACE AVAILABLE"` on signs/trucks because the prompt said `"blank signs"`.
 - `TTS_MISREAD`: Neural TTS mispronounces currency, numbers, or phrases (e.g., `"$700 PS5 Pro"` -> *"seven hundred dollars PS5 Pro"*, `"no 60 FPS"` -> *"number sixty FPS"*).
 - `CAPTION_OVERLAP`: Two ASS `Dialogue:` events overlap in time, stacking two subtitle lines vertically.
-- `CAPTION_CLIP_HORIZONTAL`: A caption line exceeds safe horizontal width (`> 24-26` chars), overflowing or crowding the left/right edges of the `1080px` frame.
+- `CAPTION_CLIP_HORIZONTAL`: A caption line exceeds safe horizontal width (`> 18-20` chars at `86px` v3.1 scale with `126%` pop + `+/-2.5 deg` tilt), overflowing or crowding the left/right edges of the `1080px` frame.
 - `AUDIO_DESYNC`: Dialogue clips off at boundary, drifts out of sync with visual cuts, or SFX fires off-beat.
 - `BGM_OVERPOWERS_VO`: Background music is too loud or clashes in the `2-4 kHz` speech presence band, masking or muddying the narration.
 - `BGM_TONE_MISMATCH`: Background music genre/mood clashes with script tone (e.g., quirky arcade/chiptune track under serious breaking news or high-stakes commentary).
@@ -79,9 +79,10 @@ Return a JSON verdict per shot:
 
 ## Part C: Captions, Audio Balance & Final Multimodal Delivery Gate (Mandatory)
 
-### Part C1: Kinetic Captions & Horizontal Safe-Width Gate
-1. **Horizontal Safe Width (`<= 24-26` chars):** Every rendered caption chunk stays at or below `24` characters (`--max-chars 24`, hard ceiling `26`) with comfortable left/right padding inside `1080px` width — zero edge clipping (`CAPTION_CLIP_HORIZONTAL`).
-2. **Dynamic Kinetic Readability:** Captions use word-by-word kinetic pop (`--caption-style kinetic_keyword`) with high-impact `highlight_keywords` (names, dollar figures, punchlines) visually emphasized, zero vertical stacking (`CAPTION_OVERLAP` assertion passes), and strict safe-zone placement (top 15% and bottom 35% clear of YouTube/TikTok/Reels chrome).
+### Part C1: v3.1 Fun Kinetic Captions & Safe-Zone Gate
+1. **Horizontal Safe Width (`<= 18` chars at `86px`):** Every rendered caption chunk stays at or below `18` characters (`--font-size 86 --max-chars 18`, warning ceiling `20`) with ~45-50px side margins at peak `126%` pop and `+/-2.5 deg` tilt — zero edge clipping (`CAPTION_CLIP_HORIZONTAL`).
+2. **Lower-Third Safe Placement & High Contrast (`MarginV=420`):** Captions sit cleanly in the lower third (`--margin-v 420`), staying off character torsos/visual gags while remaining above Shorts UI chrome, with bold `Outline=8`, `Shadow=4.5`, and deeper `#30000000` drop shadow so text stays legible over bright backgrounds.
+3. **Fun Kinetic Energy & Scene-Cut Flush:** Captions use elastic entry overshoot (`84% -> 122% -> 100%`), `126% -> 108%` keyword pop, alternating `+/-2.5 deg` micro-tilt on keyword punchlines, semantic neon colors (`--keyword-color auto`: Neon Lime for money/numbers, Fiery Coral-Orange for drama/danger, Electric Cyan for brands/AI, Bright Yellow for active spoken word), clean chunk flushing on every `shot_id` boundary, and zero vertical stacking (`CAPTION_OVERLAP` assertion passes).
 
 ### Part C2: Balanced Audio & Music Fit Gate
 1. **Upfront Dialogue Clarity:** Original narration (`voiceover.wav` or native dialogue) sits crystal-clear and upfront (`SHORTS_VO_CLARITY=1` vocal presence EQ), normalized to `-14 LUFS` integrated loudness (`48 kHz` stereo).

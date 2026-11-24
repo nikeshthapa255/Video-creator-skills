@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Audio-first neural TTS synthesizer, narration linter, and zero-overlap ASS caption builder.
+"""Audio-first neural TTS synthesizer, narration linter, and v3.1 Fun Kinetic ASS caption builder.
 
 Features:
   1. Pre-TTS Narration Linter (--lint-plan): catches TTS_MISREAD triggers such as
      "$700 PS5 Pro" (-> "700-dollar PS5 Pro") and "no 60 FPS" (-> "no sixty FPS").
   2. Audio-First Synthesis (edge-tts with boundary="WordBoundary"): generates per-shot
      VO clips, concatenates voiceover.wav (48 kHz stereo), writes exact shot_timings.json.
-  3. Kinetic Word-by-Word Captions & Horizontal Safety: auto-detects bold sans font via
-     fc-match, enforces horizontal safe width (--max-chars 24 on 1080px vertical video),
-     highlights key facts/numbers/power words/brands with distinct color + stronger kinetic
-     pop, clamps every event strictly to next_chunk_start - 0.01s, and asserts zero overlaps.
+  3. v3.1 Fun Kinetic Captions & Horizontal Safety:
+     - 86px bold sans font (auto-detected via fc-match), Outline=8, Shadow=4.5, #30000000 shadow.
+     - Lower-third safe placement (--margin-v 420: clear of character torsos and Shorts UI).
+     - Punchy 18-char chunks (--max-chars 18) flushed cleanly on every shot_id/cue_idx cut.
+     - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + alternating
+       +/-2.5 deg micro-tilt on keyword punchlines.
+     - Semantic neon keyword palette (--keyword-color auto): Neon Lime (money/numbers),
+       Fiery Coral-Orange (drama/danger/action), Electric Cyan (brands/tech/AI), Bright Yellow
+       (active spoken word).
+     - Strict zero-overlap clamping (next_start - 0.01s) with overlap assertion.
 
 Examples:
   python3 tts_and_captions_v2.py --lint-plan shot_plan.json
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --voice en-US-AvaNeural
-  python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --caption-style kinetic_keyword --max-chars 24
+  python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --caption-style kinetic_keyword --font-size 86 --max-chars 18 --margin-v 420 --keyword-color auto
 """
 
 import argparse
@@ -26,7 +32,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 ONES = [
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
@@ -35,13 +41,36 @@ ONES = [
 ]
 TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
 
-DEFAULT_KEYWORD_COLOR = "&H008CFF&"
-ACTIVE_WORD_COLOR = "&H00FFFF&"
-NEUTRAL_WORD_COLOR = "&H00FFFFFF&"
+# v3.1 Fun Kinetic defaults
+DEFAULT_FONT_SIZE = 86
+DEFAULT_MAX_CHARS = 18
+DEFAULT_MARGIN_V = 420
+DEFAULT_TILT_DEG = 2.5
+DEFAULT_KEYWORD_COLOR = "auto"
+
+# ASS BGR hex palette (v3.1 Semantic Neon)
+NEON_LIME_COLOR = "&H33FF66&"      # Money / numbers / stats
+CORAL_ORANGE_COLOR = "&H365AFF&"   # Drama / danger / action
+ELECTRIC_CYAN_COLOR = "&HFFE500&"  # Brands / tech / AI
+ACTIVE_WORD_COLOR = "&H00FFFF&"    # Bright yellow active spoken word
+NEUTRAL_WORD_COLOR = "&H00FFFFFF&" # Crisp white neutral word
+
+SEMANTIC_CATEGORY_COLORS = {
+    "money_number": NEON_LIME_COLOR,
+    "drama_action": CORAL_ORANGE_COLOR,
+    "brand_tech": ELECTRIC_CYAN_COLOR,
+}
 
 NUMBER_WORDS = {
-    "billion", "billions", "trillion", "trillions", "million", "millions",
-    "thousand", "thousands", "hundred", "hundreds", "percent", "zero",
+    "zero", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety",
+    "hundred", "hundreds", "thousand", "thousands", "million", "millions",
+    "billion", "billions", "trillion", "trillions", "percent", "percentage",
+    "dollar", "dollars", "bucks", "cash", "price", "cost", "costs", "paid",
+    "worth", "revenue", "profit", "profits", "budget", "debt", "double", "triple",
+    "half", "quarter", "dozen", "free", "cheap", "expensive", "buys", "bought",
 }
 
 POWER_DRAMA_WORDS = {
@@ -51,12 +80,20 @@ POWER_DRAMA_WORDS = {
     "unreadable", "rejected", "stolen", "cheating", "cheat", "quits", "quit",
     "disaster", "lawsuit", "lawsuits", "jailbreak", "jailbroken", "critical", "record",
     "massive", "shocking", "warning", "warnings", "privacy", "encrypted", "proof",
-    "surveillance", "risk", "risks",
+    "surveillance", "risk", "risks", "slammed", "slam", "vault", "vaults", "locked",
+    "lockdown", "fired", "sued", "exploded", "exposed", "busted", "killed", "dead",
+    "broke", "broken", "trapped", "collapse", "collapsed", "threat", "danger",
+    "attack", "raid", "blocked", "shutdown", "fraud", "lied", "lying", "crisis",
+    "urgent", "emergency", "stolen", "steal", "destroy", "destroyed", "wipe", "wiped",
 }
 
 MAJOR_TECH_BRANDS = {
     "openai", "anthropic", "meta", "nvidia", "google", "apple", "signal", "claude",
     "nasdaq", "spacex", "congress", "muse", "jolly", "gpt", "airbnb", "reuters",
+    "microsoft", "amazon", "tesla", "tiktok", "youtube", "gemini", "chatgpt",
+    "grok", "deepseek", "xai", "ai", "gpu", "gpus", "chip", "chips", "bank", "banks",
+    "robot", "robots", "model", "models", "cloud", "server", "servers", "tech",
+    "crypto", "bitcoin", "fed", "sec", "ftc", "pentagon", "nasa", "silicon",
 }
 
 PROPER_STOPWORDS = {
@@ -171,7 +208,6 @@ def detect_bold_font(preferred: str = "") -> str:
                     return matched
             except OSError:
                 break
-        # Fallback to whatever Bold sans fc-match resolves
         try:
             res = subprocess.run(
                 ["fc-match", "-f", "%{family}", "sans-serif:style=Bold"],
@@ -188,21 +224,25 @@ def detect_bold_font(preferred: str = "") -> str:
 
 
 def normalize_ass_color(color: str) -> str:
-    c = (color or DEFAULT_KEYWORD_COLOR).strip()
+    c = (color or "").strip()
+    if not c or c.lower() == "auto":
+        return "auto"
     if re.fullmatch(r"[0-9A-Fa-f]{6}", c):
         return f"&H{c.upper()}&"
     if c.upper().startswith("&H"):
         body = c[2:].rstrip("&").upper()
         return f"&H{body}&"
-    return DEFAULT_KEYWORD_COLOR
+    return CORAL_ORANGE_COLOR
 
 
 def derive_subtle_tint(keyword_color: str) -> str:
     """Blend keyword ASS BGR color with white (55/45) so inactive keywords stay subtly tinted."""
     norm = normalize_ass_color(keyword_color)
+    if norm == "auto":
+        norm = CORAL_ORANGE_COLOR
     m = re.fullmatch(r"&H([0-9A-Fa-f]{6,8})&", norm)
     if not m:
-        return "&H72BFFF&"
+        return "&H9BB0FF&"
     hex_str = m.group(1)[-6:]
     b = int(hex_str[0:2], 16)
     g = int(hex_str[2:4], 16)
@@ -236,39 +276,48 @@ def _norm_key(token: str) -> str:
     return _clean_token(token).lower()
 
 
-def is_auto_keyword(raw_text: str, is_sentence_start: bool, all_caps_doc: bool = False) -> bool:
-    """Auto-detect high-impact keywords (numbers/currency/%, power/drama words, proper nouns/brands)."""
+def classify_keyword_category(
+    raw_text: str,
+    is_sentence_start: bool = False,
+    all_caps_doc: bool = False,
+) -> Optional[str]:
+    """Classify a token into v3.1 semantic neon categories, or None if not an auto-keyword."""
     stripped = raw_text.strip(".,!?;:\"'()[]{}<>…—–")
     if not stripped:
-        return False
+        return None
 
-    # 1. Numbers / currencies / percents
+    # 1. Money / numbers / stats -> Neon Lime
     if any(ch.isdigit() for ch in stripped) or "$" in stripped or "%" in stripped:
-        return True
+        return "money_number"
 
     cleaned = _clean_token(stripped)
     lower = cleaned.lower()
     if not lower:
-        return False
+        return None
 
-    if lower in NUMBER_WORDS:
-        return True
-
-    # 2. High-impact power/drama words (including hyphenated parts)
     parts = [p for p in re.split(r"[-/]", lower) if p]
+    if lower in NUMBER_WORDS or any(p in NUMBER_WORDS for p in parts):
+        return "money_number"
+
+    # 2. Drama / danger / action -> Fiery Coral-Orange
     if lower in POWER_DRAMA_WORDS or any(p in POWER_DRAMA_WORDS for p in parts):
-        return True
+        return "drama_action"
 
-    # 3. Major AI/tech brands & news proper nouns (even at sentence start)
+    # 3. Brands / tech / AI -> Electric Cyan
     if lower in MAJOR_TECH_BRANDS or any(p in MAJOR_TECH_BRANDS for p in parts):
-        return True
+        return "brand_tech"
 
-    # 4. Capitalized non-stopword proper nouns/brands/acronyms mid-sentence
+    # 4. Capitalized non-stopword proper nouns/brands/acronyms mid-sentence -> Electric Cyan
     if not is_sentence_start and not all_caps_doc and len(cleaned) >= 2:
         if cleaned[0].isupper() and lower not in PROPER_STOPWORDS:
-            return True
+            return "brand_tech"
 
-    return False
+    return None
+
+
+def is_auto_keyword(raw_text: str, is_sentence_start: bool, all_caps_doc: bool = False) -> bool:
+    """Auto-detect high-impact keywords (numbers/currency/%, drama/action, brands/tech)."""
+    return classify_keyword_category(raw_text, is_sentence_start=is_sentence_start, all_caps_doc=all_caps_doc) is not None
 
 
 def _match_explicit_keywords(words: Sequence[Dict], explicit_keywords: Sequence[str], start_idx: int, end_idx: int) -> List[bool]:
@@ -298,7 +347,6 @@ def _match_explicit_keywords(words: Sequence[Dict], explicit_keywords: Sequence[
         if norm_tokens[i] in single_set or raw_tokens[i] in raw_single_set:
             flags[i] = True
         else:
-            # Also match hyphenated sub-tokens (e.g. "GPT-5" matches "GPT")
             for sub in re.split(r"[-/]", norm_tokens[i]):
                 if sub and sub in single_set:
                     flags[i] = True
@@ -317,7 +365,7 @@ def _match_explicit_keywords(words: Sequence[Dict], explicit_keywords: Sequence[
 
 
 def mark_keywords(words: List[Dict], global_keywords: Optional[Sequence[str]] = None) -> List[Dict]:
-    """Return shallow copies of words annotated with boolean 'is_keyword'."""
+    """Return shallow copies of words annotated with 'is_keyword' and 'keyword_category'."""
     if not words:
         return []
 
@@ -325,7 +373,6 @@ def mark_keywords(words: List[Dict], global_keywords: Optional[Sequence[str]] = 
     alpha_tokens = [t for t in alpha_tokens if len(t) >= 2 and any(c.isalpha() for c in t)]
     all_caps_doc = bool(alpha_tokens) and (sum(1 for t in alpha_tokens if t.isupper()) / len(alpha_tokens) >= 0.80)
 
-    # Group contiguous spans by shot_id (or single span if no shot_id metadata)
     result = [dict(w) for w in words]
     g_kw = [k for k in (global_keywords or []) if k]
 
@@ -349,20 +396,39 @@ def mark_keywords(words: List[Dict], global_keywords: Optional[Sequence[str]] = 
         override_kw = shot_kw if shot_kw else g_kw
         if override_kw:
             flags = _match_explicit_keywords(result, override_kw, start_idx, end_idx)
+            is_sent_start = True
             for offset, is_kw in enumerate(flags):
-                result[start_idx + offset]["is_keyword"] = is_kw
+                idx = start_idx + offset
+                txt = result[idx]["text"].strip()
+                result[idx]["is_keyword"] = is_kw
+                if is_kw:
+                    cat = classify_keyword_category(txt, is_sentence_start=is_sent_start, all_caps_doc=all_caps_doc)
+                    result[idx]["keyword_category"] = cat or "drama_action"
+                else:
+                    result[idx]["keyword_category"] = None
+                is_sent_start = bool(re.search(r"[.!?:][\"')\]”’]*$", txt))
         else:
             is_sent_start = True
             for idx in range(start_idx, end_idx):
                 txt = result[idx]["text"].strip()
-                result[idx]["is_keyword"] = is_auto_keyword(
+                cat = classify_keyword_category(
                     txt,
                     is_sentence_start=is_sent_start,
                     all_caps_doc=all_caps_doc,
                 )
+                result[idx]["is_keyword"] = cat is not None
+                result[idx]["keyword_category"] = cat
                 is_sent_start = bool(re.search(r"[.!?:][\"')\]”’]*$", txt))
 
     return result
+
+
+def resolve_keyword_color(word: Dict, keyword_color: str = DEFAULT_KEYWORD_COLOR) -> str:
+    norm = normalize_ass_color(keyword_color)
+    if norm != "auto":
+        return norm
+    cat = word.get("keyword_category") or "drama_action"
+    return SEMANTIC_CATEGORY_COLORS.get(cat, CORAL_ORANGE_COLOR)
 
 
 def cs_to_ass_time(cs: int) -> str:
@@ -376,9 +442,14 @@ def cs_to_ass_time(cs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{c:02d}"
 
 
-def build_ass_header(font_name: str, font_size: int = 68) -> str:
+def build_ass_header(
+    font_name: str,
+    font_size: int = DEFAULT_FONT_SIZE,
+    margin_v: int = DEFAULT_MARGIN_V,
+) -> str:
+    """Build v3.1 Fun Kinetic ASS header (86px bold, Outline=8, Shadow=4.5, #30000000, MarginV=420)."""
     return f"""[Script Info]
-Title: Viral Animated Short Captions
+Title: Viral Animated Short Captions (v3.1 Fun Kinetic)
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -387,7 +458,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortsHook,{font_name},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,6,2,2,80,80,680,1
+Style: ShortsHook,{font_name},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H30000000,-1,0,0,0,100,100,0,0,1,8,4.5,2,50,50,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -403,7 +474,6 @@ def split_long_word(word: Dict, max_chars: int) -> List[Dict]:
     pieces: List[str] = []
     if "-" in text:
         raw_parts = text.split("-")
-        # Keep trailing hyphen on all but last part
         hyph_parts = [p + "-" for p in raw_parts[:-1]] + [raw_parts[-1]]
         cur = ""
         for part in hyph_parts:
@@ -446,8 +516,8 @@ def split_long_word(word: Dict, max_chars: int) -> List[Dict]:
     return out
 
 
-def chunk_words(words: List[Dict], max_words: int = 3, max_chars: int = 24) -> List[List[Dict]]:
-    """Group words into short punchy lines strictly within max_chars for 1080px horizontal safety."""
+def chunk_words(words: List[Dict], max_words: int = 3, max_chars: int = DEFAULT_MAX_CHARS) -> List[List[Dict]]:
+    """Group words into bold punchy chunks strictly within max_chars, flushing cleanly on every shot_id/cue_idx boundary."""
     expanded: List[Dict] = []
     for w in words:
         expanded.extend(split_long_word(w, max_chars))
@@ -455,10 +525,21 @@ def chunk_words(words: List[Dict], max_words: int = 3, max_chars: int = 24) -> L
     chunks: List[List[Dict]] = []
     cur: List[Dict] = []
     cur_len = 0
+    cur_boundary = None
+
     for w in expanded:
         w_text = w["text"].strip()
         if not w_text:
             continue
+
+        # Flush cleanly on every shot_id or SRT cue_idx transition (fixes cross-cut word merging)
+        boundary = (w.get("shot_id"), w.get("cue_idx"))
+        if cur and boundary != cur_boundary:
+            chunks.append(cur)
+            cur = []
+            cur_len = 0
+        cur_boundary = boundary
+
         added_len = len(w_text) if not cur else (cur_len + 1 + len(w_text))
         if cur and added_len > max_chars:
             chunks.append(cur)
@@ -483,30 +564,45 @@ def build_zero_overlap_events(
     caption_style: str = "kinetic_keyword",
     keywords: Optional[Sequence[str]] = None,
     keyword_color: str = DEFAULT_KEYWORD_COLOR,
-    max_chars: int = 24,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    tilt_deg: float = DEFAULT_TILT_DEG,
 ) -> List[Tuple[int, int, str]]:
-    """Build per-word highlighted ASS events with kinetic pop, keyword emphasis, and zero overlaps."""
-    kw_color = normalize_ass_color(keyword_color)
-    subtle_kw_color = derive_subtle_tint(kw_color)
+    """Build v3.1 Fun Kinetic ASS events with elastic bounce, semantic neon colors, +/-2.5 deg micro-tilt, and zero overlaps."""
     annotated = mark_keywords(words, global_keywords=keywords) if caption_style == "kinetic_keyword" else words
     chunks = chunk_words(annotated, max_words=3, max_chars=max_chars)
     raw: List[Tuple[int, int, str]] = []
+    tilt_sign = 1.0  # Alternates +tilt_deg / -tilt_deg across keyword punchline chunks
 
     for chunk in chunks:
+        chunk_has_kw = caption_style == "kinetic_keyword" and any(bool(w.get("is_keyword", False)) for w in chunk)
+        chunk_tilt = 0.0
+        if chunk_has_kw and tilt_deg > 0:
+            chunk_tilt = round(tilt_deg * tilt_sign, 2)
+            tilt_sign = -tilt_sign
+
         for active_idx, active_word in enumerate(chunk):
             w_start = max(0, int(round(active_word["start_sec"] * 100)))
             w_end = max(w_start + 5, int(round(active_word["end_sec"] * 100)))
             styled: List[str] = []
 
             if caption_style == "kinetic_keyword":
-                line_prefix = r"{\t(0,70,\fscx114\fscy114)\t(70,150,\fscx100\fscy100)}"
+                tilt_tag = rf"\frz{chunk_tilt:g}" if chunk_tilt != 0.0 else ""
+                if active_idx == 0:
+                    # Elastic entry overshoot: 84% -> 122% -> 100%
+                    line_prefix = rf"{{{tilt_tag}\fscx84\fscy84\t(0,65,\fscx122\fscy122)\t(65,155,\fscx100\fscy100)}}"
+                else:
+                    # Crisp mid-chunk pulse without jarring shrink
+                    line_prefix = rf"{{{tilt_tag}\t(0,55,\fscx106\fscy106)\t(55,130,\fscx100\fscy100)}}"
+
                 for idx, w in enumerate(chunk):
                     clean = w["text"].replace("{", "").replace("}", "")
                     is_kw = bool(w.get("is_keyword", False))
+                    w_kw_color = resolve_keyword_color(w, keyword_color) if is_kw else ""
                     if idx == active_idx:
                         if is_kw:
+                            # Keyword pop: 126% -> 108%
                             styled.append(
-                                rf"{{\c{kw_color}\t(0,70,\fscx120\fscy120)\t(70,150,\fscx104\fscy104)}}"
+                                rf"{{\c{w_kw_color}\fscx126\fscy126\t(0,85,\fscx108\fscy108)}}"
                                 + clean
                                 + rf"{{\c{NEUTRAL_WORD_COLOR}\fscx100\fscy100}}"
                             )
@@ -516,21 +612,22 @@ def build_zero_overlap_events(
                             )
                     else:
                         if is_kw:
+                            subtle_color = derive_subtle_tint(w_kw_color)
                             styled.append(
-                                rf"{{\c{subtle_kw_color}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}"
+                                rf"{{\c{subtle_color}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}"
                             )
                         else:
                             styled.append(clean)
                 raw.append((w_start, w_end, line_prefix + " ".join(styled)))
             else:
-                # Classic karaoke_chunk mode
+                # Classic karaoke_chunk mode (still respects v3.1 shot_id flush & elastic entry)
                 for idx, w in enumerate(chunk):
                     clean = w["text"].replace("{", "").replace("}", "")
                     if idx == active_idx:
                         styled.append(rf"{{\c{ACTIVE_WORD_COLOR}}}" + clean + rf"{{\c{NEUTRAL_WORD_COLOR}}}")
                     else:
                         styled.append(clean)
-                prefix = r"{\fscx109\fscy109\t(0,75,\fscx100\fscy100)}" if active_idx == 0 else ""
+                prefix = r"{\fscx84\fscy84\t(0,65,\fscx122\fscy122)\t(65,155,\fscx100\fscy100)}" if active_idx == 0 else ""
                 raw.append((w_start, w_end, prefix + " ".join(styled)))
 
     # Strict monotonic clamp: every event ends <= next_start - 1cs (0.01s)
@@ -569,7 +666,6 @@ def assert_no_overlaps(events: List[Tuple[int, int, str]]) -> None:
             )
         if cur_e < cur_s:
             raise AssertionError(f"CAPTION_ORDER at event {i}: end {cur_e} < start {cur_s}")
-
 
 
 def probe_audio_duration(path: Path) -> float:
@@ -652,7 +748,6 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         tmp_dir = Path(tmp)
         concat_lines: List[str] = []
 
-        # Reusable silence clip for inter-shot gaps
         gap_wav = tmp_dir / "gap.wav"
         if args.gap > 0:
             subprocess.run(
@@ -698,7 +793,6 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 )
                 dur = probe_audio_duration(wav_path)
                 if not words:
-                    # Fallback if edge-tts emits no WordBoundary events for a very short interjection
                     tokens = text.split()
                     step = dur / max(1, len(tokens))
                     words = [
@@ -767,26 +861,32 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
     global_keywords = parse_keyword_list(args.keywords) or parse_keyword_list(plan.get("highlight_keywords"))
     caption_style = args.caption_style or plan.get("caption_style") or "kinetic_keyword"
     plan_max_chars = (plan.get("fun_pacing_gate") or {}).get("max_caption_chars")
-    max_chars = args.max_chars if args.max_chars is not None else int(plan_max_chars or 24)
+    max_chars = args.max_chars if args.max_chars is not None else int(plan_max_chars or DEFAULT_MAX_CHARS)
     if max_chars < 1:
-        max_chars = 24
+        max_chars = DEFAULT_MAX_CHARS
+    font_size = args.font_size if args.font_size is not None else int(plan.get("caption_font_size") or DEFAULT_FONT_SIZE)
+    margin_v = args.margin_v if args.margin_v is not None else int(plan.get("caption_margin_v") or DEFAULT_MARGIN_V)
+    keyword_color = args.keyword_color or plan.get("caption_keyword_color") or DEFAULT_KEYWORD_COLOR
+
     font_name = detect_bold_font(args.font)
     events = build_zero_overlap_events(
         all_words,
         caption_style=caption_style,
         keywords=global_keywords,
-        keyword_color=args.keyword_color,
+        keyword_color=keyword_color,
         max_chars=max_chars,
+        tilt_deg=args.tilt,
     )
-    ass_lines = [build_ass_header(font_name).rstrip()]
+    ass_lines = [build_ass_header(font_name, font_size=font_size, margin_v=margin_v).rstrip()]
     for s, e, text in events:
         ass_lines.append(f"Dialogue: 0,{cs_to_ass_time(s)},{cs_to_ass_time(e)},ShortsHook,,0,0,0,,{text}")
     ass_path = out_dir / "captions.ass"
     ass_path.write_text("\n".join(ass_lines) + "\n", encoding="utf-8")
 
     print(
-        f"Synthesized {len(shot_timings)} shots ({total_dur:.2f}s, font='{font_name}', "
-        f"style={caption_style}, max_chars={max_chars}, {len(events)} caption events)"
+        f"Synthesized {len(shot_timings)} shots ({total_dur:.2f}s, font='{font_name}' {font_size}px, "
+        f"margin_v={margin_v}, style={caption_style}, max_chars={max_chars}, kw_color={keyword_color}, "
+        f"tilt=+/-{args.tilt:g}deg, {len(events)} caption events)"
     )
     print(f"  VO:      {out_dir / 'voiceover.wav'}")
     print(f"  Timings: {timings_path}")
@@ -795,7 +895,7 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Audio-first TTS synthesizer, linter, and ASS caption builder.")
+    parser = argparse.ArgumentParser(description="Audio-first TTS synthesizer, linter, and v3.1 Fun Kinetic ASS caption builder.")
     parser.add_argument("--lint-plan", help="Run Pre-TTS narration linter on shot_plan.json and exit.")
     parser.add_argument("--shot-plan", help="Path to shot_plan.json for full audio-first synthesis.")
     parser.add_argument("--out-dir", help="Output directory for voiceover.wav, shot_timings.json, captions.ass.")
@@ -804,6 +904,24 @@ def main() -> int:
     parser.add_argument("--pitch", default="+0Hz", help="Pitch adjustment.")
     parser.add_argument("--gap", type=float, default=0.06, help="Inter-shot silence gap in seconds (default: 0.06).")
     parser.add_argument("--font", default="", help="Override caption font family (auto-detected via fc-match).")
+    parser.add_argument(
+        "--font-size",
+        type=int,
+        default=None,
+        help=f"Caption font size in px on 1080x1920 canvas (default: plan.caption_font_size or {DEFAULT_FONT_SIZE}).",
+    )
+    parser.add_argument(
+        "--margin-v",
+        type=int,
+        default=None,
+        help=f"ASS MarginV vertical offset from bottom in px (default: plan.caption_margin_v or {DEFAULT_MARGIN_V}).",
+    )
+    parser.add_argument(
+        "--tilt",
+        type=float,
+        default=DEFAULT_TILT_DEG,
+        help=f"Alternating micro-tilt degrees on keyword punchlines; 0 disables (default: {DEFAULT_TILT_DEG}).",
+    )
     parser.add_argument(
         "--caption-style",
         choices=("kinetic_keyword", "karaoke_chunk"),
@@ -817,20 +935,26 @@ def main() -> int:
     )
     parser.add_argument(
         "--keyword-color",
-        default=DEFAULT_KEYWORD_COLOR,
-        help="ASS BGR highlight color for keywords (default: &H008CFF& electric orange-gold).",
+        default=None,
+        help="Keyword color: 'auto' for semantic neon palette (lime/coral/cyan) or ASS BGR hex (default: auto).",
     )
     parser.add_argument(
         "--max-chars",
         type=int,
         default=None,
-        help="Maximum visible characters per caption line for 1080px horizontal safety (default: plan max_caption_chars or 24).",
+        help=f"Maximum visible characters per caption line for 1080px horizontal safety (default: plan max_caption_chars or {DEFAULT_MAX_CHARS}).",
     )
     parser.add_argument("--autofix", action="store_true", help="Auto-rewrite TTS_MISREAD patterns during synthesis.")
     args = parser.parse_args()
 
     if args.max_chars is not None and args.max_chars < 1:
         parser.error("--max-chars must be >= 1")
+    if args.font_size is not None and args.font_size < 12:
+        parser.error("--font-size must be >= 12")
+    if args.margin_v is not None and args.margin_v < 0:
+        parser.error("--margin-v must be >= 0")
+    if args.tilt < 0:
+        parser.error("--tilt must be >= 0")
 
     if args.lint_plan:
         plan = json.loads(Path(args.lint_plan).read_text(encoding="utf-8"))

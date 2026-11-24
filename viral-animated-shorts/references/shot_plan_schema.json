@@ -72,7 +72,26 @@
     "caption_style": {
       "type": "string",
       "enum": ["kinetic_keyword", "karaoke_chunk"],
-      "description": "kinetic_keyword = dynamic word-by-word pop with highlight_keywords emphasized; karaoke_chunk = standard bounce-pop phrase chunks."
+      "description": "kinetic_keyword = v3.1 Fun Kinetic word-by-word pop with semantic neon highlight_keywords, +/-2.5 deg micro-tilt, and elastic bounce; karaoke_chunk = bounce-pop phrase chunks."
+    },
+    "caption_font_size": {
+      "type": "integer",
+      "minimum": 48,
+      "maximum": 120,
+      "default": 86,
+      "description": "ASS caption font size on 1080x1920 vertical canvas (v3.1 default: 86)."
+    },
+    "caption_margin_v": {
+      "type": "integer",
+      "minimum": 200,
+      "maximum": 800,
+      "default": 420,
+      "description": "ASS MarginV vertical offset from bottom in px (v3.1 default: 420, clean lower-third above Shorts UI and off character torsos)."
+    },
+    "caption_keyword_color": {
+      "type": "string",
+      "default": "auto",
+      "description": "Keyword highlight mode: 'auto' for v3.1 semantic neon palette (Neon Lime for money/numbers, Fiery Coral-Orange for drama/danger, Electric Cyan for brands/tech) or explicit ASS BGR hex."
     },
     "highlight_keywords": {
       "type": "array",
@@ -109,10 +128,10 @@
         "tts_lint_passed": { "type": "boolean" },
         "max_caption_chars": {
           "type": "integer",
-          "minimum": 12,
+          "minimum": 10,
           "maximum": 36,
-          "default": 24,
-          "description": "Maximum characters per caption chunk/line to prevent horizontal clipping on 1080px vertical frames (target <= 24)."
+          "default": 18,
+          "description": "Maximum characters per caption chunk/line to prevent horizontal clipping on 1080px vertical frames at 86px font + 126% pop + +/-2.5 deg tilt (v3.1 default: 18)."
         },
         "passed": { "type": "boolean" }
       }
