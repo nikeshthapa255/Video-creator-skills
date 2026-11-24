@@ -10,14 +10,23 @@ Supports both Shorts (30-55s) and Long-Form Episodes (3-15+ min, 90-150+ shots) 
   - Supports slicing via --start-idx / --end-idx (1-based inclusive), --shot-ids, or --act <N>,
     plus --workers <N> for ThreadPoolExecutor parallelism and --skip-existing for rerolls.
 
-Motion presets (10):
+Motion presets (11):
   whip_zoom, bounce_pop, shake_zoom, zoom_in, zoom_out,
-  pan_left, pan_right, static_drift, slow_dolly_in, tilt_up
+  pan_left, pan_right, static_drift, slow_dolly_in, tilt_up, tilt_down
   (Any unrecognized preset emits a warning and safely falls back to zoom_in.)
 
+Focal anchors (7):
+  center, left_third, right_third, upper_center, upper_left, upper_right, lower_center
+  (Keeps off-center rule-of-thirds subjects locked during zooms; read from shot_timings.json
+  or overridden via --focal-anchor.)
+
+Hybrid Mode A + B alignment:
+  Use --skip-omni to skip shots where production_mode == "omni_video" while still counting
+  them in compute_global_shot_plans() so global frame lock and 3-digit indices stay aligned.
+
 Examples:
-  python3 animate_shot_v2.py --image scenes/shot_01.png --duration 3.2 --motion whip_zoom --flash-in --out clips/shot_01.mp4
-  python3 animate_shot_v2.py --timings audio/shot_timings.json --scenes-dir scenes --out-dir clips
+  python3 animate_shot_v2.py --image scenes/shot_01.png --duration 3.2 --motion whip_zoom --focal-anchor left_third --flash-in --out clips/shot_01.mp4
+  python3 animate_shot_v2.py --timings audio/shot_timings.json --scenes-dir scenes --out-dir clips --skip-omni
   python3 animate_shot_v2.py --timings audio/shot_timings.json --scenes-dir scenes --out-dir clips --aspect-ratio 16:9 --act 1 --workers 4 --fade-out-last
 """
 
@@ -52,7 +61,18 @@ PRESETS = (
     "static_drift",
     "slow_dolly_in",
     "tilt_up",
+    "tilt_down",
 )
+
+FOCAL_ANCHORS: dict[str, tuple[float, float]] = {
+    "center": (0.50, 0.50),
+    "left_third": (0.33, 0.42),
+    "right_third": (0.67, 0.42),
+    "upper_center": (0.50, 0.36),
+    "upper_left": (0.33, 0.34),
+    "upper_right": (0.67, 0.34),
+    "lower_center": (0.50, 0.65),
+}
 
 _PRINT_LOCK = threading.Lock()
 
@@ -70,6 +90,10 @@ class ShotPlan:
     act: Optional[int]
     is_first: bool
     is_last: bool
+    focal_anchor: str = "center"
+    fade_in: bool = False
+    fade_out: bool = False
+    production_mode: str = ""
 
 
 def resolve_dimensions(aspect_ratio: str) -> tuple[int, int, int, int]:
@@ -91,30 +115,99 @@ def resolve_motion(motion: str) -> str:
     return "zoom_in"
 
 
+def resolve_focal_anchor(anchor: Optional[str]) -> str:
+    """Validate focal anchor; warn and fall back to center on unrecognized values."""
+    if not anchor:
+        return "center"
+    norm = str(anchor).strip().lower()
+    if norm in FOCAL_ANCHORS:
+        return norm
+    with _PRINT_LOCK:
+        print(
+            f"Warning: unrecognized focal_anchor '{anchor}', falling back to 'center'.",
+            file=sys.stderr,
+        )
+    return "center"
+
+
+def probe_image_dimensions(image_path: Path) -> Optional[tuple[int, int]]:
+    """Probe keyframe image width and height via ffprobe."""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                str(image_path),
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if not out:
+            return None
+        first_line = out.splitlines()[0]
+        parts = first_line.split(",")
+        if len(parts) >= 2:
+            w, h = int(parts[0]), int(parts[1])
+            if w > 0 and h > 0:
+                return w, h
+    except Exception:
+        return None
+    return None
+
+
+def warn_aspect_ratio_mismatch(image_path: Path, aspect_ratio: str, out_w: int, out_h: int) -> None:
+    """Emit a warning if the input image aspect ratio deviates > 25% from the target canvas."""
+    dims = probe_image_dimensions(image_path)
+    if dims is None:
+        return
+    in_w, in_h = dims
+    in_ar = in_w / in_h
+    target_ar = out_w / out_h
+    ratio_mismatch = max(in_ar / target_ar, target_ar / in_ar) - 1.0
+    if ratio_mismatch > 0.25:
+        with _PRINT_LOCK:
+            print(
+                f"Warning: keyframe '{image_path.name}' ({in_w}x{in_h}, AR={in_ar:.2f}) deviates "
+                f"{ratio_mismatch * 100:.0f}% (>25%) from target {aspect_ratio} ({out_w}x{out_h}, AR={target_ar:.2f}); "
+                "severe cropping will occur.",
+                file=sys.stderr,
+            )
+
+
 def build_zoompan_expr(
     motion: str,
     frames: int,
     work_w: int = WORK_W,
     work_h: int = WORK_H,
+    fps: int = 30,
+    focal_anchor: str = "center",
 ) -> tuple[str, str, str]:
     if motion not in PRESETS:
         motion = "zoom_in"
 
+    fx, fy = FOCAL_ANCHORS.get(focal_anchor, FOCAL_ANCHORS["center"])
     denom = max(frames - 1, 1)
-    cut = max(int(frames * 0.20), 4)
-    rest = max(frames - cut, 1)
+    ease = f"0.5*(1-cos(PI*on/{denom}))"
 
-    cx = "iw/2-(iw/zoom/2)"
-    cy = "ih/2-(ih/zoom/2)"
+    base_x = f"{fx}*iw-(iw/zoom)*{fx}"
+    base_y = f"{fy}*ih-(ih/zoom)*{fy}"
+    cx = f"clip({base_x},0,max(0,iw-iw/zoom))"
+    cy = f"clip({base_y},0,max(0,ih-ih/zoom))"
 
     if motion == "whip_zoom":
-        # Fast punch-in settle (1.28 -> 1.04) over first 20%, then subtle forward drift
-        z = f"if(lt(on,{cut}),1.28-0.24*(on/{cut}),1.04+0.05*((on-{cut})/{rest}))"
+        # Real-time punch-in settle (1.28 -> 1.04) with quadratic ease-out, then subtle forward drift
+        cut = max(4, min(frames // 3, int(round(0.35 * fps))))
+        rest = max(frames - cut, 1)
+        z = f"if(lt(on,{cut}),1.04+0.24*pow(1-on/{cut},2),1.04+0.05*((on-{cut})/{rest}))"
         return z, cx, cy
     if motion == "bounce_pop":
-        # Elastic scale-pop overshoot on shot entry (1.02 -> 1.15 -> 1.05 -> 1.09)
-        p1 = max(int(frames * 0.10), 3)
-        p2 = max(int(frames * 0.22), p1 + 3)
+        # Real-time elastic scale-pop overshoot on shot entry (1.02 -> 1.15 -> 1.05 -> 1.09)
+        p1 = max(3, min(frames // 5, int(round(0.18 * fps))))
+        p2 = max(p1 + 3, min(frames // 2, int(round(0.40 * fps))))
         r2 = max(frames - p2, 1)
         z = (
             f"if(lt(on,{p1}),1.02+0.13*(on/{p1}),"
@@ -123,35 +216,40 @@ def build_zoompan_expr(
         )
         return z, cx, cy
     if motion == "shake_zoom":
-        # High-energy damped trauma shake + tight push-in, scaled proportionally to working canvas
-        amp_x = max(1, int(round(34 * work_w / WORK_W)))
-        amp_y = max(1, int(round(26 * work_h / WORK_H)))
+        # Isotropic trauma shake (~32px on both 9:16 and 16:9 2x canvas) with immediate Frame-0 impact
+        amp = max(1, int(round(0.015 * min(work_w, work_h))))
+        decay = f"{max(1.0, 0.6 * fps):.4g}"
         z = f"1.10+0.08*(on/{denom})"
-        x = f"iw/2-(iw/zoom/2)+sin(on*2.3)*{amp_x}*exp(-on/18)"
-        y = f"ih/2-(ih/zoom/2)+cos(on*3.1)*{amp_y}*exp(-on/18)"
+        x = f"clip({base_x}+cos(on*2.3)*{amp}*exp(-on/{decay}),0,max(0,iw-iw/zoom))"
+        y = f"clip({base_y}+sin(on*3.1+0.8)*{amp}*exp(-on/{decay}),0,max(0,ih-ih/zoom))"
         return z, x, y
     if motion == "zoom_in":
-        z = f"1.00+0.12*(on/{denom})"
+        z = f"1.00+0.12*({ease})"
         return z, cx, cy
     if motion == "zoom_out":
-        z = f"1.14-0.12*(on/{denom})"
+        z = f"1.14-0.12*({ease})"
         return z, cx, cy
     if motion == "pan_left":
         z = "1.14"
-        x = f"(iw-iw/zoom)*(1-on/{denom})"
+        x = f"(iw-iw/zoom)*(1-({ease}))"
         return z, x, cy
     if motion == "pan_right":
         z = "1.14"
-        x = f"(iw-iw/zoom)*(on/{denom})"
+        x = f"(iw-iw/zoom)*({ease})"
         return z, x, cy
     if motion == "slow_dolly_in":
         # Smooth dramatic 1.00 -> 1.10 push-in for emotional dialogue and reveals
-        z = f"1.00+0.10*(on/{denom})"
+        z = f"1.00+0.10*({ease})"
         return z, cx, cy
     if motion == "tilt_up":
-        # 1.14 zoom panning gently upward for throne/heroic reveals
+        # 1.14 zoom panning smoothly upward for throne/heroic reveals
         z = "1.14"
-        y = f"(ih-ih/zoom)*(1-on/{denom})"
+        y = f"(ih-ih/zoom)*(1-({ease}))"
+        return z, cx, y
+    if motion == "tilt_down":
+        # 1.14 zoom panning smoothly downward (mirror of tilt_up)
+        z = "1.14"
+        y = f"(ih-ih/zoom)*({ease})"
         return z, cx, y
     # static_drift
     z = f"1.02+0.03*(on/{denom})"
@@ -169,14 +267,24 @@ def animate_single(
     fade_out: bool = False,
     exact_frames: int = 0,
     aspect_ratio: str = "9:16",
+    focal_anchor: str = "center",
 ) -> int:
     if not image_path.exists():
         raise FileNotFoundError(f"Keyframe not found: {image_path}")
     motion = resolve_motion(motion)
+    focal_anchor = resolve_focal_anchor(focal_anchor)
     work_w, work_h, out_w, out_h = resolve_dimensions(aspect_ratio)
+    warn_aspect_ratio_mismatch(image_path, aspect_ratio, out_w, out_h)
 
     frames = exact_frames if exact_frames > 0 else max(1, int(round(duration * fps)))
-    z_expr, x_expr, y_expr = build_zoompan_expr(motion, frames, work_w=work_w, work_h=work_h)
+    z_expr, x_expr, y_expr = build_zoompan_expr(
+        motion,
+        frames,
+        work_w=work_w,
+        work_h=work_h,
+        fps=fps,
+        focal_anchor=focal_anchor,
+    )
 
     filters = [
         f"scale={work_w}:{work_h}:force_original_aspect_ratio=increase",
@@ -188,7 +296,10 @@ def animate_single(
     if flash_in or fade_in or fade_out:
         filters.append("setpts=PTS-STARTPTS")
     if flash_in:
-        filters.append("eq=brightness='if(lt(t,0.07),0.55*(1-t/0.07),0)':eval=frame")
+        filters.append(
+            "eq=brightness='if(lt(t,0.07),0.32*(1-t/0.07),0)':"
+            "gamma='if(lt(t,0.07),1+0.65*(1-t/0.07),1)':eval=frame"
+        )
     if fade_in and frames > 1:
         fade_in_frames = max(1, min(frames // 2, int(round(0.4 * fps))))
         filters.append(f"fade=t=in:s=0:n={fade_in_frames}")
@@ -275,6 +386,10 @@ def compute_global_shot_plans(
 
         raw_motion = str(shot.get("motion_preset") or "zoom_in")
         flash = bool(shot.get("flash_in", False)) or force_flash_in
+        focal_anchor = str(shot.get("focal_anchor") or "center")
+        shot_fade_in = bool(shot.get("fade_in", False))
+        shot_fade_out = bool(shot.get("fade_out", False))
+        prod_mode = str(shot.get("production_mode") or "").strip().lower()
         act_val = parse_act_value(
             shot.get(
                 "act",
@@ -297,6 +412,10 @@ def compute_global_shot_plans(
                 act=act_val,
                 is_first=(idx == 1),
                 is_last=(idx == total),
+                focal_anchor=focal_anchor,
+                fade_in=shot_fade_in,
+                fade_out=shot_fade_out,
+                production_mode=prod_mode,
             )
         )
         cum_frames = target_cum_frames
@@ -310,6 +429,7 @@ def filter_plans(
     end_idx: Optional[int],
     shot_ids_arg: Optional[str],
     act_arg: Optional[int],
+    skip_omni: bool = False,
 ) -> list[ShotPlan]:
     selected = plans
     if start_idx is not None:
@@ -321,6 +441,8 @@ def filter_plans(
         selected = [p for p in selected if p.shot_id in wanted]
     if act_arg is not None:
         selected = [p for p in selected if p.act == act_arg]
+    if skip_omni:
+        selected = [p for p in selected if p.production_mode != "omni_video"]
     return selected
 
 
@@ -333,6 +455,7 @@ def render_plan(
     fade_out_last: bool,
     skip_existing: bool,
     aspect_ratio: str = "9:16",
+    focal_anchor_override: Optional[str] = None,
 ) -> str:
     out_mp4 = out_dir / f"{plan.idx:03d}_{plan.shot_id}.mp4"
     if skip_existing and out_mp4.exists() and out_mp4.stat().st_size > 0:
@@ -343,8 +466,11 @@ def render_plan(
 
     img = find_scene_image(scenes_dir, plan.shot_id)
     resolved_motion = resolve_motion(plan.motion)
-    do_fade_in = fade_in_first and plan.is_first
-    do_fade_out = fade_out_last and plan.is_last
+    resolved_anchor = resolve_focal_anchor(
+        focal_anchor_override if focal_anchor_override is not None else plan.focal_anchor
+    )
+    do_fade_in = plan.fade_in or (fade_in_first and plan.is_first)
+    do_fade_out = plan.fade_out or (fade_out_last and plan.is_last)
 
     animate_single(
         image_path=img,
@@ -357,11 +483,13 @@ def render_plan(
         fade_out=do_fade_out,
         exact_frames=plan.exact_frames,
         aspect_ratio=aspect_ratio,
+        focal_anchor=resolved_anchor,
     )
     return (
         f"Animated [{plan.idx:03d}] {plan.shot_id} "
         f"({plan.exact_frames}f / {plan.exact_frames / fps:.2f}s, cum={plan.cum_start_frame}..{plan.cum_end_frame}, "
-        f"{aspect_ratio}, {resolved_motion}, flash={plan.flash_in}, fade_in={do_fade_in}, fade_out={do_fade_out}) -> {out_mp4}"
+        f"{aspect_ratio}, {resolved_motion}, anchor={resolved_anchor}, flash={plan.flash_in}, "
+        f"fade_in={do_fade_in}, fade_out={do_fade_out}) -> {out_mp4}"
     )
 
 
@@ -395,6 +523,14 @@ def main() -> int:
         default="zoom_in",
         help=f"Camera motion preset ({', '.join(PRESETS)}; unrecognized falls back to zoom_in).",
     )
+    parser.add_argument(
+        "--focal-anchor",
+        default=None,
+        help=(
+            f"Zoom focal anchor ({', '.join(FOCAL_ANCHORS.keys())}). "
+            "Defaults to 'center' in single-image mode; overrides per-shot focal_anchor in batch mode when provided."
+        ),
+    )
     parser.add_argument("--flash-in", action="store_true", help="Add 2-frame white exposure flash on entry.")
     parser.add_argument(
         "--fade-in-first",
@@ -424,6 +560,14 @@ def main() -> int:
     parser.add_argument("--act", type=int, help="Render only shots in the given positive act/chapter number.")
     parser.add_argument("--workers", type=int, default=1, help="ThreadPoolExecutor worker count (default: 1).")
     parser.add_argument("--skip-existing", action="store_true", help="Skip clips that already exist and are non-empty.")
+    parser.add_argument(
+        "--skip-omni",
+        action="store_true",
+        help=(
+            "Skip shots with production_mode == 'omni_video' while still counting them in "
+            "compute_global_shot_plans() so global frame lock and 3-digit indices (001_, 002_, ...) stay aligned."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -454,8 +598,9 @@ def main() -> int:
 
         aspect_ratio = resolve_batch_aspect_ratio(args.aspect_ratio, data)
         work_w, work_h, out_w, out_h = resolve_dimensions(aspect_ratio)
+        cli_anchor = resolve_focal_anchor(args.focal_anchor) if args.focal_anchor is not None else None
 
-        # Global cumulative frame lock computed across ALL shots first
+        # Global cumulative frame lock computed across ALL shots first (including omni_video shots)
         plans = compute_global_shot_plans(
             shots,
             args.fps,
@@ -463,23 +608,35 @@ def main() -> int:
             acts_meta=acts_meta,
         )
         total_frames = plans[-1].cum_end_frame
-        selected = filter_plans(plans, args.start_idx, args.end_idx, args.shot_ids, args.act)
+        pre_omni = filter_plans(plans, args.start_idx, args.end_idx, args.shot_ids, args.act, skip_omni=False)
 
-        if not selected:
+        if not pre_omni:
             print(
                 f"Error: slice filters matched 0 of {len(plans)} shots in {args.timings}.",
                 file=sys.stderr,
             )
             return 1
 
+        selected = filter_plans(plans, args.start_idx, args.end_idx, args.shot_ids, args.act, skip_omni=args.skip_omni)
+        omni_skipped = len(pre_omni) - len(selected)
+
+        if not selected:
+            print(
+                f"Global timeline locked: {len(plans)} shots, {total_frames} frames "
+                f"({total_frames / args.fps:.2f}s @ {args.fps}fps, {aspect_ratio}). "
+                f"All {omni_skipped} matched shot(s) skipped via --skip-omni (production_mode=omni_video)."
+            )
+            return 0
+
         scenes_dir = Path(args.scenes_dir)
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        skip_note = f", skipped {omni_skipped} omni_video shot(s)" if omni_skipped > 0 else ""
         print(
             f"Global timeline locked: {len(plans)} shots, {total_frames} frames "
             f"({total_frames / args.fps:.2f}s @ {args.fps}fps, {aspect_ratio} {work_w}x{work_h}->{out_w}x{out_h}). "
-            f"Rendering {len(selected)} shot(s) with workers={args.workers}."
+            f"Rendering {len(selected)} shot(s) with workers={args.workers}{skip_note}."
         )
 
         if args.workers == 1:
@@ -493,6 +650,7 @@ def main() -> int:
                     args.fade_out_last,
                     args.skip_existing,
                     aspect_ratio=aspect_ratio,
+                    focal_anchor_override=cli_anchor,
                 )
                 print(msg)
         else:
@@ -509,6 +667,7 @@ def main() -> int:
                         args.fade_out_last,
                         args.skip_existing,
                         aspect_ratio,
+                        cli_anchor,
                     ): plan
                     for plan in selected
                 }
@@ -533,6 +692,7 @@ def main() -> int:
             print(f"Skipped {args.image} -> {args.out}")
             return 0
         resolved_motion = resolve_motion(args.motion)
+        resolved_anchor = resolve_focal_anchor(args.focal_anchor)
         frames = animate_single(
             Path(args.image),
             args.duration,
@@ -543,8 +703,12 @@ def main() -> int:
             fade_in=args.fade_in_first,
             fade_out=args.fade_out_last,
             aspect_ratio=aspect_ratio,
+            focal_anchor=resolved_anchor,
         )
-        print(f"Animated {args.image} ({frames}f / {args.duration:.2f}s, {aspect_ratio}, {resolved_motion}) -> {args.out}")
+        print(
+            f"Animated {args.image} ({frames}f / {args.duration:.2f}s, {aspect_ratio}, "
+            f"{resolved_motion}, anchor={resolved_anchor}) -> {args.out}"
+        )
         return 0
 
     parser.error("Use either (--image, --duration, --out) or (--timings, --scenes-dir, --out-dir)")

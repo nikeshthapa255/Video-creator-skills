@@ -25,7 +25,7 @@ Features:
   4. Aspect-Ratio-Aware Fun Kinetic ASS Captions & Clean SRT Export (--export-srt):
      - 9:16 (PlayRes 1080x1920): 86px bold, Outline=8, Shadow=4.5, MarginV=420,
        max_chars=18, tilt=+/-2.5 deg (identical to v3.1/v3.2 Shorts).
-     - 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=72,
+     - 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=96,
        max_chars=36, tilt=0.0 deg, plus automatic clean captions.srt export.
      - Semantic keyword palettes: --keyword-color auto (v3.1 neon), --keyword-color palace
        (Imperial Gold / Fiery Crimson-Coral / Pearl Cyan-Jade), custom ASS BGR hex, and
@@ -91,7 +91,7 @@ ASPECT_RATIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "play_res_y": 1080,
         "font_size": 62,
         "max_chars": 36,
-        "margin_v": 72,
+        "margin_v": 96,
         "tilt": 0.0,
         "outline": 6,
         "shadow": 3.5,
@@ -251,7 +251,7 @@ def infer_video_format(plan: Dict) -> str:
     shots = plan.get("shots", []) or []
     acts = plan.get("acts", []) or []
     target_dur = float(plan.get("target_duration_sec") or 0.0)
-    if acts or len(shots) > 25 or target_dur > 90.0 or plan.get("series_metadata"):
+    if acts or len(shots) > 25 or target_dur > 90.0:
         return "long_form"
     return "short"
 
@@ -269,14 +269,20 @@ def int_to_words(n: int) -> str:
 
 
 NON_NOUN_FOLLOWERS = {
-    "a", "an", "and", "are", "as", "at", "because", "before", "but", "by",
-    "each", "every", "for", "from", "if", "in", "into", "is", "just", "less",
-    "more", "of", "on", "or", "over", "per", "so", "than", "that", "the",
-    "then", "to", "under", "was", "were", "when", "while", "with", "without",
+    "a", "an", "and", "are", "as", "at", "because", "before", "billion", "bucks",
+    "but", "by", "each", "every", "for", "from", "hundred", "if", "in", "into",
+    "is", "just", "less", "million", "more", "of", "on", "or", "over", "per",
+    "so", "than", "that", "the", "then", "thousand", "to", "total", "trillion",
+    "under", "was", "were", "when", "while", "with", "without", "worth",
 }
 
+RISKY_ALLCAPS_WORDS = {"US", "IT", "IN", "ON", "OR", "AM"}
 
-def lint_narration_text(text: str) -> List[Dict[str, str]]:
+
+def lint_narration_text(
+    text: str,
+    pronunciations: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, str]]:
     """Detect common neural TTS mispronunciations before synthesis."""
     issues: List[Dict[str, str]] = []
 
@@ -288,6 +294,7 @@ def lint_narration_text(text: str) -> List[Dict[str, str]]:
             continue
         issues.append({
             "code": "TTS_MISREAD",
+            "severity": "error",
             "match": m.group(0),
             "suggestion": f"{num}-dollar {noun}",
             "reason": "Currency before a noun can read as '<amount> dollars <noun>' instead of '<amount>-dollar <noun>'.",
@@ -299,6 +306,7 @@ def lint_narration_text(text: str) -> List[Dict[str, str]]:
         word_num = int_to_words(num)
         issues.append({
             "code": "TTS_MISREAD",
+            "severity": "error",
             "match": m.group(0),
             "suggestion": f"{m.group(1)} {word_num}",
             "reason": "'no <digits>' is frequently misread by neural TTS as 'number <digits>'. Spell out the number or use 'zero'.",
@@ -312,10 +320,25 @@ def lint_narration_text(text: str) -> List[Dict[str, str]]:
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
             issues.append({
                 "code": "TTS_MISREAD",
+                "severity": "error",
                 "match": m.group(0),
                 "suggestion": repl.strip(),
                 "reason": desc,
             })
+
+    # 4. Soft warning: risky 2-letter ALL-CAPS English words often read as acronyms/state codes
+    pron_keys = set(pronunciations.keys()) if isinstance(pronunciations, dict) else set()
+    for m in re.finditer(r"\b(US|IT|IN|ON|OR|AM)\b", text):
+        word = m.group(1)
+        if word in pron_keys:
+            continue
+        issues.append({
+            "code": "TTS_ALLCAPS_WARNING",
+            "severity": "warning",
+            "match": word,
+            "suggestion": word.lower(),
+            "reason": f"2-letter ALL-CAPS '{word}' is often read by neural TTS as an acronym or state code; lowercase it unless intentional.",
+        })
 
     return issues
 
@@ -344,10 +367,12 @@ SLOP_CLUSTER_TERMS = {
     "groundbreaking", "synergy", "leverage",
 }
 
-# Tuple format: (category, compiled_regex, hint, last_shot_only, loop_only)
+NARRATOR_SPEAKER_ROLES = {"narrator", "host", "cohost", "anchor", "vo", "voiceover"}
+
+# Tuple format: (category, compiled_regex, hint, last_shot_only, loop_only, commentary_only)
 # Every regex uses capturing group 1 for the reported match so leading sentence
 # punctuation is excluded from warnings.
-SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
+SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool, bool]] = [
     (
         "fake_contrast",
         re.compile(
@@ -360,6 +385,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "State what happened directly instead of a 'not just X, it's Y' contrast.",
         False,
         False,
+        True,
     ),
     (
         "fake_contrast",
@@ -370,6 +396,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "State what happened directly instead of a 'not just X, it's Y' contrast.",
         False,
         False,
+        True,
     ),
     (
         "fake_contrast",
@@ -380,6 +407,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "State what happened directly instead of an ad-copy 'Forget X' contrast.",
         False,
         False,
+        True,
     ),
     (
         "throat_clearing",
@@ -390,6 +418,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
             flags=re.IGNORECASE,
         ),
         "Cut the warm-up phrase and open directly on the fact or action.",
+        False,
         False,
         False,
     ),
@@ -403,17 +432,30 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "Cut the warm-up phrase and open directly on the fact or action.",
         False,
         False,
+        False,
     ),
     (
         "throat_clearing",
         re.compile(
             r"\b((?:here['’]s|here\s+is)\s+the\s+(?:thing|catch|kicker"
-            r"|wild\s+part|crazy\s+part|scary\s+part|truth))\b",
+            r"|wild\s+part|crazy\s+part|scary\s+part))\b",
             flags=re.IGNORECASE,
         ),
         "Cut the warm-up phrase and open directly on the fact or action.",
         False,
         False,
+        False,
+    ),
+    (
+        "throat_clearing",
+        re.compile(
+            r"\b((?:here['’]s|here\s+is)\s+the\s+truth)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the warm-up phrase and open directly on the fact or action.",
+        False,
+        False,
+        True,
     ),
     (
         "colon_reveal",
@@ -424,6 +466,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
             flags=re.IGNORECASE,
         ),
         "Fold the point into a direct spoken sentence instead of a staged colon reveal.",
+        False,
         False,
         False,
     ),
@@ -438,6 +481,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "Cut the dramatic echo; let the concrete fact carry the punch.",
         False,
         False,
+        True,
     ),
     (
         "dramatic_filler",
@@ -448,6 +492,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "Cut the dramatic echo fragment; let the concrete fact carry the punch.",
         False,
         False,
+        True,
     ),
     (
         "fake_deep",
@@ -459,6 +504,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
             flags=re.IGNORECASE,
         ),
         "Replace grand framing with the concrete fact or consequence.",
+        False,
         False,
         False,
     ),
@@ -476,17 +522,30 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "Replace AI-cliche wording with plain spoken English.",
         False,
         False,
+        False,
     ),
     (
         "wrapup_summary",
         re.compile(
             r"\b(in\s+summary|to\s+sum\s+up|in\s+conclusion|all\s+in\s+all"
-            r"|at\s+the\s+end\s+of\s+the\s+day|only\s+time\s+will\s+tell)\b",
+            r"|at\s+the\s+end\s+of\s+the\s+day)\b",
             flags=re.IGNORECASE,
         ),
         "Cut the wrap-up phrase; end on a concrete beat that loops into Shot 1.",
         False,
         False,
+        False,
+    ),
+    (
+        "wrapup_summary",
+        re.compile(
+            r"\b(only\s+time\s+will\s+tell)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Cut the wrap-up phrase; end on a concrete beat that loops into Shot 1.",
+        False,
+        False,
+        True,
     ),
     (
         "wrapup_summary",
@@ -496,6 +555,7 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         ),
         "Cut the wrap-up phrase; end on a concrete beat that loops into Shot 1.",
         True,
+        False,
         False,
     ),
     (
@@ -507,6 +567,20 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool]] = [
         "Avoid overusing flat 'Which is why...' loop bridges; end on a concrete beat or rotate loop callbacks.",
         True,
         True,
+        False,
+    ),
+]
+
+DRAMA_SLOP_PATTERNS: List[Tuple[str, re.Pattern, str]] = [
+    (
+        "drama_slop",
+        re.compile(
+            r"\b(mark\s+my\s+words|grave\s+mistake|you\s+have\s+no\s+idea\s+what\s+you['’]ve"
+            r"|played\s+right\s+into\s+my\s+hands|little\s+did\s+(?:he|she|they)\s+know"
+            r"|my\s+blood\s+ran\s+cold|this\s+ends\s+now)\b",
+            flags=re.IGNORECASE,
+        ),
+        "Replace melodramatic stock phrasing with concrete subtext or specific character action.",
     ),
 ]
 
@@ -525,18 +599,22 @@ def lint_slop_text(
     text: str,
     is_last_shot: bool = False,
     skip_loop_checks: bool = False,
+    skip_commentary_patterns: bool = False,
+    check_drama_slop: bool = False,
 ) -> List[Dict[str, str]]:
-    """Detect low-false-positive AI-slop patterns in spoken narration."""
+    """Detect low-false-positive AI-slop patterns in spoken narration and dialogue."""
     if not text or not text.strip():
         return []
 
     issues: List[Dict[str, str]] = []
     seen_spans: List[Tuple[int, int]] = []
 
-    for category, pattern, hint, last_shot_only, loop_only in SLOP_PATTERNS:
+    for category, pattern, hint, last_shot_only, loop_only, commentary_only in SLOP_PATTERNS:
         if last_shot_only and not is_last_shot:
             continue
         if loop_only and skip_loop_checks:
+            continue
+        if commentary_only and skip_commentary_patterns:
             continue
         effective_hint = hint
         if skip_loop_checks and category == "wrapup_summary":
@@ -557,6 +635,24 @@ def lint_slop_text(
                 "hint": effective_hint,
             })
 
+    if check_drama_slop:
+        for category, pattern, hint in DRAMA_SLOP_PATTERNS:
+            for m in pattern.finditer(text):
+                grp = 1 if m.lastindex else 0
+                s, e = m.start(grp), m.end(grp)
+                if any(s < es and ss < e for ss, es in seen_spans):
+                    continue
+                matched = m.group(grp).strip()
+                if not matched:
+                    continue
+                seen_spans.append((s, e))
+                issues.append({
+                    "code": "AI_SLOP_SCRIPT",
+                    "category": category,
+                    "match": matched,
+                    "hint": hint,
+                })
+
     cluster_terms = _extract_slop_cluster_terms(text)
     if len(cluster_terms) >= 2:
         issues.append({
@@ -570,11 +666,13 @@ def lint_slop_text(
 
 
 def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
-    """Run AI_SLOP_SCRIPT checks across every shot plus a plan-wide buzzword cluster check."""
+    """Run genre- and speaker-aware AI_SLOP_SCRIPT checks across every shot plus a plan-wide buzzword cluster check."""
     shots = plan.get("shots", []) or []
     video_format = infer_video_format(plan)
+    script_genre = str(plan.get("script_genre") or "commentary").strip().lower() or "commentary"
     ending_style = str(plan.get("ending_style") or "").strip().lower()
     skip_loop_checks = (video_format == "long_form") or (ending_style in ("cliffhanger", "outro"))
+    check_drama_slop = (script_genre == "drama") or (video_format == "long_form")
 
     warnings: List[Dict[str, str]] = []
     plan_cluster_terms: List[str] = []
@@ -585,7 +683,20 @@ def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
         sid = str(shot.get("shot_id", f"shot_{idx + 1:02d}"))
         text = str(shot.get("dialogue_or_vo", "") or "")
         is_last = idx == len(shots) - 1
-        for iss in lint_slop_text(text, is_last_shot=is_last, skip_loop_checks=skip_loop_checks):
+        speaker = str(shot.get("speaker") or "").strip().lower()
+        is_narrator = speaker in NARRATOR_SPEAKER_ROLES
+        is_character_dialogue = bool(speaker) and not is_narrator
+        skip_commentary = (
+            (script_genre == "drama" and not is_narrator)
+            or (video_format == "long_form" and is_character_dialogue)
+        )
+        for iss in lint_slop_text(
+            text,
+            is_last_shot=is_last,
+            skip_loop_checks=skip_loop_checks,
+            skip_commentary_patterns=skip_commentary,
+            check_drama_slop=check_drama_slop,
+        ):
             if iss["category"] == "ai_buzzword_cluster":
                 shot_cluster_warned = True
             warnings.append({
@@ -825,11 +936,11 @@ def _norm_key(token: str) -> str:
 
 def _speaker_palace_fallback(speaker: Optional[str]) -> str:
     sp = (speaker or "").strip().lower()
-    if sp in ("emperor", "prince", "guard", "ally", "cohost", "pei_xuan"):
+    if sp in ("emperor", "prince", "authority", "guard", "ally", "cohost", "mentor", "advisor", "royal"):
         return "palace_imperial"
-    if sp in ("rival", "antagonist", "villain", "lin_rou"):
+    if sp in ("rival", "antagonist", "villain", "enemy", "nemesis", "traitor"):
         return "palace_danger"
-    if sp in ("protagonist", "hero", "heroine", "host", "lin_wanyin"):
+    if sp in ("protagonist", "hero", "heroine", "host", "lead"):
         return "palace_jade"
     return "palace_imperial"
 
@@ -1243,7 +1354,10 @@ def build_zero_overlap_events(
     max_chars: int = DEFAULT_MAX_CHARS,
     tilt_deg: float = DEFAULT_TILT_DEG,
 ) -> List[Tuple[int, int, str]]:
-    """Build v4.0 Fun Kinetic ASS events with elastic bounce, semantic/speaker colors, tilt, and zero overlaps."""
+    """Build v4.0 Fun Kinetic or Clean Subtitle ASS events with zero overlaps."""
+    if caption_style == "none":
+        return []
+
     annotated = (
         mark_keywords(words, global_keywords=keywords, palette=keyword_color)
         if caption_style == "kinetic_keyword"
@@ -1251,6 +1365,29 @@ def build_zero_overlap_events(
     )
     chunks = chunk_words(annotated, max_words=_max_words_for_chars(max_chars), max_chars=max_chars)
     raw: List[Tuple[int, int, str]] = []
+
+    if caption_style == "clean_subtitle":
+        for chunk in chunks:
+            if not chunk:
+                continue
+            c_start = max(0, int(round(chunk[0]["start_sec"] * 100)))
+            c_end = max(c_start + 5, int(round(chunk[-1]["end_sec"] * 100)))
+            clean_text = " ".join(
+                w["text"].replace("{", "").replace("}", "").strip()
+                for w in chunk
+                if w["text"].strip()
+            )
+            if not clean_text:
+                continue
+            sp_color = chunk[0].get("speaker_keyword_color")
+            if isinstance(sp_color, str) and sp_color.strip():
+                sp_norm = normalize_ass_color(sp_color)
+                if sp_norm not in ("auto", "palace"):
+                    tint = derive_subtle_tint(sp_norm)
+                    clean_text = rf"{{\c{tint}}}" + clean_text + rf"{{\c{NEUTRAL_WORD_COLOR}}}"
+            raw.append((c_start, c_end, clean_text))
+        return _clamp_monotonic_events(raw)
+
     tilt_sign = 1.0  # Alternates +tilt_deg / -tilt_deg across keyword punchline chunks
 
     for chunk in chunks:
@@ -1413,27 +1550,45 @@ def resolve_shot_voice_params(
 
     Priority per field:
       1. Per-shot explicit shot.voice / shot.rate / shot.pitch
-      2. plan.voice_cast[speaker] (and plan.speaker_voices[speaker] for voice)
+      2. plan.voice_cast[speaker] (exact or case-insensitive fallback, plus plan.speaker_voices)
       3. Explicit CLI --voice / --rate / --pitch
-      4. Generic built-in defaults (only when a speaker is named on the shot)
-      5. Plan default voice / format fallback rate & pitch
+      4. Explicit plan.voice when voice_cast is absent (keeps single-voice plans intact)
+      5. Generic built-in defaults (only when a speaker is named on the shot)
+      6. Plan default voice / format fallback rate & pitch
     """
     raw_speaker = shot.get("speaker")
     has_speaker = isinstance(raw_speaker, str) and bool(raw_speaker.strip())
     speaker = raw_speaker.strip() if has_speaker else ""
 
-    cast_cfg = plan_voice_cast.get(speaker, {}) if has_speaker else {}
+    plan_voice_cast_lower = {k.lower(): v for k, v in plan_voice_cast.items()}
+    cast_cfg = (
+        plan_voice_cast.get(speaker) or plan_voice_cast_lower.get(speaker.lower()) or {}
+        if has_speaker
+        else {}
+    )
     generic_cfg = GENERIC_VOICE_CAST.get(speaker.lower(), {}) if has_speaker else {}
 
     shot_voice = str(shot.get("voice") or "").strip()
-    voice = (
-        shot_voice
-        or cast_cfg.get("voice")
-        or (cli_voice.strip() if cli_voice else "")
-        or generic_cfg.get("voice")
-        or plan_default_voice
-        or "en-US-AvaNeural"
-    )
+    cli_v = cli_voice.strip() if cli_voice else ""
+    plan_v = plan_default_voice.strip() if plan_default_voice else ""
+    if not plan_voice_cast and plan_v:
+        voice = (
+            shot_voice
+            or cast_cfg.get("voice")
+            or cli_v
+            or plan_v
+            or generic_cfg.get("voice")
+            or "en-US-AvaNeural"
+        )
+    else:
+        voice = (
+            shot_voice
+            or cast_cfg.get("voice")
+            or cli_v
+            or generic_cfg.get("voice")
+            or plan_v
+            or "en-US-AvaNeural"
+        )
 
     shot_rate = str(shot["rate"]).strip() if shot.get("rate") is not None and str(shot["rate"]).strip() else ""
     rate = (
@@ -1578,50 +1733,150 @@ async def synthesize_all_shots_async(
     return results
 
 
+def parse_act_value(raw: Any) -> Optional[int]:
+    """Normalize act/chapter identifiers (1, '1', 'Act 1', 'act_01', 'chapter_1', 'act-2') to int."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, float):
+        iv = int(raw)
+        return iv if iv >= 1 and iv == raw else None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        iv = int(s)
+        return iv if iv >= 1 else None
+    m = re.match(r"^(?:act|chapter|ch|part)[\s_-]*0*(\d+)$", s, flags=re.IGNORECASE)
+    if m:
+        iv = int(m.group(1))
+        return iv if iv >= 1 else None
+    m2 = re.search(r"0*(\d+)", s)
+    if m2:
+        iv = int(m2.group(1))
+        return iv if iv >= 1 else None
+    return None
+
+
 def build_act_summaries(shot_timings: List[Dict], plan: Optional[Dict] = None) -> List[Dict[str, Any]]:
-    """Aggregate per-act timing boundaries and merge act titles from plan.acts if present."""
-    plan_titles: Dict[Any, str] = {}
+    """Aggregate per-act timing boundaries and merge title/bgm_intensity/shot_ids from plan.acts."""
+    plan_act_meta: Dict[int, Dict[str, Any]] = {}
+    shot_id_to_act: Dict[str, int] = {}
     if isinstance(plan, dict) and isinstance(plan.get("acts"), list):
         for idx, item in enumerate(plan["acts"]):
             if not isinstance(item, dict):
                 continue
-            act_key = item.get("act", item.get("act_number", idx + 1))
+            raw_key = item.get("act", item.get("act_number", idx + 1))
+            act_num = parse_act_value(raw_key)
+            if act_num is None:
+                act_num = idx + 1
             title = str(item.get("title") or item.get("act_title") or "").strip()
+            bgm_intensity = str(item.get("bgm_intensity") or "").strip().lower()
+            meta = plan_act_meta.setdefault(act_num, {})
             if title:
-                plan_titles[act_key] = title
-                plan_titles[str(act_key)] = title
+                meta["title"] = title
+            if bgm_intensity:
+                meta["bgm_intensity"] = bgm_intensity
+            raw_sids = item.get("shot_ids")
+            if isinstance(raw_sids, list):
+                for sid in raw_sids:
+                    sid_s = str(sid).strip()
+                    if sid_s:
+                        shot_id_to_act[sid_s] = act_num
 
-    acts_map: Dict[Any, Dict[str, Any]] = {}
-    acts_order: List[Any] = []
+    acts_map: Dict[int, Dict[str, Any]] = {}
+    acts_order: List[int] = []
     for entry in shot_timings:
-        act_val = entry.get("act")
-        if act_val is None:
+        act_num = parse_act_value(entry.get("act"))
+        if act_num is None:
+            act_num = shot_id_to_act.get(str(entry.get("shot_id", "")))
+        if act_num is None:
             continue
-        if act_val not in acts_map:
-            acts_order.append(act_val)
-            title = plan_titles.get(act_val) or plan_titles.get(str(act_val)) or ""
-            acts_map[act_val] = {
-                "act": act_val,
-                "title": title,
+        if act_num not in acts_map:
+            acts_order.append(act_num)
+            meta = plan_act_meta.get(act_num, {})
+            rec: Dict[str, Any] = {
+                "act": act_num,
+                "title": meta.get("title", ""),
                 "start_sec": entry["start_sec"],
                 "end_sec": entry["end_sec"],
                 "duration_sec": 0.0,
                 "shot_ids": [entry["shot_id"]],
             }
+            if meta.get("bgm_intensity"):
+                rec["bgm_intensity"] = meta["bgm_intensity"]
+            acts_map[act_num] = rec
         else:
-            rec = acts_map[act_val]
+            rec = acts_map[act_num]
             rec["start_sec"] = min(rec["start_sec"], entry["start_sec"])
             rec["end_sec"] = max(rec["end_sec"], entry["end_sec"])
             rec["shot_ids"].append(entry["shot_id"])
 
     summaries: List[Dict[str, Any]] = []
-    for act_val in acts_order:
-        rec = acts_map[act_val]
+    for act_num in acts_order:
+        rec = acts_map[act_num]
         rec["start_sec"] = round(rec["start_sec"], 4)
         rec["end_sec"] = round(rec["end_sec"], 4)
         rec["duration_sec"] = round(rec["end_sec"] - rec["start_sec"], 4)
         summaries.append(rec)
     return summaries
+
+
+def format_chapter_timestamp(sec: float) -> str:
+    total = max(0, int(round(sec)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def write_chapters_file(
+    acts: List[Dict[str, Any]],
+    chapters_path: Path,
+    aspect_ratio: str = "9:16",
+) -> List[str]:
+    """Write YouTube chapters.txt from act summaries and warn if YouTube chapter rules aren't met."""
+    lines: List[str] = []
+    if not acts:
+        return lines
+
+    if len(acts) < 3:
+        print(
+            f"Warning: chapters.txt has only {len(acts)} chapter(s); "
+            "YouTube requires at least 3 chapters starting at 0:00.",
+            file=sys.stderr,
+        )
+
+    for idx, act in enumerate(acts):
+        act_num = act.get("act", idx + 1)
+        start_s = 0.0 if idx == 0 else float(act.get("start_sec", 0.0))
+        dur_s = float(act.get("duration_sec", max(0.0, float(act.get("end_sec", 0.0)) - start_s)))
+        raw_title = str(act.get("title") or "").strip()
+
+        if aspect_ratio == "16:9":
+            label = raw_title if raw_title else f"Act {act_num}"
+        else:
+            if not raw_title:
+                label = f"Act {act_num}"
+            elif re.match(r"^(?:act|chapter)\s+\d+", raw_title, flags=re.IGNORECASE):
+                label = raw_title
+            else:
+                label = f"Act {act_num}: {raw_title}"
+
+        if dur_s < 10.0:
+            print(
+                f"Warning: chapter {idx + 1} ('{label}') is {dur_s:.1f}s; "
+                "YouTube requires every chapter to be at least 10 seconds long.",
+                file=sys.stderr,
+            )
+
+        lines.append(f"{format_chapter_timestamp(start_s)} {label}")
+
+    chapters_path.parent.mkdir(parents=True, exist_ok=True)
+    chapters_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return lines
 
 
 def lint_plan(
@@ -1631,6 +1886,7 @@ def lint_plan(
     check_tts_misread: bool = True,
 ) -> int:
     found = 0
+    tts_warnings = 0
     if check_tts_misread:
         pronunciations = plan.get("tts_pronunciations")
         if not isinstance(pronunciations, dict):
@@ -1638,13 +1894,20 @@ def lint_plan(
         for shot in plan.get("shots", []):
             sid = shot.get("shot_id", "unknown")
             spoken_text = resolve_tts_text(shot, pronunciations=pronunciations, autofix=False)
-            issues = lint_narration_text(spoken_text)
+            issues = lint_narration_text(spoken_text, pronunciations=pronunciations)
             for iss in issues:
-                found += 1
-                print(
-                    f"[TTS_MISREAD] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
-                    file=sys.stderr,
-                )
+                if iss.get("severity") == "warning":
+                    tts_warnings += 1
+                    print(
+                        f"WARNING [{iss['code']}] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
+                        file=sys.stderr,
+                    )
+                else:
+                    found += 1
+                    print(
+                        f"[{iss['code']}] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
+                        file=sys.stderr,
+                    )
 
     slop_warnings: List[Dict[str, str]] = []
     if check_slop:
@@ -1672,8 +1935,13 @@ def lint_plan(
         return 2
 
     if check_tts_misread:
+        notes: List[str] = []
+        if tts_warnings > 0:
+            notes.append(f"{tts_warnings} TTS_ALLCAPS_WARNING warning(s)")
         if slop_count > 0:
-            print(f"TTS lint passed: 0 misread risks found ({slop_count} AI_SLOP_SCRIPT warning(s)).")
+            notes.append(f"{slop_count} AI_SLOP_SCRIPT warning(s)")
+        if notes:
+            print(f"TTS lint passed: 0 misread risks found ({', '.join(notes)}).")
         else:
             print("TTS lint passed: 0 misread risks found.")
     return 0
@@ -1694,8 +1962,8 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         return 2
     preset = get_aspect_preset(aspect_ratio)
 
-    plan_default_voice = str(plan.get("voice") or "").strip() or "en-US-AvaNeural"
-    default_voice = args.voice.strip() if args.voice else plan_default_voice
+    raw_plan_voice = str(plan.get("voice") or "").strip()
+    default_voice = args.voice.strip() if args.voice else (raw_plan_voice or "en-US-AvaNeural")
     fallback_rate = DEFAULT_SHORT_RATE if video_format != "long_form" else DEFAULT_LONG_RATE
     fallback_pitch = DEFAULT_PITCH
     plan_voice_cast = build_plan_voice_cast(plan)
@@ -1738,7 +2006,7 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 cli_voice=args.voice,
                 cli_rate=args.rate,
                 cli_pitch=args.pitch,
-                plan_default_voice=plan_default_voice,
+                plan_default_voice=raw_plan_voice,
                 fallback_rate=fallback_rate,
                 fallback_pitch=fallback_pitch,
             )
@@ -1828,14 +2096,18 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 all_words.append(cw)
 
             raw_post_gap = shot.get("post_gap_sec")
-            if idx < len(jobs) - 1:
-                post_gap = max(0.0, float(raw_post_gap) if raw_post_gap is not None else float(args.gap))
+            is_silent_shot = not bool(tts_spoken_text)
+            if raw_post_gap is not None:
+                post_gap = max(0.0, float(raw_post_gap))
+            elif is_silent_shot or idx >= len(jobs) - 1:
+                post_gap = 0.0
             else:
-                post_gap = max(0.0, float(raw_post_gap)) if raw_post_gap is not None else 0.0
+                post_gap = max(0.0, float(args.gap))
 
+            norm_act = parse_act_value(shot.get("act"))
             timing_entry: Dict[str, Any] = {
                 "shot_id": sid,
-                "act": shot.get("act"),
+                "act": norm_act if norm_act is not None else shot.get("act"),
                 "speaker": speaker,
                 "voice": shot_voice,
                 "rate": job["rate"],
@@ -1849,9 +2121,12 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 "flash_in": bool(shot.get("flash_in", False)),
                 "sfx_type": shot.get("sfx_type", "none"),
                 "sfx_offset_sec": float(shot.get("sfx_offset_sec", 0.0)),
-                "sfx_gain_db": float(shot.get("sfx_gain_db", -2.5)),
+                "sfx_gain_db": float(shot.get("sfx_gain_db", -3.0)),
                 "dialogue_or_vo": display_text,
             }
+            for opt_key in ("production_mode", "bgm_cue", "bgm_drop_sec", "sfx_pan", "focal_anchor", "fade_in", "fade_out"):
+                if opt_key in shot and shot[opt_key] is not None:
+                    timing_entry[opt_key] = shot[opt_key]
             if tts_spoken_text and tts_spoken_text != display_text:
                 timing_entry["tts_text"] = tts_spoken_text
             timing_entry["words"] = shifted_words
@@ -1886,17 +2161,32 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         "acts": act_summaries,
         "shots": shot_timings,
     }
+    if plan.get("ending_style"):
+        timings_payload["ending_style"] = str(plan["ending_style"]).strip()
     timings_path = out_dir / "shot_timings.json"
     timings_path.write_text(json.dumps(timings_payload, indent=2) + "\n", encoding="utf-8")
+
+    chapters_path: Optional[Path] = None
+    if act_summaries:
+        chapters_path = out_dir / "chapters.txt"
+        write_chapters_file(act_summaries, chapters_path, aspect_ratio=aspect_ratio)
 
     global_keywords = parse_keyword_list(args.keywords) or parse_keyword_list(plan.get("highlight_keywords"))
     caption_style = args.caption_style or plan.get("caption_style") or "kinetic_keyword"
     plan_max_chars = (plan.get("fun_pacing_gate") or {}).get("max_caption_chars")
-    max_chars = (
-        args.max_chars
-        if args.max_chars is not None
-        else int(plan_max_chars if (plan_max_chars and aspect_ratio == "9:16") else (plan_max_chars or preset["max_chars"]))
-    )
+    explicit_caption_max = plan.get("caption_max_chars")
+    if args.max_chars is not None:
+        max_chars = args.max_chars
+    elif explicit_caption_max is not None:
+        max_chars = int(explicit_caption_max)
+    elif aspect_ratio == "16:9":
+        max_chars = (
+            int(plan_max_chars)
+            if (plan_max_chars is not None and int(plan_max_chars) > DEFAULT_MAX_CHARS)
+            else int(preset["max_chars"])
+        )
+    else:
+        max_chars = int(plan_max_chars) if plan_max_chars is not None else int(preset["max_chars"])
     if max_chars < 1:
         max_chars = preset["max_chars"]
 
@@ -1904,28 +2194,35 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
     font_size = args.font_size if args.font_size is not None else int(plan_font_size or preset["font_size"])
     plan_margin_v = plan.get("caption_margin_v")
     margin_v = args.margin_v if args.margin_v is not None else int(plan_margin_v if plan_margin_v is not None else preset["margin_v"])
-    plan_tilt = plan.get("caption_tilt")
-    tilt_deg = (
-        args.tilt
-        if args.tilt is not None
-        else (float(plan_tilt) if plan_tilt is not None else float(preset["tilt"]))
-    )
+    plan_tilt = plan.get("caption_tilt") if plan.get("caption_tilt") is not None else plan.get("tilt")
+    if args.tilt is not None:
+        tilt_deg = args.tilt
+    elif caption_style == "clean_subtitle":
+        tilt_deg = 0.0
+    elif plan_tilt is not None:
+        tilt_deg = float(plan_tilt)
+    else:
+        tilt_deg = float(preset["tilt"])
     keyword_color = args.keyword_color or plan.get("caption_keyword_color") or DEFAULT_KEYWORD_COLOR
 
     font_name = detect_bold_font(args.font)
-    events = build_zero_overlap_events(
-        all_words,
-        caption_style=caption_style,
-        keywords=global_keywords,
-        keyword_color=keyword_color,
-        max_chars=max_chars,
-        tilt_deg=tilt_deg,
-    )
-    ass_lines = [build_ass_header(font_name, font_size=font_size, margin_v=margin_v, aspect_ratio=aspect_ratio).rstrip()]
-    for s, e, text in events:
-        ass_lines.append(f"Dialogue: 0,{cs_to_ass_time(s)},{cs_to_ass_time(e)},ShortsHook,,0,0,0,,{text}")
-    ass_path = out_dir / "captions.ass"
-    ass_path.write_text("\n".join(ass_lines) + "\n", encoding="utf-8")
+    ass_path: Optional[Path] = None
+    if caption_style == "none":
+        events: List[Tuple[int, int, str]] = []
+    else:
+        events = build_zero_overlap_events(
+            all_words,
+            caption_style=caption_style,
+            keywords=global_keywords,
+            keyword_color=keyword_color,
+            max_chars=max_chars,
+            tilt_deg=tilt_deg,
+        )
+        ass_lines = [build_ass_header(font_name, font_size=font_size, margin_v=margin_v, aspect_ratio=aspect_ratio).rstrip()]
+        for s, e, text in events:
+            ass_lines.append(f"Dialogue: 0,{cs_to_ass_time(s)},{cs_to_ass_time(e)},ShortsHook,,0,0,0,,{text}")
+        ass_path = out_dir / "captions.ass"
+        ass_path.write_text("\n".join(ass_lines) + "\n", encoding="utf-8")
 
     srt_path: Optional[Path] = None
     if args.export_srt or aspect_ratio == "16:9":
@@ -1940,11 +2237,16 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         f"max_chars={max_chars}, kw_color={keyword_color}, tilt=+/-{tilt_deg:g}deg, "
         f"{len(events)} caption events)"
     )
-    print(f"  VO:      {out_dir / 'voiceover.wav'}")
-    print(f"  Timings: {timings_path}")
-    print(f"  ASS:     {ass_path}")
+    print(f"  VO:       {out_dir / 'voiceover.wav'}")
+    print(f"  Timings:  {timings_path}")
+    if ass_path is not None:
+        print(f"  ASS:      {ass_path}")
+    else:
+        print("  ASS:      (skipped; caption_style=none)")
     if srt_path is not None:
-        print(f"  SRT:     {srt_path}")
+        print(f"  SRT:      {srt_path}")
+    if chapters_path is not None:
+        print(f"  Chapters: {chapters_path}")
     return 0
 
 
@@ -1965,7 +2267,10 @@ def main() -> int:
     parser.add_argument(
         "--rate",
         default=None,
-        help=f"Speech rate adjustment (default: {DEFAULT_SHORT_RATE} for Shorts, {DEFAULT_LONG_RATE} for long-form unless set by voice_cast/shot).",
+        help=(
+            f"Speech rate adjustment (default: {DEFAULT_SHORT_RATE.replace('%', '%%')} for Shorts, "
+            f"{DEFAULT_LONG_RATE.replace('%', '%%')} for long-form unless set by voice_cast/shot)."
+        ),
     )
     parser.add_argument(
         "--pitch",
@@ -2001,7 +2306,7 @@ def main() -> int:
         "--margin-v",
         type=int,
         default=None,
-        help="ASS MarginV vertical offset from bottom in px (default: plan.caption_margin_v or 420 for 9:16 / 72 for 16:9).",
+        help="ASS MarginV vertical offset from bottom in px (default: plan.caption_margin_v or 420 for 9:16 / 96 for 16:9).",
     )
     parser.add_argument(
         "--tilt",
@@ -2011,7 +2316,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--caption-style",
-        choices=("kinetic_keyword", "karaoke_chunk"),
+        choices=("kinetic_keyword", "karaoke_chunk", "clean_subtitle", "none"),
         default=None,
         help="Caption animation style (default: plan.caption_style or kinetic_keyword).",
     )

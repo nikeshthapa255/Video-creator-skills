@@ -24,13 +24,25 @@
   },
   "then": {
     "properties": {
-      "target_duration_sec": { "minimum": 60, "maximum": 1800 }
+      "target_duration_sec": { "minimum": 60, "maximum": 1800 },
+      "hook_gate": {
+        "required": ["visual_pattern_interrupt", "frame0_motion", "verbal_open_loop", "passed"]
+      },
+      "fun_pacing_gate": {
+        "required": ["word_count", "avg_shot_length_sec", "sfx_cue_count", "tts_lint_passed", "passed"]
+      }
     }
   },
   "else": {
     "required": ["loop_bridge"],
     "properties": {
-      "target_duration_sec": { "minimum": 10, "maximum": 60 }
+      "target_duration_sec": { "minimum": 10, "maximum": 60 },
+      "hook_gate": {
+        "required": ["visual_pattern_interrupt", "frame0_motion", "verbal_open_loop", "tos_2_3_words", "passed"]
+      },
+      "fun_pacing_gate": {
+        "required": ["word_count", "avg_shot_length_sec", "sfx_cue_count", "visual_gag_every_2_3_shots", "tts_lint_passed", "passed"]
+      }
     }
   },
   "properties": {
@@ -47,14 +59,21 @@
       "default": "short",
       "description": "short = 30-55s 9:16 Short with replay loop; long_form = 3-15+ min multi-act episode (9:16 vertical micro-drama or 16:9 horizontal YouTube video) with multi-voice cast, Act-aware BGM, and chunked QA."
     },
+    "script_genre": {
+      "type": "string",
+      "enum": ["commentary", "drama"],
+      "default": "commentary",
+      "description": "Controls --lint-plan AI-slop rules: commentary (news/explainer/comedy voiceover) vs drama (scripted character fiction; skips commentary false positives on dialogue and checks melodrama clichés)."
+    },
     "production_mode": {
       "type": "string",
       "enum": ["omni_video", "keyframe_motion", "hybrid"],
-      "description": "omni_video = Gemini Omni 1.2 Flash video generation; keyframe_motion = zero-API-key keyframes with 2x-supersampled FFmpeg motion; hybrid = mixes Mode A hero clips with Mode B motion shots via per-shot production_mode."
+      "description": "Render engine: omni_video = Mode A (Gemini Omni 1.2 Flash); keyframe_motion = Mode B (zero video API key keyframes + 2x FFmpeg zoompan); hybrid = Mode A hero/hook clips + Mode B narrative shots via shots[].production_mode."
     },
     "mode": {
       "type": "string",
-      "enum": ["2d_stickman_in_3d", "stylized_3d"]
+      "enum": ["2d_stickman_in_3d", "stylized_3d"],
+      "description": "Visual art style (distinct from production_mode render engine)."
     },
     "aspect_ratio": {
       "type": "string",
@@ -69,7 +88,7 @@
     "ending_style": {
       "type": "string",
       "enum": ["replay_loop", "cliffhanger", "outro"],
-      "description": "replay_loop = Shorts dual-anchor loop back to Shot 1; cliffhanger = serialized multi-episode drama hook; outro = standalone long-form conclusion/CTA."
+      "description": "replay_loop = Shorts dual-anchor loop back to Shot 1; cliffhanger = serialized multi-episode drama hook (holds tension in make_bgm.py); outro = standalone long-form conclusion/End-Screen slate."
     },
     "audio_mode": {
       "type": "string",
@@ -91,11 +110,11 @@
           },
           "rate": {
             "type": "string",
-            "description": "Speech rate offset such as '+14%' or '+0%'."
+            "description": "Speech rate offset such as '+14%' or '+4%'."
           },
           "pitch": {
             "type": "string",
-            "description": "Pitch offset such as '-2Hz' or '+4Hz'."
+            "description": "Pitch offset such as '-2Hz' or '+4Hz' (keep within -6Hz..+6Hz)."
           },
           "keyword_color": {
             "type": "string",
@@ -132,30 +151,40 @@
     "bgm_source": {
       "type": "string",
       "enum": ["retrieved_track", "procedural", "procedural_act_aware"],
-      "description": "retrieved_track = instrumental via retrieve_music.py; procedural = synthesized stem via make_bgm.py; procedural_act_aware = multi-act score locked to shot_timings.json act boundaries."
+      "description": "retrieved_track = instrumental via retrieve_music.py; procedural = synthesized stem via make_bgm.py; procedural_act_aware = multi-act score locked to shot_timings.json act boundaries and bgm_intensity."
     },
     "bgm_query": {
       "type": "string",
       "description": "Optional search query or style hint for retrieve_music.py when bgm_source is retrieved_track."
     },
+    "ambience_bed": {
+      "type": "string",
+      "enum": ["none", "palace_courtyard", "throne_hall", "newsroom_air", "hearth_embers"],
+      "default": "none",
+      "description": "Optional subtle -36 dBFS room-tone bed mixed by sfx_engine.py --ambience so silent pauses never drop to digital mute."
+    },
     "caption_style": {
       "type": "string",
       "enum": ["kinetic_keyword", "karaoke_chunk", "clean_subtitle", "none"],
-      "description": "kinetic_keyword = word-by-word pop with semantic highlights; karaoke_chunk = bounce-pop phrase chunks; clean_subtitle = 16:9 widescreen lower-third subtitles without tilt; none = no burned-in captions (use --export-srt for YouTube CC)."
+      "description": "kinetic_keyword = word-by-word pop with semantic highlights; karaoke_chunk = bounce-pop phrase chunks; clean_subtitle = calm static lower-third subtitles (zero bounce/tilt); none = skip burned-in ASS (use captions.srt for YouTube CC)."
     },
     "caption_font_size": {
       "type": "integer",
       "minimum": 36,
       "maximum": 120,
-      "default": 86,
       "description": "ASS caption font size (defaults: 86 on 1080x1920, 62 on 1920x1080)."
     },
     "caption_margin_v": {
       "type": "integer",
       "minimum": 40,
       "maximum": 800,
-      "default": 420,
-      "description": "ASS MarginV offset from bottom in px (defaults: 420 on 1080x1920 vertical, 72 on 1920x1080 horizontal)."
+      "description": "ASS MarginV offset from bottom in px (defaults: 420 on 1080x1920 vertical, 96 on 1920x1080 horizontal to clear YouTube scrub bar)."
+    },
+    "caption_tilt": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 8,
+      "description": "Alternating keyword-line tilt in degrees (defaults: 2.5 on 9:16 kinetic_keyword, 0.0 on 16:9 or clean_subtitle)."
     },
     "caption_keyword_color": {
       "type": "string",
@@ -175,44 +204,93 @@
       "type": "string",
       "description": "Verbatim rendering, lighting, camera, and palette block appended to every shot prompt. Forbid signage with 'unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage' (never 'blank signs')."
     },
+    "locations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "sheet_path": { "type": "string", "description": "Master empty-set location plate path (Template 1E, e.g., sheets/loc_throne_hall.png)." },
+          "lighting": { "type": "string", "description": "Locked key-light direction and color temperature for this set." },
+          "states": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "description": "Optional recurring set/location anchor registry for long-form architectural and lighting continuity."
+    },
+    "props": {
+      "type": "array",
+      "description": "Optional hero story prop registry to preserve visual consistency across Acts.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "visual_traits"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "visual_traits": { "type": "string" },
+          "state_sheets": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    },
+    "packaging": {
+      "type": "object",
+      "description": "Optional Stage 1 / Stage 6 creator packaging bundle (thumbnails, cover frame, titles, description, pinned comment).",
+      "properties": {
+        "title_candidates": { "type": "array", "items": { "type": "string" } },
+        "thumbnail_16x9_paths": { "type": "array", "items": { "type": "string" } },
+        "cover_9x16_path": { "type": "string" },
+        "description": { "type": "string" },
+        "pinned_comment": { "type": "string" },
+        "synthetic_content_disclosure": { "type": "boolean", "default": true }
+      }
+    },
     "acts": {
       "type": "array",
-      "description": "Optional multi-act / chapter outline for long-form episodes (used for modular act authoring, Act-aware BGM dynamics, and YouTube chapter export).",
+      "description": "Optional multi-act / chapter outline for long-form episodes (used for modular act authoring, Act-aware BGM dynamics, lighting color script, and YouTube chapter export).",
       "items": {
         "type": "object",
         "required": ["act", "title"],
         "properties": {
           "act": { "type": "integer", "minimum": 1 },
-          "title": { "type": "string" },
+          "title": { "type": "string", "description": "Curiosity-preserving, non-spoiler chapter/act title (<= 35 chars recommended for YouTube chapters)." },
           "act_file": { "type": "string", "description": "Optional modular act JSON path (e.g., acts/act_01.json)." },
           "target_duration_sec": { "type": "number", "minimum": 10 },
           "bgm_intensity": {
             "type": "string",
-            "enum": ["sparse", "tense", "escalating", "climax", "epilogue"]
+            "enum": ["sparse", "tense", "escalating", "climax", "epilogue"],
+            "description": "Read directly by make_bgm.py --timings to set Act orchestration density."
           },
+          "lighting_mood": { "type": "string", "description": "Act-level lighting and color-script note (e.g., warm amber lantern chiaroscuro vs cool moonlight)." },
+          "rehook_question": { "type": "string", "description": "Curiosity turn or escalation beat at the end of this Act to sustain viewer retention." },
           "summary": { "type": "string" }
         }
       }
     },
     "hook_gate": {
       "type": "object",
-      "required": ["visual_pattern_interrupt", "frame0_motion", "verbal_open_loop", "tos_2_3_words", "passed"],
       "properties": {
         "visual_pattern_interrupt": { "type": "string" },
         "frame0_motion": { "type": "string" },
         "verbal_open_loop": { "type": "string" },
         "tos_2_3_words": { "type": "string" },
+        "click_confirmation_0_5s": { "type": "string", "description": "Long-form: how 0-5s pays off the title and thumbnail immediately." },
         "passed": { "type": "boolean" }
       }
     },
     "fun_pacing_gate": {
       "type": "object",
-      "required": ["word_count", "avg_shot_length_sec", "sfx_cue_count", "visual_gag_every_2_3_shots", "tts_lint_passed", "passed"],
       "properties": {
         "word_count": { "type": "integer", "minimum": 30, "maximum": 4500 },
         "avg_shot_length_sec": { "type": "number", "minimum": 1.0, "maximum": 8.0 },
         "sfx_cue_count": { "type": "integer", "minimum": 0 },
         "visual_gag_every_2_3_shots": { "type": "boolean" },
+        "visual_shift_every_2_3_shots": { "type": "boolean", "description": "Long-form drama alternative to comedy gags: shot-scale, blocking, or emotional turn every 2-3 shots." },
         "tts_lint_passed": { "type": "boolean" },
         "natural_speech_passed": {
           "type": "boolean",
@@ -222,8 +300,7 @@
           "type": "integer",
           "minimum": 10,
           "maximum": 48,
-          "default": 18,
-          "description": "Max characters per caption line (defaults: 18 on 1080x1920 at 86px; 36 on 1920x1080 at 62px)."
+          "description": "Max characters per caption line (aspect defaults: 18 on 9:16 at 86px; 36 on 16:9 at 62px)."
         },
         "passed": { "type": "boolean" }
       }
@@ -248,6 +325,7 @@
           "id": { "type": "string" },
           "name": { "type": "string" },
           "visual_traits": { "type": "string" },
+          "relative_height": { "type": "string", "enum": ["tall", "average", "short", "petite"] },
           "sheet_2d_path": { "type": "string" },
           "sheet_3d_path": { "type": "string" },
           "state_sheets": {
@@ -299,14 +377,42 @@
             "enum": ["omni_video", "keyframe_motion"],
             "description": "Optional per-shot override when top-level production_mode is hybrid."
           },
-          "duration_sec": { "type": "number", "minimum": 1.0, "maximum": 15 },
+          "shot_role": {
+            "type": "string",
+            "enum": ["establishing", "dialogue", "action", "reaction", "insert", "cliffhanger", "end_screen"],
+            "description": "Optional dramatic function of the shot (use 'reaction' with empty dialogue_or_vo for silent beats)."
+          },
+          "location": {
+            "type": "string",
+            "description": "Optional key referencing top-level locations map for architectural/lighting continuity."
+          },
+          "duration_sec": { "type": "number", "minimum": 0.6, "maximum": 15 },
           "characters": { "type": "array", "items": { "type": "string" } },
           "character_states": {
             "type": "object",
             "additionalProperties": { "type": "string" },
-            "description": "Optional per-character state sheet selector for this shot (e.g., {\"lin_wanyin\": \"veiled\"})."
+            "description": "Optional per-character state sheet selector for this shot (e.g., {\"hero\": \"veiled\"})."
           },
           "spatial_layout": { "type": "string" },
+          "shot_scale": {
+            "type": "string",
+            "enum": ["EWS", "WS", "MS", "MCU", "CU", "ECU", "OTS", "TWO_SHOT", "INSERT", "POV"]
+          },
+          "camera_angle": {
+            "type": "string",
+            "enum": ["eye_level", "low_angle", "high_angle", "dutch_left", "dutch_right", "birds_eye", "worms_eye"]
+          },
+          "eyeline": {
+            "type": "string",
+            "enum": ["camera", "screen_right", "screen_left", "offscreen_up", "offscreen_down"],
+            "description": "180-degree screen direction for shot-reverse-shot continuity."
+          },
+          "focal_anchor": {
+            "type": "string",
+            "enum": ["center", "left_third", "right_third", "upper_center", "upper_left", "upper_right", "lower_center"],
+            "default": "center",
+            "description": "Zoompan focal lock in animate_shot_v2.py so rule-of-thirds subjects stay framed during zooms."
+          },
           "beats": {
             "type": "array",
             "minItems": 1,
@@ -332,11 +438,14 @@
               "pan_right",
               "static_drift",
               "slow_dolly_in",
-              "tilt_up"
+              "tilt_up",
+              "tilt_down"
             ],
             "default": "zoom_in"
           },
           "flash_in": { "type": "boolean", "default": false },
+          "fade_in": { "type": "boolean", "default": false },
+          "fade_out": { "type": "boolean", "default": false },
           "speaker": {
             "type": "string",
             "description": "Optional speaker key referencing top-level voice_cast for multi-voice episodes."
@@ -361,7 +470,11 @@
           },
           "dialogue_or_vo": {
             "type": "string",
-            "description": "Spoken narration or dialogue in clean display English and natural speech without AI slop or dropped grammar; drives captions (see references/spoken_english_guide.md)."
+            "description": "Spoken narration or dialogue in clean display English (leave empty '' for silent reaction beats); drives captions."
+          },
+          "subtext": {
+            "type": "string",
+            "description": "Optional writer-only dramatic intent note (not rendered)."
           },
           "tts_text": {
             "type": "string",
@@ -371,6 +484,18 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "Optional per-shot words or numbers to highlight in kinetic captions."
+          },
+          "bgm_cue": {
+            "type": "string",
+            "enum": ["continue", "drop_out", "drop_before_end", "swell_in"],
+            "default": "continue",
+            "description": "Optional spotted-silence music automation cue honored by make_bgm.py --timings."
+          },
+          "bgm_drop_sec": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 3.0,
+            "description": "Duration in seconds for bgm_cue='drop_before_end' silence window before shot end."
           },
           "sfx_type": {
             "type": "string",
@@ -401,6 +526,13 @@
           "sfx_cue": { "type": "string" },
           "sfx_offset_sec": { "type": "number", "default": 0.0 },
           "sfx_gain_db": { "type": "number", "default": -3.0 },
+          "sfx_pan": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "default": 0.5,
+            "description": "Stereo pan placement for SFX cue (0.0 = left, 0.5 = center, 1.0 = right)."
+          },
           "negative_constraints": { "type": "string" },
           "chain_from_prev_last_frame": { "type": "boolean", "default": false },
           "dual_anchor_loop": {

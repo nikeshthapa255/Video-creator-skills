@@ -29,8 +29,8 @@ from array import array
 import json
 import math
 import random
+import re
 import sys
-import warnings
 import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,15 +42,6 @@ try:
 except ImportError:
     np = None  # type: ignore
     HAS_NUMPY = False
-
-try:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        import audioop  # type: ignore
-    HAS_AUDIOOP = True
-except ImportError:
-    audioop = None  # type: ignore
-    HAS_AUDIOOP = False
 
 SR = 48000
 TWO_PI = 2.0 * math.pi
@@ -133,15 +124,57 @@ def midi_to_hz(note: float) -> float:
 # Timings & General Act-Window Parsing (scales smoothly to any Act count N >= 1)
 # =============================================================================
 
-def load_timings_duration_and_acts(
+BGM_INTENSITY_TO_STAGE: Dict[str, int] = {
+    "sparse": 1,
+    "tense": 2,
+    "escalating": 3,
+    "climax": 4,
+    "epilogue": 5,
+}
+
+
+def parse_act_value(raw: Any) -> Optional[int]:
+    """Parse flexible act/chapter labels ('Act 1', 'chapter_2', 'act-1', 'act_01', 1, '1') to int."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, float):
+        iv = int(raw)
+        return iv if iv >= 1 and iv == raw else None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        iv = int(s)
+        return iv if iv >= 1 else None
+    m = re.match(r"^(?:act|chapter|ch|part)[\s_-]*0*(\d+)$", s, flags=re.IGNORECASE)
+    if m:
+        iv = int(m.group(1))
+        return iv if iv >= 1 else None
+    m2 = re.search(r"0*(\d+)", s)
+    if m2:
+        iv = int(m2.group(1))
+        return iv if iv >= 1 else None
+    return None
+
+
+def load_timings_metadata(
     timings_path: Optional[str],
     duration: float,
-) -> Tuple[float, List[Tuple[int, float, float]]]:
-    """Read target duration and Act (act_num, start_sec, end_sec) windows from shot_timings.json."""
+) -> Dict[str, Any]:
+    """Read target duration, Act windows, bgm_intensity, ending_style, and bgm_cue drops from shot_timings.json."""
     if not timings_path:
         dur = max(1.0, float(duration))
         step = dur / 5.0
-        return dur, [(i + 1, i * step, (i + 1) * step) for i in range(5)]
+        acts = [(i + 1, i * step, (i + 1) * step) for i in range(5)]
+        return {
+            "duration": dur,
+            "acts": acts,
+            "act_intensities": [None] * len(acts),
+            "ending_style": "",
+            "bgm_cues": [],
+        }
 
     p = Path(timings_path)
     if not p.exists():
@@ -149,21 +182,45 @@ def load_timings_duration_and_acts(
     data = json.loads(p.read_text(encoding="utf-8"))
 
     inferred_dur = 0.0
+    ending_style = ""
+    shots_list: List[Dict[str, Any]] = []
     if isinstance(data, dict):
         inferred_dur = float(data.get("total_duration_sec", 0.0) or 0.0)
-        for sh in data.get("shots", []) or []:
-            if isinstance(sh, dict):
-                e = float(sh.get("end_sec", float(sh.get("start_sec", 0.0)) + float(sh.get("duration_sec", 0.0))))
-                inferred_dur = max(inferred_dur, e)
+        ending_style = str(data.get("ending_style") or "").strip().lower()
+        shots_list = [sh for sh in (data.get("shots", []) or []) if isinstance(sh, dict)]
+        for sh in shots_list:
+            e = float(sh.get("end_sec", float(sh.get("start_sec", 0.0)) + float(sh.get("duration_sec", 0.0))))
+            inferred_dur = max(inferred_dur, e)
     elif isinstance(data, list):
-        for sh in data:
-            if isinstance(sh, dict):
-                e = float(sh.get("end_sec", float(sh.get("start_sec", 0.0)) + float(sh.get("duration_sec", 0.0))))
-                inferred_dur = max(inferred_dur, e)
+        shots_list = [sh for sh in data if isinstance(sh, dict)]
+        for sh in shots_list:
+            e = float(sh.get("end_sec", float(sh.get("start_sec", 0.0)) + float(sh.get("duration_sec", 0.0))))
+            inferred_dur = max(inferred_dur, e)
 
     dur = float(duration) if duration and duration > 0 else max(1.0, inferred_dur)
 
-    parsed: List[Tuple[int, float, float]] = []
+    # Extract per-shot bgm_cue automation directives (spotted silence / drops / swells)
+    bgm_cues: List[Dict[str, Any]] = []
+    for sh in shots_list:
+        raw_cue = str(sh.get("bgm_cue") or "").strip().lower()
+        if not raw_cue or raw_cue == "none":
+            continue
+        s_t = max(0.0, float(sh.get("start_sec", sh.get("time_sec", 0.0))))
+        if s_t >= dur:
+            continue
+        e_t = float(sh.get("end_sec", s_t + float(sh.get("duration_sec", 0.0))))
+        e_t = min(dur, max(s_t + 0.05, e_t))
+        raw_drop = sh.get("bgm_drop_sec")
+        drop_sec = float(raw_drop) if raw_drop is not None else None
+        bgm_cues.append({
+            "cue": raw_cue,
+            "start_sec": s_t,
+            "end_sec": e_t,
+            "drop_sec": drop_sec,
+        })
+
+    # Parse Act windows + optional bgm_intensity
+    parsed: List[Tuple[int, float, float, Optional[str]]] = []
     if isinstance(data, dict) and data.get("acts"):
         acts_raw = data["acts"]
         if isinstance(acts_raw, list):
@@ -171,37 +228,31 @@ def load_timings_duration_and_acts(
                 if not isinstance(item, dict):
                     continue
                 raw_a = item.get("act", item.get("act_number", idx + 1))
-                try:
-                    a_num = int(str(raw_a).replace("act_", "").replace("act", ""))
-                except ValueError:
+                a_num = parse_act_value(raw_a)
+                if a_num is None:
                     a_num = idx + 1
                 s = float(item.get("start_sec", item.get("start", 0.0)))
                 e = float(item.get("end_sec", item.get("end", s + float(item.get("duration_sec", 0.0)))))
-                parsed.append((a_num, s, e))
+                inten = str(item.get("bgm_intensity") or "").strip().lower() or None
+                parsed.append((a_num, s, e, inten))
         elif isinstance(acts_raw, dict):
             for idx, (k, item) in enumerate(acts_raw.items()):
                 if not isinstance(item, dict):
                     continue
-                try:
-                    a_num = int(str(k).replace("act_", "").replace("act", ""))
-                except ValueError:
+                a_num = parse_act_value(k)
+                if a_num is None:
                     a_num = idx + 1
                 s = float(item.get("start_sec", item.get("start", 0.0)))
                 e = float(item.get("end_sec", item.get("end", 0.0)))
-                parsed.append((a_num, s, e))
+                inten = str(item.get("bgm_intensity") or "").strip().lower() or None
+                parsed.append((a_num, s, e, inten))
 
     if not parsed:
-        shots = data.get("shots", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
         act_bounds: Dict[int, List[float]] = {}
-        for sh in shots:
-            if not isinstance(sh, dict):
-                continue
+        for sh in shots_list:
             act_val = sh.get("act", sh.get("act_number", sh.get("act_id")))
-            if act_val is None:
-                continue
-            try:
-                a_num = int(str(act_val).replace("act_", "").replace("act", ""))
-            except ValueError:
+            a_num = parse_act_value(act_val)
+            if a_num is None:
                 continue
             s = float(sh.get("start_sec", sh.get("time_sec", 0.0)))
             e = float(sh.get("end_sec", s + float(sh.get("duration_sec", 0.0))))
@@ -211,21 +262,67 @@ def load_timings_duration_and_acts(
                 act_bounds[a_num][0] = min(act_bounds[a_num][0], s)
                 act_bounds[a_num][1] = max(act_bounds[a_num][1], e)
         for a_num in sorted(act_bounds):
-            parsed.append((a_num, act_bounds[a_num][0], act_bounds[a_num][1]))
+            parsed.append((a_num, act_bounds[a_num][0], act_bounds[a_num][1], None))
 
     if not parsed:
         step = dur / 5.0
-        return dur, [(i + 1, i * step, (i + 1) * step) for i in range(5)]
+        acts = [(i + 1, i * step, (i + 1) * step) for i in range(5)]
+        return {
+            "duration": dur,
+            "acts": acts,
+            "act_intensities": [None] * len(acts),
+            "ending_style": ending_style,
+            "bgm_cues": bgm_cues,
+        }
 
     parsed.sort(key=lambda x: (x[1], x[0]))
-    cleaned: List[Tuple[int, float, float]] = []
-    for idx, (a_num, s, e) in enumerate(parsed):
-        s_clamped = 0.0 if idx == 0 else max(cleaned[-1][2], min(dur, s))
-        e_clamped = dur if idx == len(parsed) - 1 else max(s_clamped + 0.5, min(dur, e))
-        cleaned.append((a_num, s_clamped, e_clamped))
-    if cleaned:
-        cleaned[-1] = (cleaned[-1][0], cleaned[-1][1], dur)
-    return dur, cleaned
+
+    # Filter & clamp cleanly to [0.0, dur] without inverted windows
+    filtered = [(a_num, max(0.0, s), min(dur, e), inten) for (a_num, s, e, inten) in parsed if s < dur - 1e-4]
+    if not filtered:
+        a_num, _, _, inten = parsed[0]
+        filtered = [(a_num, 0.0, dur, inten)]
+
+    cleaned_acts: List[Tuple[int, float, float]] = []
+    cleaned_intensities: List[Optional[str]] = []
+    for idx, (a_num, s, e, inten) in enumerate(filtered):
+        s_clamped = 0.0 if idx == 0 else max(cleaned_acts[-1][2], min(dur, s))
+        if s_clamped >= dur - 1e-4:
+            break
+        e_clamped = dur if idx == len(filtered) - 1 else min(dur, max(s_clamped, e))
+        if e_clamped <= s_clamped + 1e-4:
+            continue
+        cleaned_acts.append((a_num, s_clamped, e_clamped))
+        cleaned_intensities.append(inten)
+
+    if not cleaned_acts:
+        cleaned_acts = [(filtered[0][0], 0.0, dur)]
+        cleaned_intensities = [filtered[0][3]]
+    else:
+        # Ensure contiguous coverage [0.0 .. dur] (close inter-act post_gap_sec holes)
+        for idx in range(len(cleaned_acts) - 1):
+            a_num, s_c, _ = cleaned_acts[idx]
+            next_s = cleaned_acts[idx + 1][1]
+            cleaned_acts[idx] = (a_num, s_c, next_s)
+        last_a, last_s, _ = cleaned_acts[-1]
+        cleaned_acts[-1] = (last_a, last_s, dur)
+
+    return {
+        "duration": dur,
+        "acts": cleaned_acts,
+        "act_intensities": cleaned_intensities,
+        "ending_style": ending_style,
+        "bgm_cues": bgm_cues,
+    }
+
+
+def load_timings_duration_and_acts(
+    timings_path: Optional[str],
+    duration: float,
+) -> Tuple[float, List[Tuple[int, float, float]]]:
+    """Read target duration and Act (act_num, start_sec, end_sec) windows from shot_timings.json."""
+    meta = load_timings_metadata(timings_path, duration)
+    return meta["duration"], meta["acts"]
 
 
 def act_index_to_stage(act_idx: int, total_acts: int, t: float, duration: float) -> int:
@@ -236,6 +333,184 @@ def act_index_to_stage(act_idx: int, total_acts: int, t: float, duration: float)
     if total_acts == 5:
         return act_idx + 1
     return 1 + int(round(4.0 * (act_idx / max(1, total_acts - 1))))
+
+
+def resolve_act_stage(
+    act_idx: int,
+    total_acts: int,
+    t: float,
+    duration: float,
+    act_intensities: Optional[List[Optional[str]]] = None,
+) -> int:
+    """Resolve dramatic stage 1..5 honoring explicit acts[].bgm_intensity when present."""
+    if act_intensities and 0 <= act_idx < len(act_intensities):
+        inten = (act_intensities[act_idx] or "").strip().lower()
+        if inten in BGM_INTENSITY_TO_STAGE:
+            return BGM_INTENSITY_TO_STAGE[inten]
+    return act_index_to_stage(act_idx, total_acts, t, duration)
+
+
+def _compute_bgm_cue_events(
+    bgm_cues: Optional[List[Dict[str, Any]]],
+    duration: float,
+) -> List[Tuple[str, float, float, float]]:
+    """Normalize bgm_cues into (kind, start_sec, end_sec, ramp_sec) tuples."""
+    if not bgm_cues:
+        return []
+    out: List[Tuple[str, float, float, float]] = []
+    for item in bgm_cues:
+        cue = str(item.get("cue") or "").strip().lower()
+        s_t = max(0.0, float(item.get("start_sec", 0.0)))
+        e_t = min(duration, float(item.get("end_sec", duration)))
+        if e_t <= s_t + 0.01:
+            continue
+        raw_drop = item.get("drop_sec")
+        drop_s = float(raw_drop) if raw_drop is not None and float(raw_drop) > 0.0 else None
+        if cue == "drop_out":
+            hold_end = min(e_t, s_t + drop_s) if drop_s is not None else e_t
+            out.append(("drop", s_t, max(s_t + 0.08, hold_end), 0.08))
+        elif cue == "drop_before_end":
+            eff_drop = drop_s if drop_s is not None else min(1.5, (e_t - s_t) * 0.5)
+            d_start = max(s_t, e_t - eff_drop)
+            out.append(("drop", d_start, e_t, 0.08))
+        elif cue == "swell_in":
+            swell_dur = drop_s if drop_s is not None else min(0.6, max(0.12, (e_t - s_t) * 0.5))
+            out.append(("swell_in", s_t, min(duration, s_t + swell_dur), swell_dur))
+    return out
+
+
+def _apply_bgm_cues_pcm_inplace(
+    pcm_bytes: bytearray,
+    bgm_cues: Optional[List[Dict[str, Any]]],
+    duration: float,
+) -> None:
+    """Apply smooth cosine music-drop (-36 dB) / swell-in automation directly to stereo int16 PCM."""
+    events = _compute_bgm_cue_events(bgm_cues, duration)
+    if not events:
+        return
+    total_frames = len(pcm_bytes) // 4
+    floor_lin = 10.0 ** (-36.0 / 20.0)
+    duck_n = max(1, int(0.080 * SR))
+    swell_n = max(1, int(0.120 * SR))
+    cos = math.cos
+    pi = math.pi
+
+    for kind, s_t, e_t, _ in events:
+        if kind == "drop":
+            sf = max(0, int(round(s_t * SR)))
+            ef = min(total_frames, int(round(e_t * SR)))
+            if ef <= sf:
+                continue
+            rec_end = min(total_frames, ef + swell_n)
+            seg = array("h")
+            seg.frombytes(pcm_bytes[sf * 4 : rec_end * 4])
+            if sys.byteorder != "little":
+                seg.byteswap()
+            seg_len = rec_end - sf
+            hold_end = ef - sf
+            eff_duck = min(duck_n, hold_end)
+            for i in range(seg_len):
+                if i < eff_duck:
+                    u = i / max(1, eff_duck)
+                    g = 1.0 - (1.0 - floor_lin) * (0.5 - 0.5 * cos(pi * u))
+                elif i < hold_end:
+                    g = floor_lin
+                else:
+                    u = (i - hold_end) / max(1, seg_len - hold_end)
+                    g = floor_lin + (1.0 - floor_lin) * (0.5 - 0.5 * cos(pi * u))
+                seg[i * 2] = int(seg[i * 2] * g)
+                seg[i * 2 + 1] = int(seg[i * 2 + 1] * g)
+            if sys.byteorder != "little":
+                seg.byteswap()
+            pcm_bytes[sf * 4 : rec_end * 4] = seg.tobytes()
+        elif kind == "swell_in":
+            sf = max(0, int(round(s_t * SR)))
+            ef = min(total_frames, int(round(e_t * SR)))
+            if ef <= sf + 1:
+                continue
+            seg = array("h")
+            seg.frombytes(pcm_bytes[sf * 4 : ef * 4])
+            if sys.byteorder != "little":
+                seg.byteswap()
+            seg_len = ef - sf
+            for i in range(seg_len):
+                u = i / max(1, seg_len - 1)
+                g = floor_lin + (1.0 - floor_lin) * (0.5 - 0.5 * cos(pi * u))
+                seg[i * 2] = int(seg[i * 2] * g)
+                seg[i * 2 + 1] = int(seg[i * 2 + 1] * g)
+            if sys.byteorder != "little":
+                seg.byteswap()
+            pcm_bytes[sf * 4 : ef * 4] = seg.tobytes()
+
+
+def _apply_smooth_act_gains_pcm_inplace(
+    pcm_bytes: bytearray,
+    acts: List[Tuple[int, float, float]],
+    duration: float,
+    act_intensities: Optional[List[Optional[str]]] = None,
+    ramp_sec: float = 0.8,
+) -> None:
+    """Apply Act-level intensity gains with smooth 0.8s cosine ramps using pure Python array (no audioop)."""
+    if not acts or len(acts) < 2:
+        return
+    total_frames = len(pcm_bytes) // 4
+    stage_gains = {1: 0.86, 2: 0.93, 3: 1.00, 4: 1.00, 5: 0.84}
+    gains_per_act = [
+        stage_gains.get(resolve_act_stage(idx, len(acts), a_s, duration, act_intensities), 1.0)
+        for idx, (_, a_s, _) in enumerate(acts)
+    ]
+    if all(abs(g - 1.0) <= 0.005 for g in gains_per_act):
+        return
+
+    ramp_n = max(1, int(ramp_sec * SR))
+    half_ramp = ramp_n // 2
+    cos = math.cos
+    pi = math.pi
+
+    # Build piecewise constant + cosine transition regions
+    seg = array("h")
+    seg.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        seg.byteswap()
+
+    for idx, (_, a_s, a_e) in enumerate(acts):
+        g_cur = gains_per_act[idx]
+        sf = max(0, int(round(a_s * SR)))
+        ef = min(total_frames, int(round(a_e * SR)))
+        if ef <= sf:
+            continue
+        # Reserve ramp margins at boundaries where gain changes
+        left_margin = half_ramp if (idx > 0 and abs(gains_per_act[idx - 1] - g_cur) > 0.005) else 0
+        right_margin = half_ramp if (idx + 1 < len(acts) and abs(gains_per_act[idx + 1] - g_cur) > 0.005) else 0
+        body_s = min(ef, sf + left_margin)
+        body_e = max(body_s, ef - right_margin)
+        if abs(g_cur - 1.0) > 0.005:
+            for i in range(body_s, body_e):
+                seg[i * 2] = int(seg[i * 2] * g_cur)
+                seg[i * 2 + 1] = int(seg[i * 2 + 1] * g_cur)
+
+    # Apply smooth cosine ramps across boundaries between consecutive acts
+    for idx in range(len(acts) - 1):
+        g0 = gains_per_act[idx]
+        g1 = gains_per_act[idx + 1]
+        if abs(g1 - g0) <= 0.005:
+            continue
+        bf = int(round(acts[idx][2] * SR))
+        rs = max(0, bf - half_ramp)
+        re_f = min(total_frames, bf + half_ramp)
+        rlen = re_f - rs
+        if rlen <= 1:
+            continue
+        for k in range(rlen):
+            u = k / max(1, rlen - 1)
+            g = g0 + (g1 - g0) * (0.5 - 0.5 * cos(pi * u))
+            i = rs + k
+            seg[i * 2] = int(seg[i * 2] * g)
+            seg[i * 2 + 1] = int(seg[i * 2 + 1] * g)
+
+    if sys.byteorder != "little":
+        seg.byteswap()
+    pcm_bytes[:] = seg.tobytes()
 
 
 # =============================================================================
@@ -711,12 +986,16 @@ def _render_classic_long_tiled(
     bpm: int,
     out_path: Path,
     acts: Optional[List[Tuple[int, float, float]]] = None,
+    act_intensities: Optional[List[Optional[str]]] = None,
+    bgm_cues: Optional[List[Dict[str, Any]]] = None,
+    ending_style: str = "",
 ) -> None:
     """Fast seamless 4-bar cycle renderer for >90s durations of the 6 classic moods."""
     bar_sec = (60.0 / bpm) * 4.0
     cycle_sec = bar_sec * 4.0
-    # Render 5 bars and slice [1 bar .. 5 bars] so the loop seam naturally carries bar-4 decay tails
-    raw_dur = bar_sec * 5.0
+    seam_sec = 0.016
+    # Render 5 bars + seam overflow so [bar_n .. bar_n + cycle_n + seam_n] wraps cleanly with zero click
+    raw_dur = bar_sec * 5.0 + seam_sec + 0.04
     engine = MOOD_CONFIGS[mood].get("engine")
     if engine == "dramatic_news":
         l5, r5 = _synthesize_dramatic_news(raw_dur, bpm, apply_fades=False)
@@ -730,16 +1009,17 @@ def _render_classic_long_tiled(
 
     bar_n = int(round(bar_sec * SR))
     cycle_n = int(round(cycle_sec * SR))
+    seam_n = min(int(round(seam_sec * SR)), cycle_n // 8, max(0, len(l5) - (bar_n + cycle_n)))
     cyc_l = l5[bar_n : bar_n + cycle_n]
     cyc_r = r5[bar_n : bar_n + cycle_n]
+    over_l = l5[bar_n + cycle_n : bar_n + cycle_n + seam_n]
+    over_r = r5[bar_n + cycle_n : bar_n + cycle_n + seam_n]
 
-    # Tiny 12ms micro-crossfade at seam for click-free tiling
-    seam_n = min(int(0.012 * SR), len(cyc_l) // 8)
+    # Crossfade overflow [cycle_n .. cycle_n + seam_n] into head [0 .. seam_n] for C1-smooth tiling
     for i in range(seam_n):
-        w = i / max(1, seam_n)
-        tail_idx = len(cyc_l) - seam_n + i
-        cyc_l[i] = cyc_l[i] * w + cyc_l[tail_idx] * (1.0 - w)
-        cyc_r[i] = cyc_r[i] * w + cyc_r[tail_idx] * (1.0 - w)
+        w = 0.5 - 0.5 * math.cos(math.pi * i / max(1, seam_n))
+        cyc_l[i] = cyc_l[i] * w + over_l[i] * (1.0 - w)
+        cyc_r[i] = cyc_r[i] * w + over_r[i] * (1.0 - w)
 
     cycle_pcm = _pack_stereo_pcm_stdlib(cyc_l, cyc_r, drive=0.85)
     total_frames = int(math.ceil(duration * SR))
@@ -752,18 +1032,17 @@ def _render_classic_long_tiled(
         out_buf.extend(cycle_pcm[: take * 4])
         rem -= take
 
-    # Optional subtle Act-level intensity lift/taper when --timings is provided
-    if acts and len(acts) >= 2 and HAS_AUDIOOP:
-        stage_gains = {1: 0.86, 2: 0.93, 3: 1.00, 4: 1.00, 5: 0.84}
-        for idx, (_, a_s, a_e) in enumerate(acts):
-            stage = act_index_to_stage(idx, len(acts), a_s, duration)
-            g = stage_gains.get(stage, 1.0)
-            if abs(g - 1.0) > 0.01:
-                s_b = max(0, int(a_s * SR)) * 4
-                e_b = min(total_frames, int(a_e * SR)) * 4
-                if e_b > s_b:
-                    out_buf[s_b:e_b] = audioop.mul(bytes(out_buf[s_b:e_b]), 2, g)
+    # Smooth 0.8s cosine Act-level intensity ramps (pure Python array, Python 3.13 safe)
+    if acts and len(acts) >= 2:
+        _apply_smooth_act_gains_pcm_inplace(
+            out_buf, acts, duration, act_intensities=act_intensities, ramp_sec=0.8
+        )
 
+    if bgm_cues:
+        _apply_bgm_cues_pcm_inplace(out_buf, bgm_cues, duration)
+
+    if ending_style == "cliffhanger":
+        fo_s = 0.08
     _apply_pcm_fades_inplace(out_buf, int(fi_s * SR), int(fo_s * SR))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(out_path), "wb") as wf:
@@ -842,18 +1121,23 @@ if HAS_NUMPY:
         left[start_idx : start_idx + n] += buf_l[:n] * gain
         right[start_idx : start_idx + n] += buf_r[:n] * gain
 
-    def _np_apply_speech_eq(left: Any, right: Any) -> Tuple[Any, Any]:
-        """Batched 2D overlap-add FFT spectral discipline: carve 2.5-4 kHz speech pocket."""
+    def _np_apply_speech_eq(left: Any, right: Any, speech_carve: bool = True) -> Tuple[Any, Any]:
+        """Batched 2D COLA-unity overlap-add FFT filter (28 Hz highpass + optional 2.5-4 kHz speech carve)."""
         n = left.shape[0]
         fft_n = 16384
         hop = fft_n // 2
-        win = np.hanning(fft_n).astype(np.float32)
+        # Periodic sqrt(Hann) analysis/synthesis pair sums to exact 1.0000 at 50% overlap (zero tremolo)
+        win = np.sqrt(np.hanning(fft_n + 1)[:-1]).astype(np.float32)
         freqs = np.fft.rfftfreq(fft_n, d=1.0 / SR).astype(np.float32)
 
-        dip_db = -4.5 * np.exp(-0.5 * ((freqs - 3150.0) / 850.0) ** 2)
-        shelf_db = -3.5 / (1.0 + (6200.0 / np.maximum(freqs, 1.0)) ** 3.0)
-        hp_db = -18.0 / (1.0 + (freqs / 26.0) ** 4.0)
-        eq_curve = np.power(10.0, (dip_db + shelf_db + hp_db) / 20.0).astype(np.float32)
+        hp_db = -18.0 / (1.0 + (freqs / 28.0) ** 4.0)
+        if speech_carve:
+            dip_db = -4.5 * np.exp(-0.5 * ((freqs - 3150.0) / 850.0) ** 2)
+            shelf_db = -3.5 / (1.0 + (6200.0 / np.maximum(freqs, 1.0)) ** 3.0)
+            eq_db = dip_db + shelf_db + hp_db
+        else:
+            eq_db = hp_db
+        eq_curve = np.power(10.0, eq_db / 20.0).astype(np.float32)
 
         pad_tail = (hop - (n % hop)) % hop + hop
         total_padded = hop + n + pad_tail
@@ -867,9 +1151,54 @@ if HAS_NUMPY:
             odd = y_frames[1::2]
             out[: even.shape[0] * fft_n] += even.reshape(-1)
             out[hop : hop + odd.shape[0] * fft_n] += odd.reshape(-1)
-            return out[hop : hop + n] * np.float32(2.0)
+            return out[hop : hop + n]
 
         return _proc(left), _proc(right)
+
+    def _np_apply_bgm_cues(
+        left: Any,
+        right: Any,
+        bgm_cues: Optional[List[Dict[str, Any]]],
+        duration: float,
+    ) -> Tuple[Any, Any]:
+        """Apply smooth cosine music-drop (-36 dB, 80ms duck, 120ms swell) automation envelope."""
+        events = _compute_bgm_cue_events(bgm_cues, duration)
+        if not events:
+            return left, right
+        n = left.shape[0]
+        env = np.ones(n, dtype=np.float32)
+        floor_lin = np.float32(10.0 ** (-36.0 / 20.0))
+        duck_n = max(1, int(0.080 * SR))
+        swell_n = max(1, int(0.120 * SR))
+
+        for kind, s_t, e_t, _ in events:
+            if kind == "drop":
+                sf = max(0, int(round(s_t * SR)))
+                ef = min(n, int(round(e_t * SR)))
+                if ef <= sf:
+                    continue
+                eff_duck = min(duck_n, ef - sf)
+                if eff_duck > 1:
+                    u = np.linspace(0.0, 1.0, eff_duck, dtype=np.float32)
+                    ramp = np.float32(1.0) - (np.float32(1.0) - floor_lin) * (np.float32(0.5) - np.float32(0.5) * np.cos(np.float32(math.pi) * u))
+                    env[sf : sf + eff_duck] = np.minimum(env[sf : sf + eff_duck], ramp)
+                if sf + eff_duck < ef:
+                    env[sf + eff_duck : ef] = np.minimum(env[sf + eff_duck : ef], floor_lin)
+                rec_end = min(n, ef + swell_n)
+                if rec_end > ef:
+                    u = np.linspace(0.0, 1.0, rec_end - ef, dtype=np.float32)
+                    ramp_up = floor_lin + (np.float32(1.0) - floor_lin) * (np.float32(0.5) - np.float32(0.5) * np.cos(np.float32(math.pi) * u))
+                    env[ef:rec_end] = np.minimum(env[ef:rec_end], ramp_up)
+            elif kind == "swell_in":
+                sf = max(0, int(round(s_t * SR)))
+                ef = min(n, int(round(e_t * SR)))
+                if ef <= sf + 1:
+                    continue
+                u = np.linspace(0.0, 1.0, ef - sf, dtype=np.float32)
+                ramp_up = floor_lin + (np.float32(1.0) - floor_lin) * (np.float32(0.5) - np.float32(0.5) * np.cos(np.float32(math.pi) * u))
+                env[sf:ef] = np.minimum(env[sf:ef], ramp_up)
+
+        return left * env, right * env
 
     class _NpGuzhengBank:
         """Cached Karplus-Strong silk-string synthesizer for D Yu pitches."""
@@ -1075,7 +1404,16 @@ if HAS_NUMPY:
         g = env * bow * np.float32(gain * 0.48)
         _np_mix_stereo(left, right, sig_l * g, sig_r * g, int(start_sec * SR))
 
-    def _compose_palace_drama_numpy(duration: float, bpm: int, acts: List[Tuple[int, float, float]], seed: int = 42) -> Tuple[Any, Any]:
+    def _compose_palace_drama_numpy(
+        duration: float,
+        bpm: int,
+        acts: List[Tuple[int, float, float]],
+        seed: int = 42,
+        act_intensities: Optional[List[Optional[str]]] = None,
+        ending_style: str = "",
+        bgm_cues: Optional[List[Dict[str, Any]]] = None,
+        speech_eq: bool = False,
+    ) -> Tuple[Any, Any]:
         rng = np.random.default_rng(seed)
         beat_sec = 60.0 / bpm
         bar_sec = beat_sec * 4.0
@@ -1083,6 +1421,7 @@ if HAS_NUMPY:
         left = np.zeros(n_samples, dtype=np.float64)
         right = np.zeros(n_samples, dtype=np.float64)
         guzheng = _NpGuzhengBank(rng, max_note_sec=2.6)
+        is_cliffhanger = (ending_style or "").strip().lower() == "cliffhanger"
 
         bell_cache: Dict[Tuple[int, float], Tuple[Any, Any]] = {}
         dagu_cache: Dict[bool, Any] = {}
@@ -1148,13 +1487,18 @@ if HAS_NUMPY:
         def _stage_at(t_val: float) -> Tuple[int, float, float]:
             for idx, (_, a_s, a_e) in enumerate(acts):
                 if t_val < a_e or idx == len(acts) - 1:
-                    return act_index_to_stage(idx, len(acts), t_val, duration), a_s, a_e
-            return 5, acts[-1][1], acts[-1][2]
+                    st = resolve_act_stage(idx, len(acts), t_val, duration, act_intensities)
+                    if is_cliffhanger and idx == len(acts) - 1 and st == 5:
+                        explicit_inten = (act_intensities[idx] or "").strip().lower() if (act_intensities and idx < len(act_intensities)) else ""
+                        if explicit_inten != "epilogue":
+                            st = 4
+                    return st, a_s, a_e
+            return (4 if is_cliffhanger else 5), acts[-1][1], acts[-1][2]
 
         final_s, final_e = acts[-1][1], acts[-1][2]
         final_dur = max(1.0, final_e - final_s)
         epilogue_len = min(25.0, final_dur * 0.55) if duration >= 20.0 else duration * 0.25
-        epilogue_start = max(final_s + min(2.0, final_dur * 0.2), final_e - epilogue_len)
+        epilogue_start = (duration + 10.0) if is_cliffhanger else max(final_s + min(2.0, final_dur * 0.2), final_e - epilogue_len)
 
         # Act transition glissandi & final act imperial gong
         for idx in range(1, len(acts)):
@@ -1163,7 +1507,8 @@ if HAS_NUMPY:
             guzheng.trigger_glissando(left, right, max(0.0, t_bound - 0.7), sweep_dur=0.72, ascending=asc, low_midi=48, high_midi=84, gain=0.20)
         if len(acts) >= 2:
             _add_gong(final_s, gain=0.35)
-        guzheng.trigger_glissando(left, right, epilogue_start, sweep_dur=1.0, ascending=True, low_midi=50, high_midi=81, gain=0.17)
+        if not is_cliffhanger:
+            guzheng.trigger_glissando(left, right, epilogue_start, sweep_dur=1.0, ascending=True, low_midi=50, high_midi=81, gain=0.17)
 
         total_bars = int(math.ceil(duration / bar_sec))
         for bar_idx in range(total_bars):
@@ -1171,7 +1516,7 @@ if HAS_NUMPY:
             if bar_t >= duration:
                 break
             stage, _, _ = _stage_at(bar_t)
-            in_epilogue = bar_t >= epilogue_start - 0.15
+            in_epilogue = (not is_cliffhanger) and (bar_t >= epilogue_start - 0.15)
             bass_midi, fifth_midi, arp_pool = PALACE_PROGRESSION[bar_idx % len(PALACE_PROGRESSION)]
             rem_bar = min(bar_sec, duration - bar_t)
 
@@ -1237,19 +1582,21 @@ if HAS_NUMPY:
                             fade_tail = min(1.0, max(0.25, (duration - nt) / 8.0))
                             guzheng.trigger(left, right, arp_pool[pi % len(arp_pool)], nt, dur_sec=2.4, gain=g * fade_tail)
 
-        # Expressive Erhu phrases mapped to Act stages
+        # Expressive Erhu phrases mapped to Act stages (Stage 3 transposed +12st to D4..D5 natural erhu tessitura)
         def b2s(beats: float) -> float:
             return beats * beat_sec
 
         stage_motifs = {
             1: ([(b2s(2.0), b2s(3.5), 69, -2.0, 0.85), (b2s(5.5), b2s(2.5), 67, 0.0, 0.78), (b2s(8.0), b2s(3.0), 65, 2.0, 0.82), (b2s(11.0), b2s(1.0), 64, 0.0, 0.68), (b2s(12.0), b2s(4.0), 62, 0.0, 0.90)], 17.0, 0.19, 0.54, 0.17),
             2: ([(b2s(0.0), b2s(3.5), 74, -2.0, 0.92), (b2s(3.5), b2s(1.5), 72, 0.0, 0.82), (b2s(5.0), b2s(3.0), 69, 0.0, 0.95), (b2s(8.0), b2s(2.5), 67, 0.0, 0.86), (b2s(10.5), b2s(1.5), 65, 0.0, 0.80), (b2s(12.0), b2s(4.0), 62, 0.0, 0.92)], 18.0, 0.25, 0.52, 0.21),
-            3: ([(b2s(0.0), b2s(2.0), 50, -3.0, 0.95), (b2s(2.0), b2s(2.0), 57, 0.0, 0.92), (b2s(4.0), b2s(3.0), 55, 0.0, 0.88), (b2s(8.0), b2s(3.5), 57, -2.0, 0.96), (b2s(13.0), b2s(2.5), 60, -3.0, 0.92), (b2s(15.5), b2s(3.5), 62, 0.0, 0.98)], 20.0, 0.26, 0.47, 0.20),
+            3: ([(b2s(0.0), b2s(2.0), 62, -3.0, 0.95), (b2s(2.0), b2s(2.0), 69, 0.0, 0.92), (b2s(4.0), b2s(3.0), 67, 0.0, 0.88), (b2s(8.0), b2s(3.5), 69, -2.0, 0.96), (b2s(13.0), b2s(2.5), 72, -3.0, 0.92), (b2s(15.5), b2s(3.5), 74, 0.0, 0.98)], 20.0, 0.26, 0.47, 0.20),
             4: ([(b2s(0.0), b2s(3.0), 74, -5.0, 0.96), (b2s(3.0), b2s(2.0), 77, 0.0, 0.95), (b2s(5.0), b2s(3.0), 79, 0.0, 1.00), (b2s(8.0), b2s(4.0), 81, -2.0, 1.05), (b2s(12.0), b2s(2.0), 84, -3.0, 1.00), (b2s(14.0), b2s(3.0), 79, 0.0, 0.94), (b2s(17.0), b2s(4.0), 74, 0.0, 0.96)], 22.0, 0.27, 0.52, 0.23),
             5: ([(b2s(1.0), b2s(3.5), 69, -2.0, 0.82), (b2s(4.5), b2s(2.5), 72, 0.0, 0.80), (b2s(7.0), b2s(4.0), 74, 0.0, 0.88), (b2s(11.0), b2s(3.0), 69, 0.0, 0.76), (b2s(14.0), b2s(6.0), 62, 0.0, 0.74)], 21.0, 0.19, 0.53, 0.16),
         }
         for idx, (_, a_s, a_e) in enumerate(acts):
-            stage = act_index_to_stage(idx, len(acts), a_s, duration)
+            stage = resolve_act_stage(idx, len(acts), a_s, duration, act_intensities)
+            if is_cliffhanger and idx == len(acts) - 1 and stage == 5:
+                stage = 4
             motif, beats_len, g, pan, vib = stage_motifs[stage]
             t_cur = a_s + min(2.0, max(0.3, (a_e - a_s) * 0.1))
             while t_cur + 5.0 < a_e:
@@ -1260,14 +1607,20 @@ if HAS_NUMPY:
                     _np_render_erhu_phrase(left, right, t_cur, span, oct_m, rng, gain=0.15, pan=0.44, vibrato_depth=0.14)
                 t_cur += b2s(beats_len + 4.0)
 
-        # Final luminous moonlight D-A-D chord
-        end_chord_t = max(0.0, duration - min(4.8, duration * 0.18))
-        for idx_c, m_c in enumerate((50, 57, 62, 69, 74)):
-            guzheng.trigger(left, right, m_c, end_chord_t + idx_c * 0.14, dur_sec=2.6, gain=0.15)
+        if is_cliffhanger:
+            # Abrupt dramatic cliffhanger sting on the final beat (no moonlight resolve)
+            sting_t = max(0.0, duration - min(0.85, duration * 0.12))
+            _add_dagu(sting_t, 0.42, soft=False)
+            _add_gong(sting_t, gain=0.34)
+        else:
+            # Final luminous moonlight D-A-D chord
+            end_chord_t = max(0.0, duration - min(4.8, duration * 0.18))
+            for idx_c, m_c in enumerate((50, 57, 62, 69, 74)):
+                guzheng.trigger(left, right, m_c, end_chord_t + idx_c * 0.14, dur_sec=2.6, gain=0.15)
 
-        left, right = _np_apply_speech_eq(left, right)
+        left, right = _np_apply_speech_eq(left, right, speech_carve=speech_eq)
         fade_in_n = min(n_samples // 3, int(1.2 * SR))
-        fade_out_n = min(n_samples // 2, int(2.5 * SR))
+        fade_out_n = min(n_samples // 2, int((0.08 if is_cliffhanger else 2.5) * SR))
         if fade_in_n > 1:
             fi = (0.5 - 0.5 * np.cos(math.pi * np.arange(fade_in_n, dtype=np.float32) / np.float32(fade_in_n))).astype(np.float32)
             left[:fade_in_n] *= fi
@@ -1285,9 +1638,21 @@ if HAS_NUMPY:
             scale = np.float32(target_peak / peak)
             left *= scale
             right *= scale
+
+        if bgm_cues:
+            left, right = _np_apply_bgm_cues(left, right, bgm_cues, duration)
         return left, right
 
-    def _compose_epic_story_numpy(duration: float, bpm: int, acts: List[Tuple[int, float, float]], seed: int = 42) -> Tuple[Any, Any]:
+    def _compose_epic_story_numpy(
+        duration: float,
+        bpm: int,
+        acts: List[Tuple[int, float, float]],
+        seed: int = 42,
+        act_intensities: Optional[List[Optional[str]]] = None,
+        ending_style: str = "",
+        bgm_cues: Optional[List[Dict[str, Any]]] = None,
+        speech_eq: bool = False,
+    ) -> Tuple[Any, Any]:
         """Vectorized cinematic Act-aware narrative score for documentaries, explainers & dramatic stories."""
         rng = np.random.default_rng(seed)
         beat_sec = 60.0 / bpm
@@ -1295,17 +1660,23 @@ if HAS_NUMPY:
         n_samples = int(math.ceil(duration * SR))
         left = np.zeros(n_samples, dtype=np.float64)
         right = np.zeros(n_samples, dtype=np.float64)
+        is_cliffhanger = (ending_style or "").strip().lower() == "cliffhanger"
 
         def _stage_at(t_val: float) -> int:
             for idx, (_, a_s, a_e) in enumerate(acts):
                 if t_val < a_e or idx == len(acts) - 1:
-                    return act_index_to_stage(idx, len(acts), t_val, duration)
-            return 5
+                    st = resolve_act_stage(idx, len(acts), t_val, duration, act_intensities)
+                    if is_cliffhanger and idx == len(acts) - 1 and st == 5:
+                        explicit_inten = (act_intensities[idx] or "").strip().lower() if (act_intensities and idx < len(act_intensities)) else ""
+                        if explicit_inten != "epilogue":
+                            st = 4
+                    return st
+            return 4 if is_cliffhanger else 5
 
         final_s, final_e = acts[-1][1], acts[-1][2]
         final_dur = max(1.0, final_e - final_s)
         epilogue_len = min(20.0, final_dur * 0.5) if duration >= 20.0 else duration * 0.25
-        epilogue_start = max(final_s + min(1.5, final_dur * 0.2), final_e - epilogue_len)
+        epilogue_start = (duration + 10.0) if is_cliffhanger else max(final_s + min(1.5, final_dur * 0.2), final_e - epilogue_len)
 
         # Cached warm muted pluck + cinematic tom/kick
         pluck_cache: Dict[int, Any] = {}
@@ -1351,7 +1722,7 @@ if HAS_NUMPY:
             if bar_t >= duration:
                 break
             stage = _stage_at(bar_t)
-            in_epilogue = bar_t >= epilogue_start - 0.15
+            in_epilogue = (not is_cliffhanger) and (bar_t >= epilogue_start - 0.15)
             bass_midi, chord = EPIC_PROGRESSION[bar_idx % len(EPIC_PROGRESSION)]
             rem_bar = min(bar_sec, duration - bar_t)
 
@@ -1407,9 +1778,15 @@ if HAS_NUMPY:
                     _add_perc("kick", bar_t + beat_sec * 2.5, 0.24)
                     _add_perc("tom", bar_t + beat_sec * 3.0, 0.22, 0.55)
 
-        left, right = _np_apply_speech_eq(left, right)
+        if is_cliffhanger:
+            sting_t = max(0.0, duration - min(0.70, duration * 0.12))
+            _add_perc("kick", sting_t, 0.45)
+            _add_perc("tom", sting_t, 0.32, 0.42)
+            _add_perc("tom", sting_t + 0.04, 0.30, 0.58)
+
+        left, right = _np_apply_speech_eq(left, right, speech_carve=speech_eq)
         fade_in_n = min(n_samples // 3, int(1.0 * SR))
-        fade_out_n = min(n_samples // 2, int(2.2 * SR))
+        fade_out_n = min(n_samples // 2, int((0.08 if is_cliffhanger else 2.2) * SR))
         if fade_in_n > 1:
             fi = (0.5 - 0.5 * np.cos(math.pi * np.arange(fade_in_n, dtype=np.float32) / np.float32(fade_in_n))).astype(np.float32)
             left[:fade_in_n] *= fi
@@ -1427,6 +1804,9 @@ if HAS_NUMPY:
             scale = np.float32(target_peak / peak)
             left *= scale
             right *= scale
+
+        if bgm_cues:
+            left, right = _np_apply_bgm_cues(left, right, bgm_cues, duration)
         return left, right
 
 
@@ -1448,9 +1828,11 @@ def _stdlib_synth_stage_loop(
     n_bars = 4
     dur_h = bar_sec * n_bars
     n = int(round(dur_h * sr_h))
+    seam_n = min(int(0.020 * sr_h), n // 8)
+    n_gen = n + seam_n
     n_out = int(round(dur_h * SR))
-    l = [0.0] * n
-    r = [0.0] * n
+    l = [0.0] * n_gen
+    r = [0.0] * n_gen
     rng = random.Random(seed + stage * 31 + (100 if in_epilogue else 0))
     sin = math.sin
     cos = math.cos
@@ -1459,7 +1841,7 @@ def _stdlib_synth_stage_loop(
 
     def _add_pluck_note(midi: int, t_start: float, note_dur: float, gain: float, pan: float, bright: float = 0.35) -> None:
         s_i = int(t_start * sr_h)
-        m_len = min(int(note_dur * sr_h), n - s_i)
+        m_len = min(int(note_dur * sr_h), n_gen - s_i)
         if m_len < 16 or s_i < 0:
             return
         freq = midi_to_hz(midi)
@@ -1488,7 +1870,7 @@ def _stdlib_synth_stage_loop(
 
     def _add_drone_bar(bar_t: float, bar_dur: float, bass_midi: int, fifth_midi: int, gain: float) -> None:
         s_i = int(bar_t * sr_h)
-        m_len = min(int(bar_dur * sr_h), n - s_i)
+        m_len = min(int(bar_dur * sr_h), n_gen - s_i)
         if m_len < 32:
             return
         f0 = midi_to_hz(bass_midi)
@@ -1523,7 +1905,7 @@ def _stdlib_synth_stage_loop(
     def _add_drum(t_s: float, gain: float, soft: bool = False) -> None:
         s_i = int(t_s * sr_h)
         d_dur = 0.35 if soft else 0.65
-        m_len = min(int(d_dur * sr_h), n - s_i)
+        m_len = min(int(d_dur * sr_h), n_gen - s_i)
         if m_len < 16 or s_i < 0:
             return
         ph = 0.0
@@ -1546,7 +1928,7 @@ def _stdlib_synth_stage_loop(
         gr = sin(pan * math.pi * 0.5) * gain
         for rel_b, dur_b, midi in notes_seq:
             s_i = int(rel_b * beat_sec * sr_h)
-            m_len = min(int(dur_b * beat_sec * sr_h), n - s_i)
+            m_len = min(int(dur_b * beat_sec * sr_h), n_gen - s_i)
             if m_len < 32 or s_i < 0:
                 continue
             freq = midi_to_hz(midi)
@@ -1562,12 +1944,14 @@ def _stdlib_synth_stage_loop(
                 l[s_i + j] += v * gl
                 r[s_i + j] += v * gr
 
+    seam_sec = seam_n * inv_sr
     if mood == "palace_drama":
         for b in range(n_bars):
             bt = b * bar_sec
+            extra = seam_sec if b == n_bars - 1 else 0.0
             bass_m, fifth_m, arp_pool = PALACE_PROGRESSION[b % len(PALACE_PROGRESSION)]
             dg = 0.12 if in_epilogue else (0.14, 0.18, 0.22, 0.26, 0.21)[stage - 1]
-            _add_drone_bar(bt, bar_sec, bass_m, fifth_m, dg)
+            _add_drone_bar(bt, bar_sec + extra, bass_m, fifth_m, dg)
 
             if in_epilogue:
                 for bo, pi, g in ((0.0, 0, 0.19), (1.0, 2, 0.16), (1.5, 4, 0.18), (2.5, 5, 0.17)):
@@ -1599,11 +1983,11 @@ def _stdlib_synth_stage_loop(
                 _add_drum(bt, 0.32, soft=False)
                 _add_drum(bt + beat_sec * 2.0, 0.26, soft=False)
 
-        # Singing Erhu motif across the 4-bar phrase
+        # Singing Erhu motif across the 4-bar phrase (Stage 3 transposed +12st to D4..D5)
         erhu_lines = {
             1: [(2.0, 3.5, 69), (5.5, 2.5, 67), (8.0, 3.0, 65), (11.5, 4.0, 62)],
             2: [(0.0, 3.5, 74), (3.5, 2.0, 72), (5.5, 3.0, 69), (9.0, 3.0, 67), (12.0, 3.8, 62)],
-            3: [(0.0, 2.5, 50), (2.5, 2.5, 57), (5.0, 3.0, 55), (8.5, 3.5, 57), (12.0, 3.8, 62)],
+            3: [(0.0, 2.5, 62), (2.5, 2.5, 69), (5.0, 3.0, 67), (8.5, 3.5, 69), (12.0, 3.8, 74)],
             4: [(0.0, 3.0, 74), (3.0, 2.5, 77), (5.5, 3.0, 79), (8.5, 3.5, 81), (12.0, 3.8, 74)],
             5: [(1.0, 3.5, 69), (4.5, 2.5, 72), (7.5, 4.0, 74), (11.5, 4.0, 62)],
         }
@@ -1613,12 +1997,13 @@ def _stdlib_synth_stage_loop(
         # epic_story pure-stdlib Act-stage texture
         for b in range(n_bars):
             bt = b * bar_sec
+            extra = seam_sec if b == n_bars - 1 else 0.0
             bass_m, chord = EPIC_PROGRESSION[b % len(EPIC_PROGRESSION)]
             dg = 0.13 if in_epilogue else (0.16, 0.20, 0.24, 0.28, 0.20)[stage - 1]
-            _add_drone_bar(bt, bar_sec, bass_m, bass_m + 7, dg)
+            _add_drone_bar(bt, bar_sec + extra, bass_m, bass_m + 7, dg)
             # Warm melodic pad chord tones
             for v_idx, cm in enumerate(chord[:3]):
-                _add_drone_bar(bt, bar_sec, cm, cm + 7, 0.08 if in_epilogue else 0.10)
+                _add_drone_bar(bt, bar_sec + extra, cm, cm + 7, 0.08 if in_epilogue else 0.10)
             if in_epilogue:
                 for bo, ci in ((0.0, 0), (1.5, 2), (2.5, 4)):
                     _add_pluck_note(chord[ci % len(chord)], bt + bo * beat_sec, 1.3, 0.13, 0.42 + 0.14 * (ci % 2), bright=0.22)
@@ -1638,13 +2023,13 @@ def _stdlib_synth_stage_loop(
             lead = [(0.0, 3.5, 69), (4.0, 3.5, 72), (8.0, 3.5, 74), (12.0, 3.8, 76 if stage == 4 else 69)]
             _add_bowed_line(lead, 0.16 if stage == 3 else 0.20, 0.50)
 
-    # Smooth loop-seam blend on first/last 20ms
-    seam_n = min(int(0.020 * sr_h), n // 8)
+    # Proper loop-seam wrap: crossfade overflow [n .. n + seam_n] into head [0 .. seam_n], then trim to n
     for i in range(seam_n):
-        w = i / max(1, seam_n)
-        ti = n - seam_n + i
-        l[i] = l[i] * w + l[ti] * (1.0 - w)
-        r[i] = r[i] * w + r[ti] * (1.0 - w)
+        w = 0.5 - 0.5 * cos(math.pi * i / max(1, seam_n))
+        l[i] = l[i] * w + l[n + i] * (1.0 - w)
+        r[i] = r[i] * w + r[n + i] * (1.0 - w)
+    l = l[:n]
+    r = r[:n]
 
     # Normalize gently to ~-3.5 dBFS peak
     peak = max(max(abs(x) for x in l), max(abs(x) for x in r), 1e-6)
@@ -1664,28 +2049,44 @@ def _render_longform_stdlib(
     acts: List[Tuple[int, float, float]],
     out_path: Path,
     seed: int = 42,
+    act_intensities: Optional[List[Optional[str]]] = None,
+    ending_style: str = "",
+    bgm_cues: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Fast Act-aware pure-stdlib composer for palace_drama and epic_story."""
+    is_cliffhanger = (ending_style or "").strip().lower() == "cliffhanger"
     final_s, final_e = acts[-1][1], acts[-1][2]
     final_dur = max(1.0, final_e - final_s)
     epilogue_len = min(25.0, final_dur * 0.55) if duration >= 20.0 else duration * 0.25
-    epilogue_start = max(final_s + min(2.0, final_dur * 0.2), final_e - epilogue_len)
+    epilogue_start = (duration + 10.0) if is_cliffhanger else max(final_s + min(2.0, final_dur * 0.2), final_e - epilogue_len)
 
-    # Build chronological segments (stage, in_epilogue, start_frame, end_frame)
+    # Build strictly contiguous chronological segments spanning exact [0 .. total_frames]
     total_frames = int(math.ceil(duration * SR))
-    segments: List[Tuple[int, bool, int, int]] = []
+    raw_segments: List[Tuple[int, bool, int, int]] = []
     for idx, (_, a_s, a_e) in enumerate(acts):
-        stage = act_index_to_stage(idx, len(acts), a_s, duration)
-        sf = max(0, int(round(a_s * SR)))
-        ef = min(total_frames, int(round(a_e * SR)))
+        stage = resolve_act_stage(idx, len(acts), a_s, duration, act_intensities)
+        if is_cliffhanger and idx == len(acts) - 1 and stage == 5:
+            explicit_inten = (act_intensities[idx] or "").strip().lower() if (act_intensities and idx < len(act_intensities)) else ""
+            if explicit_inten != "epilogue":
+                stage = 4
+        sf = 0 if not raw_segments else raw_segments[-1][3]
+        ef = total_frames if idx == len(acts) - 1 else min(total_frames, max(sf, int(round(a_e * SR))))
         if ef <= sf:
             continue
-        if idx == len(acts) - 1 and epilogue_start > a_s + 0.5 and epilogue_start < a_e - 0.5:
-            epi_f = int(round(epilogue_start * SR))
-            segments.append((stage, False, sf, epi_f))
-            segments.append((stage, True, epi_f, ef))
+        if (not is_cliffhanger) and idx == len(acts) - 1 and epilogue_start > a_s + 0.5 and epilogue_start < a_e - 0.5:
+            epi_f = max(sf + 1, min(ef - 1, int(round(epilogue_start * SR))))
+            raw_segments.append((stage, False, sf, epi_f))
+            raw_segments.append((stage, True, epi_f, ef))
         else:
-            segments.append((stage, idx == len(acts) - 1 and duration < 20.0, sf, ef))
+            raw_segments.append((stage, (not is_cliffhanger) and idx == len(acts) - 1 and duration < 20.0, sf, ef))
+
+    if not raw_segments:
+        raw_segments = [(1, False, 0, total_frames)]
+    elif raw_segments[-1][3] < total_frames:
+        st, epi, sf, _ = raw_segments[-1]
+        raw_segments[-1] = (st, epi, sf, total_frames)
+
+    segments = raw_segments
 
     # Synthesize each needed (stage, in_epilogue) 4-bar texture ONCE
     loop_cache: Dict[Tuple[int, bool], bytes] = {}
@@ -1704,26 +2105,37 @@ def _render_longform_stdlib(
             rem -= take
         return buf
 
+    # Tile seg_frames + actual_xf on subsequent segments so crossfades NEVER shrink total length
     out_buf = bytearray()
     xfade_frames = int(0.35 * SR)
     for seg_idx, (stage, in_epi, sf, ef) in enumerate(segments):
         seg_frames = ef - sf
-        seg_pcm = _tile_segment(loop_cache[(stage, in_epi)], seg_frames)
-        if seg_idx > 0 and len(out_buf) >= xfade_frames * 4 and len(seg_pcm) >= xfade_frames * 4:
-            xf = _crossfade_pcm_seam(bytes(out_buf[-xfade_frames * 4 :]), bytes(seg_pcm[: xfade_frames * 4]), xfade_frames)
-            out_buf[-xfade_frames * 4 :] = xf
-            out_buf.extend(seg_pcm[xfade_frames * 4 :])
+        if seg_idx > 0 and len(out_buf) >= 8:
+            actual_xf = min(xfade_frames, len(out_buf) // 4, seg_frames)
+            if actual_xf > 1:
+                seg_pcm = _tile_segment(loop_cache[(stage, in_epi)], seg_frames + actual_xf)
+                xf = _crossfade_pcm_seam(bytes(out_buf[-actual_xf * 4 :]), bytes(seg_pcm[: actual_xf * 4]), actual_xf)
+                out_buf[-actual_xf * 4 :] = xf
+                out_buf.extend(seg_pcm[actual_xf * 4 :])
+            else:
+                out_buf.extend(_tile_segment(loop_cache[(stage, in_epi)], seg_frames))
         else:
-            out_buf.extend(seg_pcm)
+            out_buf.extend(_tile_segment(loop_cache[(stage, in_epi)], seg_frames))
 
-    # Pad or trim to exact total_frames
+    # Exact target length check (no trailing silence gap!)
     target_bytes = total_frames * 4
-    if len(out_buf) < target_bytes:
-        out_buf.extend(bytes(target_bytes - len(out_buf)))
-    elif len(out_buf) > target_bytes:
+    if len(out_buf) > target_bytes:
         del out_buf[target_bytes:]
+    elif len(out_buf) < target_bytes:
+        # Repeat tail cycle frames if ever short by rounding (never pad dead silence)
+        last_loop = loop_cache[(segments[-1][0], segments[-1][1])]
+        out_buf.extend(_tile_segment(last_loop, (target_bytes - len(out_buf)) // 4))
 
-    _apply_pcm_fades_inplace(out_buf, min(total_frames // 3, int(1.2 * SR)), min(total_frames // 2, int(2.4 * SR)))
+    if bgm_cues:
+        _apply_bgm_cues_pcm_inplace(out_buf, bgm_cues, duration)
+
+    fo_frames = min(total_frames // 2, int((0.08 if is_cliffhanger else 2.4) * SR))
+    _apply_pcm_fades_inplace(out_buf, min(total_frames // 3, int(1.2 * SR)), fo_frames)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(out_path), "wb") as wf:
         wf.setnchannels(2)
@@ -1759,6 +2171,12 @@ def main() -> int:
     )
     parser.add_argument("--bpm", type=int, default=0, help="Override mood default BPM.")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed (default: 42).")
+    parser.add_argument(
+        "--speech-eq",
+        action="store_true",
+        default=False,
+        help="Opt-in 2.5-4 kHz speech-pocket carve in make_bgm.py (default: OFF; assemble_short.sh handles speech EQ).",
+    )
     parser.add_argument("--out", required=True, help="Output WAV path.")
     args = parser.parse_args()
 
@@ -1767,16 +2185,40 @@ def main() -> int:
     if args.duration < 0:
         parser.error("--duration must be >= 0")
 
-    duration, acts = load_timings_duration_and_acts(args.timings, args.duration)
+    meta = load_timings_metadata(args.timings, args.duration)
+    duration = meta["duration"]
+    acts = meta["acts"]
+    act_intensities = meta["act_intensities"]
+    ending_style = meta["ending_style"]
+    bgm_cues = meta["bgm_cues"]
     bpm = args.bpm if args.bpm > 0 else int(MOOD_CONFIGS[args.mood]["bpm"])
     out_path = Path(args.out)
 
     if args.mood == "palace_drama":
         if HAS_NUMPY:
-            left, right = _compose_palace_drama_numpy(duration, bpm, acts, seed=args.seed)
+            left, right = _compose_palace_drama_numpy(
+                duration,
+                bpm,
+                acts,
+                seed=args.seed,
+                act_intensities=act_intensities,
+                ending_style=ending_style,
+                bgm_cues=bgm_cues,
+                speech_eq=args.speech_eq,
+            )
             write_stereo_wav_arrays(left, right, out_path, already_limited=True)
         else:
-            _render_longform_stdlib("palace_drama", duration, bpm, acts, out_path, seed=args.seed)
+            _render_longform_stdlib(
+                "palace_drama",
+                duration,
+                bpm,
+                acts,
+                out_path,
+                seed=args.seed,
+                act_intensities=act_intensities,
+                ending_style=ending_style,
+                bgm_cues=bgm_cues,
+            )
         act_summary = ", ".join(f"Act{a}:{s:.1f}-{e:.1f}s" for a, s, e in acts)
         engine = "numpy" if HAS_NUMPY else "stdlib"
         print(f"Generated palace_drama BGM ({bpm} BPM D Yu, {duration:.2f}s, {engine}, {act_summary}) -> {out_path}")
@@ -1784,10 +2226,29 @@ def main() -> int:
 
     if args.mood == "epic_story":
         if HAS_NUMPY:
-            left, right = _compose_epic_story_numpy(duration, bpm, acts, seed=args.seed)
+            left, right = _compose_epic_story_numpy(
+                duration,
+                bpm,
+                acts,
+                seed=args.seed,
+                act_intensities=act_intensities,
+                ending_style=ending_style,
+                bgm_cues=bgm_cues,
+                speech_eq=args.speech_eq,
+            )
             write_stereo_wav_arrays(left, right, out_path, already_limited=True)
         else:
-            _render_longform_stdlib("epic_story", duration, bpm, acts, out_path, seed=args.seed)
+            _render_longform_stdlib(
+                "epic_story",
+                duration,
+                bpm,
+                acts,
+                out_path,
+                seed=args.seed,
+                act_intensities=act_intensities,
+                ending_style=ending_style,
+                bgm_cues=bgm_cues,
+            )
         act_summary = ", ".join(f"Act{a}:{s:.1f}-{e:.1f}s" for a, s, e in acts)
         engine = "numpy" if HAS_NUMPY else "stdlib"
         print(f"Generated epic_story BGM ({bpm} BPM, {duration:.2f}s, {engine}, {act_summary}) -> {out_path}")
@@ -1795,10 +2256,29 @@ def main() -> int:
 
     # Classic 6 Shorts moods: fast seamless 4-bar tiling for long durations (> 90s)
     if duration > 90.0:
-        _render_classic_long_tiled(args.mood, duration, bpm, out_path, acts=acts if args.timings else None)
+        _render_classic_long_tiled(
+            args.mood,
+            duration,
+            bpm,
+            out_path,
+            acts=acts if args.timings else None,
+            act_intensities=act_intensities if args.timings else None,
+            bgm_cues=bgm_cues if args.timings else None,
+            ending_style=ending_style,
+        )
     else:
         left, right = synthesize_bgm(args.mood, duration, bpm)
-        write_stereo_wav_arrays(left, right, out_path, drive=0.85, already_limited=False)
+        if bgm_cues:
+            pcm = bytearray(_pack_stereo_pcm_stdlib(left, right, drive=0.85))
+            _apply_bgm_cues_pcm_inplace(pcm, bgm_cues, duration)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(out_path), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(SR)
+                wf.writeframes(bytes(pcm))
+        else:
+            write_stereo_wav_arrays(left, right, out_path, drive=0.85, already_limited=False)
 
     print(f"Generated {args.mood} BGM ({bpm} BPM, {duration:.2f}s) -> {out_path}")
     return 0

@@ -9,7 +9,7 @@ Features (v4.0 Fun Kinetic):
   - Aspect-ratio-aware layout (--aspect-ratio 9:16|16:9, default 9:16):
       * 9:16 (PlayRes 1080x1920): 86px bold, Outline=8, Shadow=4.5, MarginV=420,
         max_chars=18, tilt=+/-2.5 deg (100% identical to v3.1/v3.2 Shorts).
-      * 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=72,
+      * 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=96,
         max_chars=36, tilt=0.0 deg (horizontal subtitle framing).
   - Resets caption chunks cleanly on every SRT cue boundary.
   - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + optional
@@ -146,7 +146,7 @@ def main() -> int:
         "--margin-v",
         type=int,
         default=None,
-        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V} for 9:16, 72 for 16:9).",
+        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V} for 9:16, 96 for 16:9).",
     )
     parser.add_argument(
         "--tilt",
@@ -156,7 +156,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--caption-style",
-        choices=("kinetic_keyword", "karaoke_chunk"),
+        choices=("kinetic_keyword", "karaoke_chunk", "clean_subtitle"),
         default="kinetic_keyword",
         help="Caption animation style (default: kinetic_keyword).",
     )
@@ -182,7 +182,10 @@ def main() -> int:
     font_size = args.font_size if args.font_size is not None else int(preset["font_size"])
     margin_v = args.margin_v if args.margin_v is not None else int(preset["margin_v"])
     max_chars = args.max_chars if args.max_chars is not None else int(preset["max_chars"])
-    tilt_deg = args.tilt if args.tilt is not None else float(preset["tilt"])
+    if args.caption_style == "clean_subtitle":
+        tilt_deg = 0.0
+    else:
+        tilt_deg = args.tilt if args.tilt is not None else float(preset["tilt"])
 
     if max_chars < 1:
         parser.error("--max-chars must be >= 1")

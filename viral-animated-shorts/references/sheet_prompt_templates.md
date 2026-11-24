@@ -68,6 +68,19 @@ Neutral standing pose, arms slightly away from torso, empty hands with zero held
 
 Register both sheets under `characters[].state_sheets` in `shot_plan.json` and select the active state per shot via `shots[].character_states`.
 
+## 1E. Master location / set anchor plate (long-form continuity)
+
+Use in long-form episodes for any recurring interior or exterior set (Throne Hall, Study, Newsroom, Courtyard) so parallel Act subagents share identical architecture, palette, and key-light direction. Save as `sheets/loc_<id>.png` and register under `locations.<id>.sheet_path` in `shot_plan.json`:
+
+```text
+Wide establishing architectural plate of [LOCATION_NAME] in [STYLE_BIBLE_LOOK].
+Empty set with ZERO characters, ZERO people, and ZERO moving figures.
+Lock clear architectural landmarks: [WALL_MATERIALS_PILLARS_WINDOWS_FURNITURE_PLACEMENT], consistent key lighting from [UPPER_LEFT_OR_RIGHT_LIGHT_DIRECTION] with [WARM_OR_COOL_COLOR_TEMPERATURE] rim fill, shallow atmospheric depth.
+[ASPECT_RATIO_FRAMING_NOTE]. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
+```
+
+In Stage 3, attach `Image 1 = Character turnaround/state sheet` and `Image 2 = Location anchor plate` so recurring scenes never drift in architecture or lighting.
+
 ## 2. 2D-to-3D upgrade turnaround sheet
 
 Pass the approved 2D turnaround sheet as reference image 1 (`-i <char>_2d.png`):
@@ -84,17 +97,17 @@ Preserve the exact silhouette, round white head, simple black dot eyes, thin sti
 
 ### 2D stickman-in-3D (9:16 vertical)
 ```text
-Flat 2D thick-line cartoon stickman character composited naturally with soft contact shadows into a rich, cinematic photoreal 3D environment. Crisp daylight/practical lighting, shallow depth of field, vibrant high-contrast colors, energetic comedic timing, vertical 9:16 framing with subject centered in the middle 50% safe zone. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
+Flat 2D thick-line cartoon stickman character composited naturally with soft contact shadows into a rich, cinematic photoreal 3D environment. Crisp daylight/practical lighting, shallow depth of field, vibrant high-contrast colors, energetic comedic timing, vertical 9:16 framing with eyes in the upper-middle 32-42% safe band and subject above the bottom 35% UI/caption zone. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
 ```
 
 ### Stylized 3D (9:16 vertical Short or micro-drama)
 ```text
-Modern stylized 3D animated film look (refined porcelain/matte-vinyl shading, subtle subsurface skin scattering, crisp rim lighting, expressive motion) set in a detailed 3D environment. Vibrant high-contrast colors, shallow cinematic depth of field, vertical 9:16 framing with focal subjects in the middle 50% safe zone. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
+Modern stylized 3D animated film look (refined porcelain/matte-vinyl shading, subtle subsurface skin scattering, crisp rim lighting, expressive motion) set in a detailed 3D environment. Vibrant high-contrast colors, shallow cinematic depth of field, vertical 9:16 framing with eyes in the upper-middle 32-42% safe band and focal action above the bottom 35% UI/caption zone. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
 ```
 
 ### Stylized 3D (16:9 widescreen long-form episode)
 ```text
-Cinematic stylized 3D animated feature film look (refined matte-vinyl and soft clay shading, luminous subsurface skin scattering, rich practical key lighting against atmospheric rim shadows, detailed 3D architecture and props). Shallow cinematic depth of field, horizontal 16:9 widescreen composition using rule-of-thirds framing with clear lower-third space for subtitles. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
+Cinematic stylized 3D animated feature film look (refined matte-vinyl and soft clay shading, luminous subsurface skin scattering, rich practical key lighting against atmospheric rim shadows, detailed 3D architecture and props). Shallow cinematic depth of field, horizontal 16:9 widescreen rule-of-thirds composition with eyes on the upper third line, generous lead room in the gaze direction, and bottom 16% clear for subtitles. Unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage, no subtitles, no watermarks.
 ```
 
 > **Cultural and historical sets:** Explicitly ban local scripts on props and architecture too (for example, `"unadorned palace pillars, plain silk banners, plain scrolls, zero letters, zero Chinese characters, zero digits, zero signage"`).
@@ -109,17 +122,24 @@ Match the exact camera angle, background architecture, lighting palette, and sta
 
 Omit this suffix on long-form episodes (`ending_style: "cliffhanger"` or `"outro"`, `dual_anchor_loop: false`).
 
-## 5. Cast isolation clauses (prevents `SOLO_CHAR_BLEED` and `MULTI_CHAR_BLEED`)
+## 5. Cast isolation and staging clauses (prevents `SOLO_CHAR_BLEED`, `MULTI_CHAR_BLEED`, and `EYELINE_CROSS`)
 
 ### Solo character (~70% of long-form shots)
-Pass **only** that character's active turnaround sheet (or state sheet) and prepend:
+Pass **only** that character's active turnaround/state sheet (plus optional location plate) and prepend:
 
 ```text
-SOLO character: ONLY [CHARACTER_NAME] (matching the attached turnaround sheet) appears in this frame; no other named characters, mascots, or co-hosts appear in the foreground.
+SOLO character: ONLY [CHARACTER_NAME] (matching the first attached turnaround sheet) appears in this frame, positioned on [CENTER / LEFT_THIRD / RIGHT_THIRD] looking [SCREEN_RIGHT / SCREEN_LEFT / AT_CAMERA]; no other named characters, mascots, or co-hosts appear in the foreground.
 ```
 
-### Zero-lead insert / environment shot (~15-20% of long-form shots)
-Attach **no** lead turnaround sheets and prepend:
+### Over-the-Shoulder (OTS) dialogue shot (`16:9` intimacy without bleed)
+Attach **only** the facing speaker's turnaround sheet (not the foreground listener's!) and prepend:
+
+```text
+Over-the-shoulder widescreen shot: dark, soft-blurred back-of-shoulder silhouette of an off-camera listener anchoring the extreme [LEFT / RIGHT] foreground edge; ONLY [SPEAKER_NAME] (matching the attached turnaround sheet) is in sharp focus on the opposite third looking toward the foreground shoulder.
+```
+
+### Zero-lead insert / establishing wide (~15-20% of long-form shots)
+Attach **no** lead turnaround sheets (optionally attach the location plate) and prepend:
 
 ```text
 No named lead characters appear in the foreground of this frame.
@@ -129,5 +149,5 @@ No named lead characters appear in the foreground of this frame.
 Attach **only** the two characters' active sheets in left-to-right order and prepend:
 
 ```text
-Two-character confrontation: [CHARACTER_A] (matching the first attached turnaround sheet) positioned on the left and [CHARACTER_B] (matching the second attached turnaround sheet) positioned on the right, with clear spatial separation to prevent costume or face bleed.
+Two-character confrontation: [CHARACTER_A] (matching the first attached turnaround sheet) positioned on the left looking right and [CHARACTER_B] (matching the second attached turnaround sheet) positioned on the right looking left, with clear spatial separation and consistent relative height to prevent costume or face bleed.
 ```

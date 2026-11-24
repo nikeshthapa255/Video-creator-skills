@@ -28,9 +28,7 @@ from array import array
 import json
 import math
 import random
-import struct
 import sys
-import warnings
 import wave
 import zlib
 from pathlib import Path
@@ -44,21 +42,57 @@ except ImportError:
     np = None  # type: ignore
     HAS_NUMPY = False
 
-try:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        import audioop  # type: ignore
-    HAS_AUDIOOP = True
-except ImportError:
-    audioop = None  # type: ignore
-    HAS_AUDIOOP = False
-
 SR = 48000
 TWO_PI = 2.0 * math.pi
+
+AMBIENCE_PRESETS = (
+    "none",
+    "palace_courtyard",
+    "throne_hall",
+    "newsroom_air",
+    "hearth_embers",
+)
+
+# Per-cue loudness calibration: cue -> (target_rms_dbfs, max_peak_dbfs)
+CUE_CALIBRATION: Dict[str, Tuple[float, float]] = {
+    # Impacts & deep cinematic hits (-13 dBFS RMS, -2.0 dBFS peak)
+    "vine_boom": (-13.0, -2.0),
+    "war_drum_hit": (-13.0, -2.0),
+    "palace_gong": (-13.0, -2.0),
+    "heartbeat_pulse": (-13.0, -2.0),
+    "cinematic_riser": (-13.0, -2.0),
+    # Sharp comedic / UI / metallic tonal cues (-14 dBFS RMS, -2.5 dBFS peak)
+    "siren_chirp": (-14.0, -2.5),
+    "record_scratch": (-14.0, -2.5),
+    "laser_zap": (-14.0, -2.5),
+    "bonk_boing": (-14.0, -2.5),
+    "cash_ching": (-14.0, -2.5),
+    "ding_levelup": (-14.0, -2.5),
+    "pop": (-14.0, -2.5),
+    "jade_clink": (-14.0, -2.5),
+    "blade_unsheathe": (-14.0, -2.5),
+    "guzheng_gliss": (-14.0, -2.5),
+    # Broadband textures & swells (-16 dBFS RMS, -2.5 dBFS peak)
+    "porcelain_shatter": (-16.0, -2.5),
+    "fire_crackle_burst": (-16.0, -2.5),
+    "whoosh": (-16.0, -2.5),
+    "silk_whoosh": (-16.0, -2.5),
+    "court_gasp_swell": (-16.0, -2.5),
+}
 
 
 def db_to_lin(db: float) -> float:
     return 10.0 ** (db / 20.0)
+
+
+def _pan_gains(pan: float) -> Tuple[float, float]:
+    """Equal-power stereo balance gains where pan=0.5 yields (1.0, 1.0)."""
+    p = max(0.0, min(1.0, float(pan)))
+    if abs(p - 0.5) < 1e-6:
+        return 1.0, 1.0
+    angle = p * math.pi * 0.5
+    s2 = math.sqrt(2.0)
+    return s2 * math.cos(angle), s2 * math.sin(angle)
 
 
 def _upsample_2x(buf: List[float], target_n: int) -> List[float]:
@@ -124,97 +158,123 @@ def _stdlib_bandpass(samples: List[float], low_hz: float, high_hz: float, sr: in
 def _py_vine_boom(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.95
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     phase = 0.0
     sin = math.sin
     exp = math.exp
     tanh = math.tanh
     uni = rng.uniform
     inv_sr = 1.0 / SR
+    p_jit = uni(0.985, 1.015)
     for i in range(n):
         t = i * inv_sr
-        freq = 32.0 + 108.0 * exp(-t * 9.5)
+        freq = (32.0 + 108.0 * exp(-t * 9.5)) * p_jit
         phase += TWO_PI * freq * inv_sr
         sub = sin(phase) + 0.35 * sin(phase * 2.0)
-        click = uni(-1.0, 1.0) * exp(-t * 140.0) * 0.4
+        click_l = uni(-1.0, 1.0) * exp(-t * 140.0) * 0.42
+        click_r = uni(-1.0, 1.0) * exp(-t * 140.0) * 0.42
+        air = sin(phase * 3.0 + 0.4) * exp(-t * 18.0) * 0.12
         env = exp(-t * 3.8) * _adsr_scalar(t, dur, a=0.003, d=0.08)
-        out[i] = tanh((sub * 1.45 + click) * env) * 0.92
-    return out, list(out)
+        l[i] = tanh((sub * 1.45 + click_l + air) * env) * 0.92
+        r[i] = tanh((sub * 1.45 + click_r - air) * env) * 0.92
+    return l, r
 
 
 def _py_record_scratch(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.42
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     phase = 0.0
-    prev_noise = 0.0
+    prev_noise_l = 0.0
+    prev_noise_r = 0.0
     sin = math.sin
     exp = math.exp
     tanh = math.tanh
     uni = rng.uniform
     inv_sr = 1.0 / SR
     pi_dur = math.pi / dur
+    p_jit = uni(0.98, 1.02)
     for i in range(n):
         t = i * inv_sr
         if t < 0.14:
-            freq = 420.0 + 1600.0 * (t / 0.14)
+            freq = (420.0 + 1600.0 * (t / 0.14)) * p_jit
         else:
-            freq = 2020.0 * exp(-(t - 0.14) * 9.0) + 180.0
+            freq = (2020.0 * exp(-(t - 0.14) * 9.0) + 180.0) * p_jit
         phase += TWO_PI * freq * inv_sr
-        raw_n = uni(-1.0, 1.0)
-        hp_noise = raw_n - 0.7 * prev_noise
-        prev_noise = raw_n
-        harmonic = sin(phase) + 0.5 * sin(phase * 2.7)
+        raw_l = uni(-1.0, 1.0)
+        raw_r = uni(-1.0, 1.0)
+        hp_l = raw_l - 0.7 * prev_noise_l
+        hp_r = raw_r - 0.7 * prev_noise_r
+        prev_noise_l = raw_l
+        prev_noise_r = raw_r
+        harm_l = sin(phase) + 0.5 * sin(phase * 2.7)
+        harm_r = sin(phase + 0.28) + 0.5 * sin(phase * 2.72 - 0.2)
         env = _adsr_scalar(t, dur, a=0.004, d=0.06) * (0.45 + 0.55 * sin(pi_dur * t))
-        out[i] = tanh((harmonic * 0.65 + hp_noise * 0.45) * env) * 0.85
-    return out, list(out)
+        l[i] = tanh((harm_l * 0.65 + hp_l * 0.45) * env) * 0.85
+        r[i] = tanh((harm_r * 0.65 + hp_r * 0.45) * env) * 0.85
+    return l, r
 
 
 def _py_siren_chirp(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.48
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     phase = 0.0
     sin = math.sin
     cos = math.cos
     tanh = math.tanh
     inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.985, 1.015)
     for i in range(n):
         t = i * inv_sr
         cycle = (t * 4.2) % 1.0
-        freq = 680.0 + 720.0 * (0.5 - 0.5 * cos(TWO_PI * cycle))
+        freq = (680.0 + 720.0 * (0.5 - 0.5 * cos(TWO_PI * cycle))) * p_jit
         phase += TWO_PI * freq * inv_sr
-        sig = sin(phase) + 0.25 * sin(3.0 * phase)
-        env = _adsr_scalar(t, dur, a=0.008, d=0.05)
-        out[i] = tanh(sig * 0.9) * env * 0.75
-    return out, list(out)
+        sig_l = sin(phase) + 0.25 * sin(3.0 * phase)
+        sig_r = sin(phase + 0.22) + 0.25 * sin(3.0 * phase - 0.35)
+        sway = 0.42 + 0.16 * sin(TWO_PI * 2.2 * t)
+        env = _adsr_scalar(t, dur, a=0.008, d=0.05) * 0.75
+        l[i] = tanh(sig_l * 0.9) * env * math.cos(sway * math.pi * 0.5) * 1.414
+        r[i] = tanh(sig_r * 0.9) * env * math.sin(sway * math.pi * 0.5) * 1.414
+    return l, r
 
 
 def _py_bonk_boing(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.65
     n = int(SR * dur)
-    out = [0.0] * n
-    phase = 0.0
+    l = [0.0] * n
+    r = [0.0] * n
+    phase_l = 0.0
+    phase_r = 0.0
     sin = math.sin
     exp = math.exp
     tanh = math.tanh
     inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.98, 1.02)
     for i in range(n):
         t = i * inv_sr
-        bonk = sin(TWO_PI * (340.0 * exp(-t * 25.0) + 110.0) * t) * exp(-t * 28.0)
-        wobble_freq = 210.0 + 110.0 * sin(TWO_PI * 13.5 * t) * exp(-t * 3.0) + 90.0 * t
-        phase += TWO_PI * wobble_freq * inv_sr
-        spring = (sin(phase) + 0.3 * sin(2.0 * phase)) * exp(-t * 4.2)
+        bonk = sin(TWO_PI * (340.0 * exp(-t * 25.0) + 110.0) * p_jit * t) * exp(-t * 28.0)
+        wobble_freq = (210.0 + 110.0 * sin(TWO_PI * 13.5 * t) * exp(-t * 3.0) + 90.0 * t) * p_jit
+        phase_l += TWO_PI * wobble_freq * inv_sr
+        phase_r += TWO_PI * (wobble_freq + 2.4) * inv_sr
+        spring_l = (sin(phase_l) + 0.3 * sin(2.0 * phase_l)) * exp(-t * 4.2)
+        spring_r = (sin(phase_r + 0.2) + 0.3 * sin(2.0 * phase_r)) * exp(-t * 4.2)
         env = _adsr_scalar(t, dur, a=0.002, d=0.06)
-        out[i] = tanh((bonk * 0.9 + spring * 0.7) * env) * 0.85
-    return out, list(out)
+        l[i] = tanh((bonk * 0.9 + spring_l * 0.7) * env) * 0.85
+        r[i] = tanh((bonk * 0.9 + spring_r * 0.7) * env) * 0.85
+    return l, r
 
 
 def _py_cash_ching(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.72
     n = int(SR * dur)
-    out = [0.0] * n
-    freqs = (2093.0, 3136.0, 4186.0, 5274.0)
+    l = [0.0] * n
+    r = [0.0] * n
+    p_jit = rng.uniform(0.99, 1.01)
+    freqs = tuple(f * p_jit for f in (2093.0, 3136.0, 4186.0, 5274.0))
     amps = (0.50, 0.35, 0.25, 0.15)
     sin = math.sin
     exp = math.exp
@@ -223,25 +283,33 @@ def _py_cash_ching(rng: random.Random) -> Tuple[List[float], List[float]]:
     inv_sr = 1.0 / SR
     for i in range(n):
         t = i * inv_sr
-        clack = uni(-1.0, 1.0) * exp(-t * 75.0) * 0.55
-        bell = 0.0
+        clack_l = uni(-1.0, 1.0) * exp(-t * 75.0) * 0.55
+        clack_r = uni(-1.0, 1.0) * exp(-t * 75.0) * 0.55
+        bell_l = 0.0
+        bell_r = 0.0
         if t >= 0.045:
             tb = t - 0.045
             bell_env = exp(-tb * 5.2) * _adsr_scalar(tb, dur - 0.045, a=0.002, d=0.08)
             for f, a in zip(freqs, amps):
-                bell += a * sin(TWO_PI * f * tb)
-            bell *= bell_env
-        out[i] = tanh(clack + bell * 1.1) * 0.82
-    return out, list(out)
+                bell_l += a * sin(TWO_PI * f * tb)
+                bell_r += a * sin(TWO_PI * (f + 3.2) * tb + 0.25)
+            bell_l *= bell_env
+            bell_r *= bell_env
+        l[i] = tanh(clack_l + bell_l * 1.1) * 0.82
+        r[i] = tanh(clack_r + bell_r * 1.1) * 0.82
+    return l, r
 
 
 def _py_ding_levelup(rng: random.Random) -> Tuple[List[float], List[float]]:
-    notes = (1046.5, 1318.5, 1568.0, 2093.0)
+    p_jit = rng.uniform(0.992, 1.008)
+    notes = tuple(f * p_jit for f in (1046.5, 1318.5, 1568.0, 2093.0))
     step = 0.075
     dur = step * len(notes) + 0.38
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     sin = math.sin
+    cos = math.cos
     exp = math.exp
     tanh = math.tanh
     inv_sr = 1.0 / SR
@@ -251,41 +319,54 @@ def _py_ding_levelup(rng: random.Random) -> Tuple[List[float], List[float]]:
         note_n = min(int(note_dur * SR), n - start_i)
         dec = 5.5 if idx == len(notes) - 1 else 14.0
         w = TWO_PI * freq
+        pan = (0.32 + 0.12 * idx) * math.pi * 0.5
+        gl = cos(pan) * 1.414 * 0.48
+        gr = sin(pan) * 1.414 * 0.48
         for j in range(note_n):
             t = j * inv_sr
             env = exp(-t * dec) * _adsr_scalar(t, note_dur, a=0.003, d=0.03)
-            sig = sin(w * t) + 0.25 * sin(2.0 * w * t)
-            out[start_i + j] += sig * env * 0.48
-    out = [tanh(x) * 0.82 for x in out]
-    return out, list(out)
+            sig = (sin(w * t) + 0.25 * sin(2.0 * w * t)) * env
+            l[start_i + j] += sig * gl
+            r[start_i + j] += sig * gr
+    l = [tanh(x) * 0.82 for x in l]
+    r = [tanh(x) * 0.82 for x in r]
+    return l, r
 
 
 def _py_laser_zap(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.28
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     phase = 0.0
     sin = math.sin
+    cos = math.cos
     exp = math.exp
     tanh = math.tanh
     inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.975, 1.025)
     for i in range(n):
         t = i * inv_sr
-        freq = 2600.0 * exp(-t * 11.5) + 140.0
+        freq = (2600.0 * exp(-t * 11.5) + 140.0) * p_jit
         phase += TWO_PI * freq * inv_sr
-        sig = sin(phase) + 0.45 * sin(2.0 * phase) + 0.2 * sin(3.0 * phase)
+        sig_l = sin(phase) + 0.45 * sin(2.0 * phase) + 0.2 * sin(3.0 * phase)
+        sig_r = sin(phase + 0.18) + 0.45 * sin(2.0 * phase - 0.2) + 0.2 * sin(3.0 * phase)
         env = _adsr_scalar(t, dur, a=0.002, d=0.04) * exp(-t * 4.0)
-        out[i] = tanh(sig * env) * 0.8
-    return out, list(out)
+        pan = (0.34 + 0.32 * (t / dur)) * math.pi * 0.5
+        l[i] = tanh(sig_l * env) * 0.8 * cos(pan) * 1.414
+        r[i] = tanh(sig_r * env) * 0.8 * sin(pan) * 1.414
+    return l, r
 
 
 def _py_whoosh(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.34
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     lp = 0.0
     lp2 = 0.0
     sin = math.sin
+    cos = math.cos
     tanh = math.tanh
     uni = rng.uniform
     inv_sr = 1.0 / SR
@@ -298,26 +379,33 @@ def _py_whoosh(rng: random.Random) -> Tuple[List[float], List[float]]:
         lp += alpha * (raw - lp)
         lp2 += (alpha * 0.6) * (lp - lp2)
         bp = lp - lp2 * 0.65
-        out[i] = tanh(bp * 2.8) * bell * 0.78
-    return out, list(out)
+        mono = tanh(bp * 2.8) * bell * 0.78
+        # Smooth L-to-R stereo pan sweep across whoosh
+        pan = (0.20 + 0.60 * (t / dur)) * math.pi * 0.5
+        l[i] = mono * cos(pan) * 1.414
+        r[i] = mono * sin(pan) * 1.414
+    return l, r
 
 
 def _py_pop(rng: random.Random) -> Tuple[List[float], List[float]]:
     dur = 0.095
     n = int(SR * dur)
-    out = [0.0] * n
+    l = [0.0] * n
+    r = [0.0] * n
     phase = 0.0
     sin = math.sin
     exp = math.exp
     tanh = math.tanh
     inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.97, 1.03)
     for i in range(n):
         t = i * inv_sr
-        freq = 210.0 + 520.0 * (t / dur)
+        freq = (210.0 + 520.0 * (t / dur)) * p_jit
         phase += TWO_PI * freq * inv_sr
         env = exp(-t * 32.0) * _adsr_scalar(t, dur, a=0.002, d=0.015)
-        out[i] = tanh(sin(phase) * 1.4) * env * 0.85
-    return out, list(out)
+        l[i] = tanh(sin(phase) * 1.4) * env * 0.85
+        r[i] = tanh(sin(phase + 0.24) * 1.4) * env * 0.85
+    return l, r
 
 
 def _py_palace_gong(rng: random.Random) -> Tuple[List[float], List[float]]:
@@ -836,74 +924,88 @@ if HAS_NUMPY:
         dur = 0.95
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        freq = 32.0 + 108.0 * np.exp(-t * 9.5)
+        p_jit = float(rng.uniform(0.985, 1.015))
+        freq = (32.0 + 108.0 * np.exp(-t * 9.5)) * p_jit
         phase = TWO_PI * np.cumsum(freq) / SR
         sub = np.sin(phase) + 0.35 * np.sin(phase * 2.0)
-        click = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 140.0) * 0.4
+        click_l = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 140.0) * 0.42
+        click_r = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 140.0) * 0.42
+        air = np.sin(phase * 3.0 + 0.4) * np.exp(-t * 18.0) * 0.12
         env = np.exp(-t * 3.8) * _np_adsr(t, dur, a=0.003, d=0.08)
-        out = np.tanh((sub * 1.45 + click) * env) * 0.92
-        return out, out.copy()
+        return np.tanh((sub * 1.45 + click_l + air) * env) * 0.92, np.tanh((sub * 1.45 + click_r - air) * env) * 0.92
 
     def _np_record_scratch(rng: Any) -> Tuple[Any, Any]:
         dur = 0.42
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        freq = np.where(t < 0.14, 420.0 + 1600.0 * (t / 0.14), 2020.0 * np.exp(-(t - 0.14) * 9.0) + 180.0)
+        p_jit = float(rng.uniform(0.98, 1.02))
+        freq = np.where(t < 0.14, 420.0 + 1600.0 * (t / 0.14), 2020.0 * np.exp(-(t - 0.14) * 9.0) + 180.0) * p_jit
         phase = TWO_PI * np.cumsum(freq) / SR
-        raw = rng.uniform(-1.0, 1.0, size=n)
-        hp = raw - 0.7 * np.concatenate(([0.0], raw[:-1]))
-        harmonic = np.sin(phase) + 0.5 * np.sin(phase * 2.7)
+        raw_l = rng.uniform(-1.0, 1.0, size=n)
+        raw_r = rng.uniform(-1.0, 1.0, size=n)
+        hp_l = raw_l - 0.7 * np.concatenate(([0.0], raw_l[:-1]))
+        hp_r = raw_r - 0.7 * np.concatenate(([0.0], raw_r[:-1]))
+        harm_l = np.sin(phase) + 0.5 * np.sin(phase * 2.7)
+        harm_r = np.sin(phase + 0.28) + 0.5 * np.sin(phase * 2.72 - 0.2)
         env = _np_adsr(t, dur, a=0.004, d=0.06) * (0.45 + 0.55 * np.sin(math.pi * t / dur))
-        out = np.tanh((harmonic * 0.65 + hp * 0.45) * env) * 0.85
-        return out, out.copy()
+        return np.tanh((harm_l * 0.65 + hp_l * 0.45) * env) * 0.85, np.tanh((harm_r * 0.65 + hp_r * 0.45) * env) * 0.85
 
     def _np_siren_chirp(rng: Any) -> Tuple[Any, Any]:
         dur = 0.48
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.985, 1.015))
         cycle = (t * 4.2) % 1.0
-        freq = 680.0 + 720.0 * (0.5 - 0.5 * np.cos(TWO_PI * cycle))
+        freq = (680.0 + 720.0 * (0.5 - 0.5 * np.cos(TWO_PI * cycle))) * p_jit
         phase = TWO_PI * np.cumsum(freq) / SR
-        sig = np.sin(phase) + 0.25 * np.sin(3.0 * phase)
-        env = _np_adsr(t, dur, a=0.008, d=0.05)
-        out = np.tanh(sig * 0.9) * env * 0.75
-        return out, out.copy()
+        sig_l = np.sin(phase) + 0.25 * np.sin(3.0 * phase)
+        sig_r = np.sin(phase + 0.22) + 0.25 * np.sin(3.0 * phase - 0.35)
+        sway = (0.42 + 0.16 * np.sin(TWO_PI * 2.2 * t)) * math.pi * 0.5
+        env = _np_adsr(t, dur, a=0.008, d=0.05) * 0.75
+        return np.tanh(sig_l * 0.9) * env * np.cos(sway) * 1.414, np.tanh(sig_r * 0.9) * env * np.sin(sway) * 1.414
 
     def _np_bonk_boing(rng: Any) -> Tuple[Any, Any]:
         dur = 0.65
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        bonk = np.sin(TWO_PI * (340.0 * np.exp(-t * 25.0) + 110.0) * t) * np.exp(-t * 28.0)
-        wobble_freq = 210.0 + 110.0 * np.sin(TWO_PI * 13.5 * t) * np.exp(-t * 3.0) + 90.0 * t
-        phase = TWO_PI * np.cumsum(wobble_freq) / SR
-        spring = (np.sin(phase) + 0.3 * np.sin(2.0 * phase)) * np.exp(-t * 4.2)
+        p_jit = float(rng.uniform(0.98, 1.02))
+        bonk = np.sin(TWO_PI * (340.0 * np.exp(-t * 25.0) + 110.0) * p_jit * t) * np.exp(-t * 28.0)
+        wobble_freq = (210.0 + 110.0 * np.sin(TWO_PI * 13.5 * t) * np.exp(-t * 3.0) + 90.0 * t) * p_jit
+        phase_l = TWO_PI * np.cumsum(wobble_freq) / SR
+        phase_r = TWO_PI * np.cumsum(wobble_freq + 2.4) / SR
+        spring_l = (np.sin(phase_l) + 0.3 * np.sin(2.0 * phase_l)) * np.exp(-t * 4.2)
+        spring_r = (np.sin(phase_r + 0.2) + 0.3 * np.sin(2.0 * phase_r)) * np.exp(-t * 4.2)
         env = _np_adsr(t, dur, a=0.002, d=0.06)
-        out = np.tanh((bonk * 0.9 + spring * 0.7) * env) * 0.85
-        return out, out.copy()
+        return np.tanh((bonk * 0.9 + spring_l * 0.7) * env) * 0.85, np.tanh((bonk * 0.9 + spring_r * 0.7) * env) * 0.85
 
     def _np_cash_ching(rng: Any) -> Tuple[Any, Any]:
         dur = 0.72
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        clack = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 75.0) * 0.55
+        p_jit = float(rng.uniform(0.99, 1.01))
+        clack_l = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 75.0) * 0.55
+        clack_r = rng.uniform(-1.0, 1.0, size=n) * np.exp(-t * 75.0) * 0.55
         tb = np.maximum(0.0, t - 0.045)
         active = (t >= 0.045).astype(np.float64)
         bell_env = np.exp(-tb * 5.2) * _np_adsr(tb, dur - 0.045, a=0.002, d=0.08) * active
-        bell = (
-            0.50 * np.sin(TWO_PI * 2093.0 * tb)
-            + 0.35 * np.sin(TWO_PI * 3136.0 * tb)
-            + 0.25 * np.sin(TWO_PI * 4186.0 * tb)
-            + 0.15 * np.sin(TWO_PI * 5274.0 * tb)
-        ) * bell_env
-        out = np.tanh(clack + bell * 1.1) * 0.82
-        return out, out.copy()
+        bell_l = np.zeros(n, dtype=np.float64)
+        bell_r = np.zeros(n, dtype=np.float64)
+        for f_base, amp in ((2093.0, 0.50), (3136.0, 0.35), (4186.0, 0.25), (5274.0, 0.15)):
+            f = f_base * p_jit
+            bell_l += amp * np.sin(TWO_PI * f * tb)
+            bell_r += amp * np.sin(TWO_PI * (f + 3.2) * tb + 0.25)
+        bell_l *= bell_env
+        bell_r *= bell_env
+        return np.tanh(clack_l + bell_l * 1.1) * 0.82, np.tanh(clack_r + bell_r * 1.1) * 0.82
 
     def _np_ding_levelup(rng: Any) -> Tuple[Any, Any]:
-        notes = (1046.5, 1318.5, 1568.0, 2093.0)
+        p_jit = float(rng.uniform(0.992, 1.008))
+        notes = tuple(f * p_jit for f in (1046.5, 1318.5, 1568.0, 2093.0))
         step = 0.075
         dur = step * len(notes) + 0.38
         n = int(SR * dur)
-        out = np.zeros(n, dtype=np.float64)
+        l = np.zeros(n, dtype=np.float64)
+        r = np.zeros(n, dtype=np.float64)
         for idx, freq in enumerate(notes):
             start_i = int(idx * step * SR)
             note_dur = 0.42 if idx == len(notes) - 1 else 0.18
@@ -911,21 +1013,24 @@ if HAS_NUMPY:
             tn = np.arange(note_n, dtype=np.float64) / SR
             dec = 5.5 if idx == len(notes) - 1 else 14.0
             env = np.exp(-tn * dec) * _np_adsr(tn, note_dur, a=0.003, d=0.03)
-            sig = np.sin(TWO_PI * freq * tn) + 0.25 * np.sin(4.0 * math.pi * freq * tn)
-            out[start_i : start_i + note_n] += sig * env * 0.48
-        out = np.tanh(out) * 0.82
-        return out, out.copy()
+            sig = (np.sin(TWO_PI * freq * tn) + 0.25 * np.sin(4.0 * math.pi * freq * tn)) * env
+            pan = (0.32 + 0.12 * idx) * math.pi * 0.5
+            l[start_i : start_i + note_n] += sig * (math.cos(pan) * 1.414 * 0.48)
+            r[start_i : start_i + note_n] += sig * (math.sin(pan) * 1.414 * 0.48)
+        return np.tanh(l) * 0.82, np.tanh(r) * 0.82
 
     def _np_laser_zap(rng: Any) -> Tuple[Any, Any]:
         dur = 0.28
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        freq = 2600.0 * np.exp(-t * 11.5) + 140.0
+        p_jit = float(rng.uniform(0.975, 1.025))
+        freq = (2600.0 * np.exp(-t * 11.5) + 140.0) * p_jit
         phase = TWO_PI * np.cumsum(freq) / SR
-        sig = np.sin(phase) + 0.45 * np.sin(2.0 * phase) + 0.2 * np.sin(3.0 * phase)
+        sig_l = np.sin(phase) + 0.45 * np.sin(2.0 * phase) + 0.2 * np.sin(3.0 * phase)
+        sig_r = np.sin(phase + 0.18) + 0.45 * np.sin(2.0 * phase - 0.2) + 0.2 * np.sin(3.0 * phase)
         env = _np_adsr(t, dur, a=0.002, d=0.04) * np.exp(-t * 4.0)
-        out = np.tanh(sig * env) * 0.8
-        return out, out.copy()
+        pan = (0.34 + 0.32 * (t / dur)) * math.pi * 0.5
+        return np.tanh(sig_l * env) * 0.8 * np.cos(pan) * 1.414, np.tanh(sig_r * env) * 0.8 * np.sin(pan) * 1.414
 
     def _np_whoosh(rng: Any) -> Tuple[Any, Any]:
         dur = 0.34
@@ -934,18 +1039,20 @@ if HAS_NUMPY:
         bell = np.sin(math.pi * t / dur) ** 1.6
         raw = rng.uniform(-1.0, 1.0, size=n)
         bp = _np_fft_bandpass(raw, 260.0, 2600.0)
-        out = np.tanh(bp * 2.4) * bell * 0.78
-        return out, out.copy()
+        mono = np.tanh(bp * 2.4) * bell * 0.78
+        # Smooth L-to-R stereo pan sweep across whoosh
+        pan = (0.20 + 0.60 * (t / dur)) * math.pi * 0.5
+        return mono * np.cos(pan) * 1.414, mono * np.sin(pan) * 1.414
 
     def _np_pop(rng: Any) -> Tuple[Any, Any]:
         dur = 0.095
         n = int(SR * dur)
         t = np.arange(n, dtype=np.float64) / SR
-        freq = 210.0 + 520.0 * (t / dur)
+        p_jit = float(rng.uniform(0.97, 1.03))
+        freq = (210.0 + 520.0 * (t / dur)) * p_jit
         phase = TWO_PI * np.cumsum(freq) / SR
         env = np.exp(-t * 32.0) * _np_adsr(t, dur, a=0.002, d=0.015)
-        out = np.tanh(np.sin(phase) * 1.4) * env * 0.85
-        return out, out.copy()
+        return np.tanh(np.sin(phase) * 1.4) * env * 0.85, np.tanh(np.sin(phase + 0.24) * 1.4) * env * 0.85
 
     def _np_palace_gong(rng: Any) -> Tuple[Any, Any]:
         dur = 2.4
@@ -1219,43 +1326,276 @@ else:
 GENERATORS = NUMPY_GENERATORS if HAS_NUMPY else STDLIB_GENERATORS
 
 
+def _calibrate_cue_numpy(left: Any, right: Any, target_rms_db: float, max_peak_db: float) -> Tuple[Any, Any]:
+    """Calibrate stereo NumPy cue buffer to target RMS with gentle peak ceiling."""
+    target_rms = db_to_lin(target_rms_db)
+    max_peak = db_to_lin(max_peak_db)
+    l_out = left.astype(np.float64, copy=True)
+    r_out = right.astype(np.float64, copy=True)
+    knee = max_peak * 0.72
+    headroom = max(1e-6, max_peak - knee)
+
+    for _ in range(3):
+        rms = float(np.sqrt(0.5 * (np.mean(l_out * l_out) + np.mean(r_out * r_out))))
+        if rms < 1e-8:
+            return l_out, r_out
+        if abs(rms - target_rms) / target_rms < 0.015:
+            break
+        scale = target_rms / rms
+        l_out *= scale
+        r_out *= scale
+        peak = max(float(np.max(np.abs(l_out))), float(np.max(np.abs(r_out))))
+        if peak > max_peak:
+            for arr in (l_out, r_out):
+                mag = np.abs(arr)
+                over = np.maximum(0.0, mag - knee)
+                shaped = np.where(mag > knee, knee + headroom * np.tanh(over / headroom), mag)
+                arr[:] = np.sign(arr) * shaped
+    peak_final = max(float(np.max(np.abs(l_out))), float(np.max(np.abs(r_out))))
+    if peak_final > max_peak:
+        g_cap = max_peak / peak_final
+        l_out *= g_cap
+        r_out *= g_cap
+    return l_out, r_out
+
+
+def _calibrate_cue_stdlib(
+    left: List[float],
+    right: List[float],
+    target_rms_db: float,
+    max_peak_db: float,
+) -> Tuple[List[float], List[float]]:
+    """Calibrate stereo pure-Python cue buffer to target RMS with gentle peak ceiling."""
+    n = len(left)
+    if n == 0:
+        return left, right
+    target_rms = db_to_lin(target_rms_db)
+    max_peak = db_to_lin(max_peak_db)
+    knee = max_peak * 0.72
+    headroom = max(1e-6, max_peak - knee)
+    tanh = math.tanh
+    l_out = list(left)
+    r_out = list(right)
+
+    for _ in range(3):
+        energy = 0.0
+        for a, b in zip(l_out, r_out):
+            energy += a * a + b * b
+        rms = math.sqrt(energy / (2.0 * n))
+        if rms < 1e-8:
+            return l_out, r_out
+        if abs(rms - target_rms) / target_rms < 0.015:
+            break
+        g = target_rms / rms
+        peak = 0.0
+        for i in range(n):
+            lv = l_out[i] * g
+            rv = r_out[i] * g
+            l_out[i] = lv
+            r_out[i] = rv
+            al = abs(lv)
+            ar = abs(rv)
+            if al > peak:
+                peak = al
+            if ar > peak:
+                peak = ar
+        if peak > max_peak:
+            for vals in (l_out, r_out):
+                for i, x in enumerate(vals):
+                    ax = abs(x)
+                    if ax > knee:
+                        shaped = knee + headroom * tanh((ax - knee) / headroom)
+                        vals[i] = shaped if x >= 0.0 else -shaped
+    peak_final = max(max(abs(a) for a in l_out), max(abs(b) for b in r_out))
+    if peak_final > max_peak:
+        g_cap = max_peak / peak_final
+        l_out = [a * g_cap for a in l_out]
+        r_out = [b * g_cap for b in r_out]
+    return l_out, r_out
+
+
 def synthesize_cue(name: str, seed: Optional[int] = None) -> Tuple[Any, Any]:
-    """Synthesize a stereo cue pair (left, right) using NumPy when installed or stdlib fallback."""
+    """Synthesize a calibrated stereo cue pair (left, right) using NumPy when installed or stdlib fallback."""
     if seed is None:
         seed = zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF
+    target_rms_db, max_peak_db = CUE_CALIBRATION.get(name, (-14.0, -2.5))
     if HAS_NUMPY:
-        return NUMPY_GENERATORS[name](np.random.default_rng(seed))
-    return STDLIB_GENERATORS[name](random.Random(seed))
+        cl, cr = NUMPY_GENERATORS[name](np.random.default_rng(seed))
+        return _calibrate_cue_numpy(cl, cr, target_rms_db, max_peak_db)
+    cl, cr = STDLIB_GENERATORS[name](random.Random(seed))
+    return _calibrate_cue_stdlib(cl, cr, target_rms_db, max_peak_db)
+
+
+# =============================================================================
+# Continuous Stereo Room-Tone Ambience Bed (-36 dBFS RMS)
+# =============================================================================
+
+def _synth_ambience_loop_numpy(preset: str, loop_sec: float = 8.0, target_rms_db: float = -36.0) -> Tuple[Any, Any]:
+    """Synthesize a seamlessly loopable stereo room-tone bed calibrated to target_rms_db."""
+    n = int(round(loop_sec * SR))
+    seam_n = min(int(0.08 * SR), n // 8)
+    n_gen = n + seam_n
+    rng = np.random.default_rng(zlib.crc32(f"amb_{preset}".encode("utf-8")) & 0xFFFFFFFF)
+    t = np.arange(n_gen, dtype=np.float64) / SR
+    raw_l = rng.uniform(-1.0, 1.0, size=n_gen)
+    raw_r = rng.uniform(-1.0, 1.0, size=n_gen)
+
+    if preset == "palace_courtyard":
+        # Night breeze + gentle outdoor air shimmer
+        breeze_l = _np_fft_bandpass(raw_l, 110.0, 760.0) * (0.78 + 0.22 * np.sin(TWO_PI * (2.0 / loop_sec) * t))
+        breeze_r = _np_fft_bandpass(raw_r, 110.0, 760.0) * (0.78 + 0.22 * np.sin(TWO_PI * (3.0 / loop_sec) * t + 1.1))
+        air_l = _np_fft_bandpass(raw_l, 1200.0, 3600.0) * 0.14
+        air_r = _np_fft_bandpass(raw_r, 1200.0, 3600.0) * 0.14
+        l, r = breeze_l + air_l, breeze_r + air_r
+    elif preset == "throne_hall":
+        # Deep cavernous stone hall resonance
+        low_l = _np_fft_bandpass(raw_l, 52.0, 320.0)
+        low_r = _np_fft_bandpass(raw_r, 52.0, 320.0)
+        mode_l = (np.sin(TWO_PI * 110.0 * t) * 0.08 + np.sin(TWO_PI * 165.0 * t + 0.5) * 0.05)
+        mode_r = (np.sin(TWO_PI * 110.0 * t + 0.7) * 0.08 + np.sin(TWO_PI * 165.0 * t + 1.4) * 0.05)
+        l, r = low_l + mode_l, low_r + mode_r
+    elif preset == "newsroom_air":
+        # Smooth studio HVAC / broadcast room tone
+        l = _np_fft_bandpass(raw_l, 75.0, 1650.0) * 0.85 + _np_fft_bandpass(raw_l, 70.0, 260.0) * 0.45
+        r = _np_fft_bandpass(raw_r, 75.0, 1650.0) * 0.85 + _np_fft_bandpass(raw_r, 70.0, 260.0) * 0.45
+    elif preset == "hearth_embers":
+        # Warm fire bed + sparse soft tiny ember crackles
+        l = _np_fft_bandpass(raw_l, 85.0, 580.0) * (0.82 + 0.18 * np.sin(TWO_PI * (2.0 / loop_sec) * t))
+        r = _np_fft_bandpass(raw_r, 85.0, 580.0) * (0.82 + 0.18 * np.sin(TWO_PI * (3.0 / loop_sec) * t + 0.8))
+        for _ in range(int(loop_sec * 5)):
+            s_i = int(rng.uniform(0.05, loop_sec - 0.05) * SR)
+            pn = min(int(0.014 * SR), n_gen - s_i)
+            if pn < 16:
+                continue
+            tp = np.arange(pn, dtype=np.float64) / SR
+            cf = rng.uniform(2000.0, 4600.0)
+            pop = (np.sin(TWO_PI * cf * tp) * 0.5 + rng.uniform(-0.5, 0.5, size=pn)) * np.exp(-tp * 260.0) * rng.uniform(0.08, 0.22)
+            pan = rng.uniform(0.20, 0.80) * math.pi * 0.5
+            l[s_i : s_i + pn] += pop * math.cos(pan)
+            r[s_i : s_i + pn] += pop * math.sin(pan)
+    else:
+        return np.zeros(n, dtype=np.float64), np.zeros(n, dtype=np.float64)
+
+    # Seamless overflow loop-seam crossfade
+    w = 0.5 - 0.5 * np.cos(math.pi * np.arange(seam_n, dtype=np.float64) / max(1, seam_n))
+    l[:seam_n] = l[:seam_n] * w + l[n : n + seam_n] * (1.0 - w)
+    r[:seam_n] = r[:seam_n] * w + r[n : n + seam_n] * (1.0 - w)
+    l = l[:n]
+    r = r[:n]
+
+    rms = float(np.sqrt(0.5 * (np.mean(l * l) + np.mean(r * r))))
+    target = db_to_lin(target_rms_db)
+    if rms > 1e-9:
+        scale = target / rms
+        l *= scale
+        r *= scale
+    return l, r
+
+
+def _synth_ambience_loop_stdlib(preset: str, loop_sec: float = 6.0, target_rms_db: float = -36.0) -> Tuple[List[float], List[float]]:
+    """Fast 24kHz->48kHz seamlessly loopable stereo room-tone bed in pure Python."""
+    sr_h = SR // 2
+    n = int(round(loop_sec * sr_h))
+    seam_n = min(int(0.06 * sr_h), n // 8)
+    n_gen = n + seam_n
+    n_out = int(round(loop_sec * SR))
+    rng = random.Random(zlib.crc32(f"amb_{preset}".encode("utf-8")) & 0xFFFFFFFF)
+    raw_l = [rng.uniform(-1.0, 1.0) for _ in range(n_gen)]
+    raw_r = [rng.uniform(-1.0, 1.0) for _ in range(n_gen)]
+    sin = math.sin
+    cos = math.cos
+    exp = math.exp
+    inv_sr = 1.0 / sr_h
+
+    if preset == "palace_courtyard":
+        bl = _stdlib_bandpass(raw_l, 110.0, 760.0, sr=sr_h)
+        br = _stdlib_bandpass(raw_r, 110.0, 760.0, sr=sr_h)
+        l = [bl[i] * (0.78 + 0.22 * sin(TWO_PI * (2.0 / loop_sec) * (i * inv_sr))) for i in range(n_gen)]
+        r = [br[i] * (0.78 + 0.22 * sin(TWO_PI * (3.0 / loop_sec) * (i * inv_sr) + 1.1)) for i in range(n_gen)]
+    elif preset == "throne_hall":
+        ll = _stdlib_bandpass(raw_l, 52.0, 320.0, sr=sr_h)
+        lr = _stdlib_bandpass(raw_r, 52.0, 320.0, sr=sr_h)
+        l = [ll[i] + 0.06 * sin(TWO_PI * 110.0 * (i * inv_sr)) for i in range(n_gen)]
+        r = [lr[i] + 0.06 * sin(TWO_PI * 110.0 * (i * inv_sr) + 0.7) for i in range(n_gen)]
+    elif preset == "newsroom_air":
+        l = _stdlib_bandpass(raw_l, 75.0, 1650.0, sr=sr_h)
+        r = _stdlib_bandpass(raw_r, 75.0, 1650.0, sr=sr_h)
+    elif preset == "hearth_embers":
+        l = _stdlib_bandpass(raw_l, 85.0, 580.0, sr=sr_h)
+        r = _stdlib_bandpass(raw_r, 85.0, 580.0, sr=sr_h)
+        for _ in range(int(loop_sec * 5)):
+            s_i = int(rng.uniform(0.05, loop_sec - 0.05) * sr_h)
+            pn = min(int(0.014 * sr_h), n_gen - s_i)
+            if pn < 8:
+                continue
+            cf = rng.uniform(2000.0, 4600.0)
+            amp = rng.uniform(0.08, 0.22)
+            pan = rng.uniform(0.20, 0.80) * math.pi * 0.5
+            gl, gr = cos(pan) * amp, sin(pan) * amp
+            for j in range(pn):
+                tp = j * inv_sr
+                pop = (sin(TWO_PI * cf * tp) * 0.5 + rng.uniform(-0.5, 0.5)) * exp(-tp * 260.0)
+                l[s_i + j] += pop * gl
+                r[s_i + j] += pop * gr
+    else:
+        return [0.0] * n_out, [0.0] * n_out
+
+    for i in range(seam_n):
+        w = 0.5 - 0.5 * cos(math.pi * i / max(1, seam_n))
+        l[i] = l[i] * w + l[n + i] * (1.0 - w)
+        r[i] = r[i] * w + r[n + i] * (1.0 - w)
+    l = l[:n]
+    r = r[:n]
+
+    energy = sum(a * a + b * b for a, b in zip(l, r))
+    rms = math.sqrt(energy / max(1, 2 * n))
+    target = db_to_lin(target_rms_db)
+    if rms > 1e-9:
+        sc = target / rms
+        l = [a * sc for a in l]
+        r = [b * sc for b in r]
+    return _upsample_2x(l, n_out), _upsample_2x(r, n_out)
 
 
 def _pack_stereo_pcm_stdlib(left: List[float], right: List[float], gain: float = 1.0) -> bytes:
+    """Pack stereo float lists to int16 PCM; soft-limit with tanh ONLY if peak > 0.98."""
     n = len(left)
     if n == 0:
         return b""
     peak = max(max(left), -min(left), max(right), -min(right)) * abs(gain)
-    if peak <= 0.99:
+    if peak <= 0.98:
         scale = 32767.0 * gain
-        pcm = array("h", (int(v * scale) for pair in zip(left, right) for v in pair))
+        pcm = array("h", (max(-32767, min(32767, int(round(v * scale)))) for pair in zip(left, right) for v in pair))
     else:
         tanh = math.tanh
         if gain == 1.0:
-            pcm = array("h", (int(tanh(v) * 32767.0) for pair in zip(left, right) for v in pair))
+            pcm = array("h", (int(round(tanh(v) * 32767.0)) for pair in zip(left, right) for v in pair))
         else:
-            pcm = array("h", (int(tanh(v * gain) * 32767.0) for pair in zip(left, right) for v in pair))
+            pcm = array("h", (int(round(tanh(v * gain) * 32767.0)) for pair in zip(left, right) for v in pair))
     if sys.byteorder != "little":
         pcm.byteswap()
     return pcm.tobytes()
 
 
 def write_stereo_wav(samples: Any, out_path: Path, right: Optional[Any] = None) -> None:
-    """Write 48 kHz 16-bit stereo WAV from mono or stereo (left, right) buffers."""
+    """Write 48 kHz 16-bit stereo WAV; soft-limit ONLY if peak > 0.98 (no double-tanh)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if HAS_NUMPY and isinstance(samples, np.ndarray):
         l_arr = samples
         r_arr = samples if right is None else right
-        interleaved = np.empty((l_arr.shape[0], 2), dtype=np.int16)
-        interleaved[:, 0] = np.clip(np.round(np.tanh(l_arr) * 32767.0), -32768, 32767).astype(np.int16)
-        interleaved[:, 1] = np.clip(np.round(np.tanh(r_arr) * 32767.0), -32768, 32767).astype(np.int16)
+        peak = max(
+            float(np.max(np.abs(l_arr))) if l_arr.size else 0.0,
+            float(np.max(np.abs(r_arr))) if r_arr.size else 0.0,
+        )
+        if peak > 0.98:
+            l_out = np.tanh(l_arr)
+            r_out = np.tanh(r_arr)
+        else:
+            l_out = l_arr
+            r_out = r_arr
+        interleaved = np.empty((l_out.shape[0], 2), dtype=np.int16)
+        interleaved[:, 0] = np.clip(np.round(l_out * 32767.0), -32768, 32767).astype(np.int16)
+        interleaved[:, 1] = np.clip(np.round(r_out * 32767.0), -32768, 32767).astype(np.int16)
         with wave.open(str(out_path), "wb") as wf:
             wf.setnchannels(2)
             wf.setsampwidth(2)
@@ -1273,11 +1613,33 @@ def write_stereo_wav(samples: Any, out_path: Path, right: Optional[Any] = None) 
         wf.writeframes(pcm_bytes)
 
 
-def _render_timeline_numpy(cues: List[Dict], total_dur: float, out_path: Path) -> int:
+def _render_timeline_numpy(
+    cues: List[Dict],
+    total_dur: float,
+    out_path: Path,
+    ambience: str = "none",
+) -> int:
     final_len = int(math.ceil(total_dur * SR))
     mix_l = np.zeros(final_len, dtype=np.float64)
     mix_r = np.zeros(final_len, dtype=np.float64)
-    cache: Dict[str, Tuple[Any, Any]] = {}
+
+    if ambience and ambience != "none":
+        amb_l, amb_r = _synth_ambience_loop_numpy(ambience)
+        loop_n = amb_l.shape[0]
+        if loop_n > 0:
+            reps = (final_len + loop_n - 1) // loop_n
+            mix_l += np.tile(amb_l, reps)[:final_len]
+            mix_r += np.tile(amb_r, reps)[:final_len]
+            fade_n = min(final_len // 4, int(0.25 * SR))
+            if fade_n > 1:
+                ramp = 0.5 - 0.5 * np.cos(math.pi * np.arange(fade_n, dtype=np.float64) / fade_n)
+                mix_l[:fade_n] *= ramp
+                mix_r[:fade_n] *= ramp
+                mix_l[-fade_n:] *= ramp[::-1]
+                mix_r[-fade_n:] *= ramp[::-1]
+
+    cache: Dict[Tuple[str, int], Tuple[Any, Any]] = {}
+    occ_counts: Dict[str, int] = {}
     placed = 0
 
     for cue in cues:
@@ -1287,29 +1649,38 @@ def _render_timeline_numpy(cues: List[Dict], total_dur: float, out_path: Path) -
         if name not in NUMPY_GENERATORS:
             print(f"Warning: skipping unknown SFX cue '{name}' at {cue['time_sec']:.2f}s", file=sys.stderr)
             continue
-        if name not in cache:
-            cache[name] = synthesize_cue(name)
-        cl, cr = cache[name]
+        variant = occ_counts.get(name, 0) % 3
+        occ_counts[name] = occ_counts.get(name, 0) + 1
+        key = (name, variant)
+        if key not in cache:
+            seed = (zlib.crc32(name.encode("utf-8")) + variant * 7919) & 0xFFFFFFFF
+            cache[key] = synthesize_cue(name, seed=seed)
+        cl, cr = cache[key]
         start_i = int(cue["time_sec"] * SR)
         if start_i >= final_len:
             continue
         gain = db_to_lin(cue["gain_db"])
+        gl, gr = _pan_gains(cue.get("pan", 0.5))
         n = min(cl.shape[0], final_len - start_i)
-        mix_l[start_i : start_i + n] += cl[:n] * gain
-        mix_r[start_i : start_i + n] += cr[:n] * gain
+        mix_l[start_i : start_i + n] += cl[:n] * (gain * gl)
+        mix_r[start_i : start_i + n] += cr[:n] * (gain * gr)
         placed += 1
 
     write_stereo_wav(mix_l, out_path, right=mix_r)
     return placed
 
 
-def _render_timeline_stdlib(cues: List[Dict], total_dur: float, out_path: Path) -> int:
-    """Fast pure-stdlib interval-sparse timeline mixer & chunked-zero WAV streamer."""
+def _render_timeline_stdlib(
+    cues: List[Dict],
+    total_dur: float,
+    out_path: Path,
+    ambience: str = "none",
+) -> int:
+    """Python 3.13-safe pure-stdlib float timeline mixer with 3-variant cache, panning, and optional ambience."""
     final_len = int(math.ceil(total_dur * SR))
-    cache: Dict[str, Tuple[List[float], List[float]]] = {}
-    base_pcm_cache: Dict[str, bytes] = {}
-    pcm_cache: Dict[Tuple[str, float], bytes] = {}
-    placements: List[Tuple[int, int, str, float]] = []
+    cache: Dict[Tuple[str, int], Tuple[List[float], List[float]]] = {}
+    occ_counts: Dict[str, int] = {}
+    placements: List[Tuple[int, int, str, int, float, float]] = []
 
     for cue in cues:
         name = cue["sfx"]
@@ -1318,23 +1689,27 @@ def _render_timeline_stdlib(cues: List[Dict], total_dur: float, out_path: Path) 
         if name not in STDLIB_GENERATORS:
             print(f"Warning: skipping unknown SFX cue '{name}' at {cue['time_sec']:.2f}s", file=sys.stderr)
             continue
-        if name not in cache:
-            cache[name] = synthesize_cue(name)
+        variant = occ_counts.get(name, 0) % 3
+        occ_counts[name] = occ_counts.get(name, 0) + 1
+        key = (name, variant)
+        if key not in cache:
+            seed = (zlib.crc32(name.encode("utf-8")) + variant * 7919) & 0xFFFFFFFF
+            cache[key] = synthesize_cue(name, seed=seed)
         start_i = int(cue["time_sec"] * SR)
         if start_i >= final_len:
             continue
-        cl = cache[name][0]
+        cl = cache[key][0]
         end_i = min(final_len, start_i + len(cl))
         if end_i <= start_i:
             continue
-        placements.append((start_i, end_i, name, float(cue["gain_db"])))
+        placements.append((start_i, end_i, name, variant, float(cue["gain_db"]), float(cue.get("pan", 0.5))))
 
     placements.sort(key=lambda x: x[0])
 
     # Merge overlapping placements into disjoint active spans
-    spans: List[Tuple[int, int, List[Tuple[int, int, str, float]]]] = []
+    spans: List[Tuple[int, int, List[Tuple[int, int, str, int, float, float]]]] = []
     for item in placements:
-        s, e, _, _ = item
+        s, e = item[0], item[1]
         if spans and s < spans[-1][1]:
             prev_s, prev_e, group = spans[-1]
             group.append(item)
@@ -1342,21 +1717,55 @@ def _render_timeline_stdlib(cues: List[Dict], total_dur: float, out_path: Path) 
         else:
             spans.append((s, e, [item]))
 
-    def _get_base_pcm(name: str) -> bytes:
-        if name not in base_pcm_cache:
-            cl, cr = cache[name]
-            base_pcm_cache[name] = _pack_stereo_pcm_stdlib(cl, cr, gain=1.0)
-        return base_pcm_cache[name]
+    has_amb = bool(ambience and ambience != "none")
+    amb_l: List[float] = []
+    amb_r: List[float] = []
+    amb_len = 0
+    fade_n = min(final_len // 4, int(0.25 * SR))
+    if has_amb:
+        amb_l, amb_r = _synth_ambience_loop_stdlib(ambience)
+        amb_len = len(amb_l)
+
+    def _amb_sample_slice(start_f: int, length: int) -> Tuple[List[float], List[float]]:
+        if not has_amb or amb_len == 0:
+            return [0.0] * length, [0.0] * length
+        bl = [0.0] * length
+        br = [0.0] * length
+        cos = math.cos
+        pi = math.pi
+        for j in range(length):
+            g_idx = start_f + j
+            k = g_idx % amb_len
+            fg = 1.0
+            if fade_n > 1:
+                if g_idx < fade_n:
+                    fg = 0.5 - 0.5 * cos(pi * g_idx / fade_n)
+                elif g_idx >= final_len - fade_n:
+                    rem = final_len - 1 - g_idx
+                    fg = 0.5 - 0.5 * cos(pi * rem / fade_n)
+            bl[j] = amb_l[k] * fg
+            br[j] = amb_r[k] * fg
+        return bl, br
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     zero_block_frames = 65536
     zero_block = bytes(zero_block_frames * 4)
 
-    def _write_zeros(wf: wave.Wave_write, frames: int) -> None:
+    def _write_gap(wf: wave.Wave_write, start_f: int, frames: int) -> None:
+        if not has_amb:
+            rem = frames
+            while rem > 0:
+                chunk = min(rem, zero_block_frames)
+                wf.writeframes(zero_block if chunk == zero_block_frames else bytes(chunk * 4))
+                rem -= chunk
+            return
+        pos = start_f
         rem = frames
         while rem > 0:
             chunk = min(rem, zero_block_frames)
-            wf.writeframes(zero_block if chunk == zero_block_frames else bytes(chunk * 4))
+            bl, br = _amb_sample_slice(pos, chunk)
+            wf.writeframes(_pack_stereo_pcm_stdlib(bl, br))
+            pos += chunk
             rem -= chunk
 
     cursor = 0
@@ -1367,52 +1776,26 @@ def _render_timeline_stdlib(cues: List[Dict], total_dur: float, out_path: Path) 
 
         for span_s, span_e, group in spans:
             if span_s > cursor:
-                _write_zeros(wf, span_s - cursor)
+                _write_gap(wf, cursor, span_s - cursor)
 
             span_len = span_e - span_s
-            if len(group) == 1:
-                s_i, e_i, name, gain_db = group[0]
-                needed_bytes = (e_i - s_i) * 4
+            buf_l, buf_r = _amb_sample_slice(span_s, span_len)
+            for s_i, e_i, name, variant, gain_db, pan in group:
+                cl, cr = cache[(name, variant)]
                 gain = db_to_lin(gain_db)
-                if HAS_AUDIOOP and gain <= 1.0:
-                    raw = _get_base_pcm(name)[:needed_bytes]
-                    wf.writeframes(audioop.mul(raw, 2, gain) if gain != 1.0 else raw)
-                else:
-                    g_key = round(gain_db, 2)
-                    cache_key = (name, g_key)
-                    if cache_key not in pcm_cache:
-                        cl, cr = cache[name]
-                        pcm_cache[cache_key] = _pack_stereo_pcm_stdlib(cl, cr, gain=db_to_lin(g_key))
-                    wf.writeframes(pcm_cache[cache_key][:needed_bytes])
-            elif HAS_AUDIOOP and all(db_to_lin(g[3]) <= 1.0 for g in group):
-                span_buf = bytearray(span_len * 4)
-                for s_i, e_i, name, gain_db in group:
-                    n_bytes = (e_i - s_i) * 4
-                    off_b = (s_i - span_s) * 4
-                    seg = _get_base_pcm(name)[:n_bytes]
-                    gain = db_to_lin(gain_db)
-                    if gain != 1.0:
-                        seg = audioop.mul(seg, 2, gain)
-                    mixed = audioop.add(bytes(span_buf[off_b : off_b + n_bytes]), seg, 2)
-                    span_buf[off_b : off_b + n_bytes] = mixed
-                wf.writeframes(bytes(span_buf))
-            else:
-                buf_l = [0.0] * span_len
-                buf_r = [0.0] * span_len
-                for s_i, e_i, name, gain_db in group:
-                    cl, cr = cache[name]
-                    gain = db_to_lin(gain_db)
-                    off = s_i - span_s
-                    n = e_i - s_i
-                    for j in range(n):
-                        buf_l[off + j] += cl[j] * gain
-                        buf_r[off + j] += cr[j] * gain
-                wf.writeframes(_pack_stereo_pcm_stdlib(buf_l, buf_r))
-
+                gl, gr = _pan_gains(pan)
+                g_l = gain * gl
+                g_r = gain * gr
+                off = s_i - span_s
+                n = e_i - s_i
+                for j in range(n):
+                    buf_l[off + j] += cl[j] * g_l
+                    buf_r[off + j] += cr[j] * g_r
+            wf.writeframes(_pack_stereo_pcm_stdlib(buf_l, buf_r))
             cursor = span_e
 
         if cursor < final_len:
-            _write_zeros(wf, final_len - cursor)
+            _write_gap(wf, cursor, final_len - cursor)
 
     return len(placements)
 
@@ -1436,8 +1819,9 @@ def load_cues(timings_path: Path) -> Tuple[List[Dict], float]:
             continue
         base_t = float(item.get("time_sec", item.get("start_sec", 0.0)))
         offset = float(item.get("sfx_offset_sec", 0.0))
-        gain_db = float(item.get("sfx_gain_db", item.get("gain_db", -2.5)))
-        cues.append({"time_sec": max(0.0, base_t + offset), "sfx": sfx, "gain_db": gain_db})
+        gain_db = float(item.get("sfx_gain_db", item.get("gain_db", -3.0)))
+        pan = max(0.0, min(1.0, float(item.get("sfx_pan", item.get("pan", 0.5)))))
+        cues.append({"time_sec": max(0.0, base_t + offset), "sfx": sfx, "gain_db": gain_db, "pan": pan})
         end_t = float(item.get("end_sec", base_t + float(item.get("duration_sec", 1.5))))
         total_dur = max(total_dur, end_t)
 
@@ -1452,7 +1836,13 @@ def main() -> int:
     parser.add_argument("--cue", help="Render a single SFX cue to --out.")
     parser.add_argument("--timings", help="Path to shot_timings.json or cue list JSON.")
     parser.add_argument("--duration", type=float, default=0.0, help="Override timeline duration in seconds.")
-    parser.add_argument("--gain-db", type=float, default=-2.0, help="Single-cue gain in dB (default: -2.0).")
+    parser.add_argument("--gain-db", type=float, default=-3.0, help="Single-cue gain in dB (default: -3.0).")
+    parser.add_argument(
+        "--ambience",
+        choices=AMBIENCE_PRESETS,
+        default="none",
+        help="Optional continuous -36 dBFS stereo room-tone bed mixed into timeline WAV (default: none).",
+    )
     parser.add_argument("--out", help="Output WAV path.")
     args = parser.parse_args()
 
@@ -1494,11 +1884,12 @@ def main() -> int:
         cues, inferred_dur = load_cues(Path(args.timings))
         total_dur = max(args.duration, inferred_dur, 1.0)
         if HAS_NUMPY:
-            placed = _render_timeline_numpy(cues, total_dur, out_path)
+            placed = _render_timeline_numpy(cues, total_dur, out_path, ambience=args.ambience)
         else:
-            placed = _render_timeline_stdlib(cues, total_dur, out_path)
+            placed = _render_timeline_stdlib(cues, total_dur, out_path, ambience=args.ambience)
         engine_tag = "numpy" if HAS_NUMPY else "stdlib"
-        print(f"Rendered {placed} SFX cues ({total_dur:.2f}s, {engine_tag}) to {out_path}")
+        amb_tag = f", ambience={args.ambience}" if args.ambience != "none" else ""
+        print(f"Rendered {placed} SFX cues ({total_dur:.2f}s, {engine_tag}{amb_tag}) to {out_path}")
         return 0
 
     parser.error("Provide either --cue or --timings")

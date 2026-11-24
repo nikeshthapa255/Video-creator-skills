@@ -15,13 +15,14 @@ Retrieval cascade:
 Post-processing (applied to EVERY track source):
   - Loops shorter tracks or trims longer ones to exact --duration
   - Converts to 48 kHz 16-bit stereo PCM WAV
-  - Applies gentle speech-friendly warmth (highpass=f=45, lowpass=f=7000)
+  - Applies gentle speech-friendly warmth (highpass=f=45, lowpass=f=10500)
   - Normalizes to consistent subtle loudness (--target-lufs, default -22.0 LUFS)
   - Applies smooth fade-in and fade-out after normalization
 
 Examples:
   python3 retrieve_music.py --mood dramatic_news --duration 42 --out audio/bgm.wav
   python3 retrieve_music.py --mood cinematic_tension --query "cyber leak" --library-dir ~/music --duration 38 --out audio/bgm.wav
+  python3 retrieve_music.py --mood palace_drama --timings audio/shot_timings.json --duration 180 --out audio/bgm.wav
   python3 retrieve_music.py --track-file ~/music/news_bed.mp3 --duration 40 --out audio/bgm.wav
 """
 
@@ -46,7 +47,9 @@ MOODS = (
     "cinematic_tension",
     "comedy_quirk",
     "dramatic_news",
+    "epic_story",
     "miami_pop",
+    "palace_drama",
     "retro_drive",
     "tech_pulse",
 )
@@ -58,6 +61,8 @@ MOOD_KEYWORDS: Dict[str, List[str]] = {
     "retro_drive": ["retro", "synthwave", "drive", "80s", "outrun", "vaporwave"],
     "tech_pulse": ["tech", "pulse", "electronic", "minimal", "modern", "startup", "ai"],
     "comedy_quirk": ["comedy", "quirk", "quirky", "playful", "funny", "marimba", "cartoon"],
+    "palace_drama": ["palace", "drama", "guzheng", "erhu", "historical", "imperial", "dynasty", "chinese", "asian", "ancient", "court"],
+    "epic_story": ["epic", "story", "orchestral", "cinematic", "narrative", "documentary", "dramatic", "strings", "emotional", "heroic"],
 }
 
 USER_AGENT = "viral-animated-shorts/2.1 (+https://github.com/)"
@@ -204,18 +209,26 @@ def try_optional_api_search(mood: str, query: str, cache_dir: Path) -> Optional[
     return None
 
 
-def run_make_bgm_fallback(mood: str, duration: float, raw_wav: Path) -> Path:
+def run_make_bgm_fallback(
+    mood: str,
+    duration: float,
+    raw_wav: Path,
+    timings: Optional[str] = None,
+) -> Path:
     make_bgm = SCRIPT_DIR / "make_bgm.py"
     if not make_bgm.exists():
         raise FileNotFoundError(f"Fallback generator not found: {make_bgm}")
+    cmd = [
+        sys.executable,
+        str(make_bgm),
+        "--mood", mood,
+        "--duration", f"{duration:.3f}",
+        "--out", str(raw_wav),
+    ]
+    if timings:
+        cmd.extend(["--timings", str(timings)])
     subprocess.run(
-        [
-            sys.executable,
-            str(make_bgm),
-            "--mood", mood,
-            "--duration", f"{duration:.3f}",
-            "--out", str(raw_wav),
-        ],
+        cmd,
         check=True,
         stdout=subprocess.DEVNULL,
     )
@@ -255,13 +268,13 @@ def postprocess_bgm(
         stage1 = Path(tmp) / "stage1.wav"
         in_args = ["-stream_loop", "-1", "-i", str(raw_path)] if needs_loop else ["-i", str(raw_path)]
 
-        # Stage 1: exact duration (loop or trim), 48 kHz stereo PCM, warm speech-friendly EQ
+        # Stage 1: exact duration (loop or trim), 48 kHz stereo PCM, warm acoustic-preserving EQ
         subprocess.run(
             [
                 "ffmpeg", "-y", "-v", "error",
                 *in_args,
                 "-t", f"{duration:.3f}",
-                "-af", "highpass=f=45,lowpass=f=7000",
+                "-af", "highpass=f=45,lowpass=f=10500",
                 "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le",
                 str(stage1),
             ],
@@ -330,6 +343,11 @@ def main() -> int:
     parser.add_argument("--query", default="", help="Optional search/match keywords (e.g. 'ai leak breaking news').")
     parser.add_argument("--duration", type=float, required=True, help="Target output duration in seconds (> 0).")
     parser.add_argument("--out", required=True, help="Output stereo 48 kHz WAV path.")
+    parser.add_argument(
+        "--timings",
+        default="",
+        help="Optional shot_timings.json forwarded to make_bgm.py fallback for Act-aware long-form scoring.",
+    )
     parser.add_argument("--track-file", default="", help="Explicit local instrumental audio file path.")
     parser.add_argument("--url", default="", help="Explicit HTTP/HTTPS URL to an instrumental audio file (cached).")
     parser.add_argument(
@@ -410,9 +428,10 @@ def main() -> int:
         # 5. Deterministic zero-API-key fallback via make_bgm.py
         if raw_path is None:
             fallback_wav = tmp_dir / f"fallback_{args.mood}.wav"
-            raw_path = run_make_bgm_fallback(args.mood, args.duration, fallback_wav)
+            timings_arg = args.timings.strip() or None
+            raw_path = run_make_bgm_fallback(args.mood, args.duration, fallback_wav, timings=timings_arg)
             selected_source = "procedural_make_bgm"
-            selected_detail = f"make_bgm.py --mood {args.mood}"
+            selected_detail = f"make_bgm.py --mood {args.mood}" + (f" --timings {timings_arg}" if timings_arg else "")
 
         pp_meta = postprocess_bgm(
             raw_path=raw_path,

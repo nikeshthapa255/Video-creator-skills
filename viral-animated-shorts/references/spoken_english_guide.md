@@ -62,24 +62,25 @@ Write narration the way a sharp friend tells a wild story out loud, instead of l
 ## What to keep (do not over-correct)
 
 Do not strip the script down into stiff, robotic telegraphese. Keep:
-- **Natural contractions** (`it's`, `don't`, `won't`, `you're`, `couldn't`), saving uncontracted words for comedic stress (`"He did NOT pay"`).
+- **Natural contractions** (`it's`, `don't`, `won't`, `you're`, `couldn't`), using uncontracted words (`"He did not pay"`) or a short pause/exclamation for stress. **Avoid ALL-CAPS emphasis on short words** (`US`, `IT`, `IN`, `ON`, `OR`, `AM`, `NOT`), because neural TTS often spells them out as acronyms or state names (`"U.S."`, `"I.T."`, `"Oregon"`).
 - **Specific visual comedy** (`"ten roasted chickens"`, `"parallel parks inside a police barricade"`, `"Just steal a rusty scooter. It can't dial the cops."`).
 - **Voice and real escalations:** Keep character attitude and real comedic rule-of-three escalations (three escalating gags are comedy; three filler adjectives like `"fast, sleek, and innovative"` are slop).
 - **Real contrasts:** Keep a contrast when both halves add new facts or correct a real misconception.
 
-## Long-form multi-character dialogue and Act pacing
+## Scripted drama, multi-character dialogue, and silent beats (`script_genre: "drama"`)
 
-When writing 3-15+ minute multi-act episodes (`video_format: "long_form"`):
-- **Differentiate character rhythm, not just TTS voice:** Give each character distinct sentence length and diction (for example, crisp measured commands for authority figures, clipped taunts for rivals, economical narration between dialogue beats) so scenes play like a real screenplay rather than one narrator reading every part.
-- **Let Act breaks breathe:** End each Act on a concrete turning point or question and give that final shot `post_gap_sec: 0.25` (vertical drama) or `0.35` (16:9 episode) so the viewer absorbs the turn before the next Act starts.
-- **Keep foreign, historical, and brand names clean in `dialogue_or_vo`:** Put phonetic hints (`"Lin Wanyin": "Lin Wahn-yeen"`, `"Pei Xuan": "Pay Shwen"`, `"Hanfu": "Hahn-foo"`) in top-level `tts_pronunciations` so every Act uses the same pronunciation while captions stay cleanly spelled.
-- **Skip forced Shorts loops:** Close long-form episodes on a concrete cliffhanger (`ending_style: "cliffhanger"`) or a crisp closing thought (`ending_style: "outro"`), never a mechanical `"Which is why..."` loop back to Shot 1.
+When writing 3-15+ minute multi-act scripted fiction (`video_format: "long_form"`, `script_genre: "drama"`):
+- **Use two lanes cleanly:** Commentary/explainer voiceover uses `"script_genre": "commentary"` ("sharp friend telling a wild story"); scripted drama uses `"script_genre": "drama"` so `--lint-plan` preserves dramatic character dialogue while flagging melodrama clichés (`"mark my words"`, `"grave mistake"`, `"played right into my hands"`, `"little did she know"`, `"my blood ran cold"`, `"this ends now"`).
+- **Differentiate character rhythm, not just TTS voice:** Give each character distinct sentence length, diction, and honorifics/address forms, and keep `narrator` lines `<= 30-35%` of dramatic episodes. Never double-narrate physical actions already shown in `beats[].action`.
+- **Direct silent reaction beats:** Budget 10-15% of dramatic shots as silent holds (`dialogue_or_vo: ""`, `shot_role: "reaction"`, `duration_sec: 0.9-1.8`, paired with SFX or `bgm_cue: "drop_out"`). Avoid `...` ellipses inside `tts_text` (they cause neural TTS pitch drops); use `post_gap_sec: 0.25-0.35` or a shot cut for real dramatic pauses.
+- **Keep foreign, historical, and brand names clean in `dialogue_or_vo`:** Put phonetic hints (`"Lin Wanyin": "Lin Wahn-yeen"`, `"Pei Xuan": "Pay Shwen"`, `"Hanfu": "Hahn-foo"`) in top-level `tts_pronunciations` so every Act uses consistent pronunciation while captions stay cleanly spelled. Avoid placing two multi-word phonetic keys adjacent without punctuation.
+- **Skip forced Shorts loops:** Close long-form episodes on a concrete cliffhanger (`ending_style: "cliffhanger"`) or a crisp closing thought/End-Screen bridge (`ending_style: "outro"`), never a mechanical `"Which is why..."` loop back to Shot 1.
 
 ## Four-point read-aloud check
 
 Run `python3 scripts/tts_and_captions_v2.py --lint-plan shot_plan.json`, then read the script (or each Act) aloud before Stage 2 TTS:
-1. **Friend test:** Would you say every line out loud without tripping over legalese, missing words, buzzwords, or fast-TTS slurs (like `"legend hid"` blurring into `"legend did"`)?
-2. **Cadence:** Do shot lengths move between quick punchlines and fuller setups instead of repeating the same 10-word beat?
-3. **Display vs. TTS:** Does `dialogue_or_vo` look right on screen, with awkward acronyms, foreign names, numbers, and dates moved into `tts_pronunciations` or `tts_text`?
+1. **Friend / actor test:** Would a real person or actor say every line out loud without tripping over legalese, missing words, buzzwords, melodrama clichés, or fast-TTS slurs (like `"legend hid"` blurring into `"legend did"`)?
+2. **Cadence & silence:** Do shot lengths move between quick punchlines, fuller setups, and breathing/reaction beats instead of repeating the same 10-word wall of speech?
+3. **Display vs. TTS:** Does `dialogue_or_vo` look right on screen, with awkward acronyms, foreign names, numbers, and dates moved into `tts_pronunciations` or `tts_text`, and zero risky ALL-CAPS 2-letter words?
 4. **Opening and ending:** Does Shot 1 hit cold at `0:00`, and does the closing beat land cleanly (a natural loop for Shorts, or a sharp cliffhanger/outro for long-form episodes)?
 

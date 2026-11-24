@@ -78,27 +78,27 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
 - Ground every proper name with a quick role on first mention (for example, `Education Minister Choi`), and keep one Short to one clear thread (or introduce both beats in Shot 1). Apply `../clear-natural-english/SKILL.md` to YouTube titles, descriptions, and pinned comments, and cut em-dash spam and recycled openers (`Be honest:`, `Imagine...`).
 
 2. Compile `<project_dir>/shot_plan.json` matching `references/shot_plan_schema.json`:
-   - Set `video_format` (`short` or `long_form`), `aspect_ratio` (`9:16` or `16:9`), `production_mode` (`omni_video`, `keyframe_motion`, or `hybrid`), `audio_mode` (`tts_plus_bgm` or `native_omni`), and `character_references_path` pointing to `<project_dir>/character_references.json`.
+   - Set `video_format` (`short` or `long_form`), `script_genre` (`commentary` or `drama`), `aspect_ratio` (`9:16` or `16:9`), `production_mode` (`omni_video`, `keyframe_motion`, or `hybrid`), `audio_mode` (`tts_plus_bgm` or `native_omni`), and `character_references_path` pointing to `<project_dir>/character_references.json`.
    - Lock one verbatim `style_bible` string and reuse it in every shot prompt. **Never write `"blank signs"`**, because models render the literal word `"BLANK"`. Always write `"unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage"` (plus local script guards like `"plain silk banners, plain scrolls, zero Chinese characters"` in historical settings).
-   - Define every character with `no_held_props_confirmed: true`, `reference_image_path` (from Stage 0), and `likeness_verified: true`. For long-form visual state changes (e.g., veiled vs. unveiled across Acts), map variant turnaround sheets in `characters[].state_sheets` and select them per shot via `shots[].character_states`.
-   - For multi-voice long-form episodes, define top-level `voice_cast` (`speaker -> {voice, rate, pitch, keyword_color}`) using `WordBoundary`-verified `edge-tts` voices (`en-GB-SoniaNeural`, `en-US-AvaNeural`, `en-GB-RyanNeural`, `en-US-EmmaNeural`, `en-GB-ThomasNeural`) and tag each shot with `speaker`, `act`, and optional `post_gap_sec` (`0.25-0.35s` on Act-closing shots).
-   - Set caption options (`9:16`: `caption_style: "kinetic_keyword"`, `max_caption_chars: 18`, `caption_font_size: 86`, `caption_margin_v: 420`, `caption_keyword_color: "auto"` or `"palace"`; `16:9`: `caption_font_size: 62`, `max_caption_chars: 36`, `caption_margin_v: 72`, `tilt: 0`, or `"none"` + `--export-srt` for YouTube CC). Add `fun_pacing_gate.natural_speech_passed: true` and `tts_pronunciations`.
-   - Set `bgm_source` (`"retrieved_track"`, `"procedural"`, or `"procedural_act_aware"`) and `bgm_mood` (`dramatic_news`, `cinematic_tension`, `miami_pop`, `retro_drive`, `tech_pulse`, `comedy_quirk`, or Act-aware long-form moods `palace_drama` and `epic_story`).
-   - Assign a synced `sfx_type` cue to punchlines, reveals, and transitions (Shorts cues: `record_scratch`, `vine_boom`, `siren_chirp`, `bonk_boing`, `cash_ching`, `ding_levelup`, `laser_zap`, `whoosh`, `pop`; cinematic/drama cues: `palace_gong`, `war_drum_hit`, `silk_whoosh`, `jade_clink`, `porcelain_shatter`, `blade_unsheathe`, `guzheng_gliss`, `fire_crackle_burst`, `court_gasp_swell`, `cinematic_riser`, `heartbeat_pulse`).
-   - For Shorts, write `loop_bridge` so the closing line connects naturally into Shot 1. For Long-Form, set `ending_style: "cliffhanger"` or `"outro"`, omit `loop_bridge`, and populate `acts[]`.
+   - Define every character with `no_held_props_confirmed: true`, `reference_image_path` (from Stage 0), and `likeness_verified: true`. For long-form visual state changes (e.g., veiled vs. unveiled across Acts), map variant turnaround sheets in `characters[].state_sheets` and select them per shot via `shots[].character_states`; register recurring interior/exterior sets in `locations[]` (Template 1E).
+   - For multi-voice long-form episodes, define top-level `voice_cast` (`speaker -> {voice, rate, pitch, keyword_color}`) using `WordBoundary`-verified `edge-tts` voices (`en-GB-SoniaNeural`, `en-US-AvaNeural`, `en-GB-RyanNeural`, `en-US-EmmaNeural`, `en-GB-ThomasNeural`) and tag each shot with `speaker`, `act`, and optional `post_gap_sec` (`0.25-0.35s` on Act-closing shots). Include 10-15% silent reaction shots (`dialogue_or_vo: ""`, `shot_role: "reaction"`) in scripted drama.
+   - Set caption options (`9:16`: `caption_style: "kinetic_keyword"`, `max_caption_chars: 18`, `caption_font_size: 86`, `caption_margin_v: 420`, `caption_keyword_color: "auto"` or `"palace"`; `16:9`: `caption_style: "none"` + `captions.srt` recommended for YouTube CC, or burned `clean_subtitle` with `caption_font_size: 62`, `max_caption_chars: 36`, `caption_margin_v: 96`, `caption_tilt: 0`). Add `fun_pacing_gate.natural_speech_passed: true` and `tts_pronunciations`.
+   - Set `bgm_source` (`"retrieved_track"`, `"procedural"`, or `"procedural_act_aware"`), `bgm_mood` (`dramatic_news`, `cinematic_tension`, `miami_pop`, `retro_drive`, `tech_pulse`, `comedy_quirk`, or Act-aware long-form moods `palace_drama` and `epic_story`), optional `ambience_bed` (`palace_courtyard`, `throne_hall`, `newsroom_air`, `hearth_embers`), and per-shot `bgm_cue` (`drop_out` / `drop_before_end` for spotted silence).
+   - Assign a synced `sfx_type` cue (plus optional `sfx_pan` `0.0..1.0`) to punchlines, reveals, and transitions (Shorts cues: `record_scratch`, `vine_boom`, `siren_chirp`, `bonk_boing`, `cash_ching`, `ding_levelup`, `laser_zap`, `whoosh`, `pop`; cinematic/drama cues: `palace_gong`, `war_drum_hit`, `silk_whoosh`, `jade_clink`, `porcelain_shatter`, `blade_unsheathe`, `guzheng_gliss`, `fire_crackle_burst`, `court_gasp_swell`, `cinematic_riser`, `heartbeat_pulse`).
+   - For Shorts, write `loop_bridge` so the closing line connects naturally into Shot 1. For Long-Form, set `ending_style: "cliffhanger"` or `"outro"` (reserving an 8-12s End-Screen slate for `16:9` outros), omit `loop_bridge`, populate `acts[]` (with `bgm_intensity`, `lighting_mood`, `rehook_question`), and plan `packaging` (thumbnails/cover + titles).
 3. Run the pre-TTS linter (required) before synthesizing voiceover. It blocks `TTS_MISREAD` risks and prints soft `[AI_SLOP_SCRIPT]` warnings:
    ```sh
    python3 scripts/tts_and_captions_v2.py --lint-plan <project_dir>/shot_plan.json
    ```
    Pass `--strict-slop` to fail with exit code `2` on any `[AI_SLOP_SCRIPT]` warning, or `--no-slop-check` to silence slop warnings during intentional parody.
-4. Confirm Beat 1 (`0-3s`), pacing (Part A2 for Shorts or Part A2-LF for Long-Form), and spoken naturalness pass `references/qa_rubric.md` before generating assets.
+4. Confirm Beat 1 (`0-3s` Shorts or Part A1-LF `0-20s` Long-Form), pacing (Part A2 or Part A2-LF), and spoken naturalness pass `references/qa_rubric.md` before generating assets.
 
-### Stage 2: Generate turnaround sheets, voiceover, captions, and audio stems
+### Stage 2: Generate turnaround/location sheets, voiceover, captions, and audio stems
 
-1. Generate one 16:9 3-panel turnaround sheet per character (`Front | 3/4 Side | Back`) using `references/sheet_prompt_templates.md` on a plain light-gray background, in a neutral pose, with zero held props. Use Template 1A for 2D stickmen, Template 1B for official product mascots anchored to Stage 0, Template 1C for stylized 3D real people, and **Template 1D for long-form multi-state variants** (e.g., `sheets/<char>_veiled.png` anchored to `sheets/<char>.png`). Compare side by side with `read_file` or `view_file`.
+1. Generate one 16:9 3-panel turnaround sheet per character (`Front | 3/4 Side | Back`) using `references/sheet_prompt_templates.md` on a plain light-gray background, in a neutral pose, with zero held props. Use Template 1A for 2D stickmen, Template 1B for official product mascots anchored to Stage 0, Template 1C for stylized 3D real people, **Template 1D for long-form multi-state variants** (`sheets/<char>_veiled.png`), and **Template 1E for recurring empty-set location plates** (`sheets/loc_<id>.png`). Compare side by side with `read_file` or `view_file`.
    - **If an image model blocks a public figure's photo:** Open the Stage 0 portrait with `read_file`, enter observable traits directly into Template 1C without attaching the raw photo, inspect side by side, and lock that sheet as the sole Stage 3 reference.
    - For Mode A, upload approved turnaround sheets once with `gemini-api files upload <sheet> --wait`.
-2. Synthesize voiceover and captions before animating so every clip matches its exact spoken duration and avoids `AUDIO_DESYNC`. `tts_and_captions_v2.py` supports single-voice Shorts, multi-voice long-form `voice_cast`, bounded concurrency (`--concurrency 4 --max-retries 4`), per-shot `post_gap_sec`, `acts[]` boundary summaries in `shot_timings.json`, and `9:16` or `16:9` ASS captions (plus `--export-srt` for YouTube CC):
+2. Synthesize voiceover and captions before animating so every clip matches its exact spoken duration and avoids `AUDIO_DESYNC`. `tts_and_captions_v2.py` supports single-voice Shorts, multi-voice long-form `voice_cast`, bounded concurrency (`--concurrency 4 --max-retries 4`), per-shot `post_gap_sec`, silent reaction beats, `acts[]` boundary summaries, validated `chapters.txt`, `9:16` or `16:9` ASS captions (`kinetic_keyword`, `karaoke_chunk`, `clean_subtitle`, or `none`), and `--export-srt` for YouTube CC:
    ```sh
    # Short-Form (9:16, single voice):
    python3 scripts/tts_and_captions_v2.py \
@@ -114,11 +114,12 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
      --out-dir <project_dir>/audio \
      --gap 0.08 --concurrency 4 --max-retries 4 --export-srt
    ```
-   This outputs `audio/voiceover.wav`, `audio/shot_timings.json` (including `acts[]`), zero-overlap `audio/captions.ass`, and optional `audio/captions.srt`.
-3. Generate SFX and BGM stems:
+   This outputs `audio/voiceover.wav`, `audio/shot_timings.json` (including `acts[]`), `audio/chapters.txt` (when `acts` present), zero-overlap `audio/captions.ass` (skipped if `caption_style == "none"`), and optional `audio/captions.srt`.
+3. Generate SFX (with optional subtle room-tone `--ambience`) and BGM stems:
    ```sh
    python3 scripts/sfx_engine.py \
      --timings <project_dir>/audio/shot_timings.json \
+     --ambience none \
      --out <project_dir>/audio/sfx_track.wav
 
    # Short-Form news/commentary BGM retrieval:
@@ -133,7 +134,7 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
      --duration <total_sec> \
      --out <project_dir>/audio/bgm.wav
 
-   # Long-Form Act-aware procedural score (palace_drama or epic_story locked to exact Act boundaries):
+   # Long-Form Act-aware procedural score (palace_drama or epic_story honoring acts[].bgm_intensity, cliffhanger & bgm_cue):
    python3 scripts/make_bgm.py \
      --mood epic_story \
      --timings <project_dir>/audio/shot_timings.json \
@@ -143,12 +144,12 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
 ### Stage 3: Generate visuals (Mode A, Mode B, or Hybrid) and animate frame-locked clips
 
 - **Rules for all modes:**
-  - Attach only the locked 3-panel turnaround sheet(s) (or active `state_sheets` variant) for characters appearing in that shot. Bind characters in natural language by upload order (never `<IMAGE_REF_N>`).
+  - Attach only the locked 3-panel turnaround sheet(s) (or active `state_sheets` variant) plus optional location anchor plate (Template 1E) for that shot. Bind references in natural language by upload order (never `<IMAGE_REF_N>`).
   - Append the verbatim `style_bible` (including `"unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage"`).
-  - Keep solo shots isolated (`SOLO character: ONLY <char> appears in this frame...`), tag insert shots (`No named lead characters appear in the foreground`), and keep 2-character shots spatially separated left/right (`Two-character confrontation...`, max 2 leads) to prevent `SOLO_CHAR_BLEED` and `MULTI_CHAR_BLEED`.
-  - **Short-Form replay loop:** On the final shot (`dual_anchor_loop: true`), attach both the character sheet and `scenes/shot_01.png` so the ending snaps cleanly back to Frame 0. **Long-Form:** Skip replay looping (`dual_anchor_loop: false`) and end on a cliffhanger or natural outro.
-- **Mode A (`omni_video`):** Render `360p` drafts (`9:16` or `16:9`) via `gemini-api video -m gemini-omni-1.2-flash` or `generate_video.py --batch jobs_360p.json`.
-- **Mode B (`keyframe_motion`):** Generate keyframes (`scenes/shot_001.png` .. `shot_NNN.png`) in the target aspect ratio (`9:16` or `16:9`) and inspect them with `read_file`. Then animate every shot to its exact spoken duration from `shot_timings.json` using 2x-supersampled FFmpeg camera presets (`whip_zoom`, `bounce_pop`, `shake_zoom`, `zoom_in`, `zoom_out`, `pan_left`, `pan_right`, `static_drift`, `slow_dolly_in`, `tilt_up`). `animate_shot_v2.py` computes global cumulative frames across all shots *before* slicing so parallel Act workers stay locked within `<= 1` frame:
+  - Keep solo shots isolated (`SOLO character: ONLY <char>...`), enforce opposing 180-degree `eyeline` directions on shot-reverse-shot dialogue (or OTS silhouettes on `16:9`), tag inserts (`No named lead characters appear in the foreground`), and keep 2-character shots spatially separated left/right (`Two-character confrontation...`, max 2 leads) to prevent `SOLO_CHAR_BLEED`, `MULTI_CHAR_BLEED`, and `EYELINE_CROSS`.
+  - **Short-Form replay loop:** On the final shot (`dual_anchor_loop: true`), attach both the character sheet and `scenes/shot_01.png` so the ending snaps cleanly back to Frame 0. **Long-Form:** Skip replay looping (`dual_anchor_loop: false`) and end on a cliffhanger or natural outro/End-Screen slate.
+- **Mode A (`omni_video`):** Render `360p` drafts (`9:16` or `16:9`) via `gemini-api video -m gemini-omni-1.2-flash` (or the `google-genai` Python SDK) into `drafts_360p/shot_XXX.mp4`. In `hybrid` mode, anchor Mode A hero shots to `scenes/shot_XXX.png`, strip audio (`-an`), trim to the exact `shot_timings.json` duration, and save as `clips/<idx:03d>_<shot_id>.mp4`.
+- **Mode B (`keyframe_motion`):** Generate keyframes (`scenes/shot_001.png` .. `shot_NNN.png`) in the target aspect ratio (`9:16` or `16:9`) and inspect them with `read_file`. Then animate every shot to its exact spoken duration from `shot_timings.json` using 2x-supersampled eased FFmpeg camera presets (`whip_zoom`, `bounce_pop`, `shake_zoom`, `zoom_in`, `zoom_out`, `pan_left`, `pan_right`, `static_drift`, `slow_dolly_in`, `tilt_up`, `tilt_down`) with `focal_anchor` support so `16:9` rule-of-thirds subjects stay framed:
   ```sh
   # Full Short or full episode with multi-threaded workers:
   python3 scripts/animate_shot_v2.py \
@@ -157,39 +158,39 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
     --out-dir <project_dir>/clips \
     --workers 4 --skip-existing
 
-  # Parallel Long-Form Act slice (auto-detects 9:16 or 16:9 from shot_timings.json):
+  # Parallel Long-Form Act slice (auto-detects 9:16 or 16:9; add --skip-omni in hybrid mode):
   python3 scripts/animate_shot_v2.py \
     --timings <project_dir>/audio/shot_timings.json \
     --scenes-dir <project_dir>/scenes \
     --out-dir <project_dir>/clips \
-    --act 5 --workers 4 --skip-existing --fade-out-last
+    --act 5 --workers 4 --skip-existing --skip-omni --fade-out-last
   ```
 
 ### Stage 4: Run multi-frame QA (max 2-3 retries per shot)
 
-1. Sample frames using video-stream duration and `-sseof` (safe against AAC padding):
+1. Sample `f_frame0`, `f_start`, `f_mid`, `f_peak`, and `f_end` (`-sseof -0.05`, safe against AAC padding):
    ```sh
    bash scripts/extract_qa_frames.sh <clip.mp4> <project_dir>/qa/<shot_id> [prev_clip.mp4]
    ```
-2. Audit sampled frames (or Mode B keyframes before animating) alongside the Stage 0 reference image, the active 3-panel turnaround/state sheet, and the previous shot's end frame against `references/qa_rubric.md`.
+2. Audit sampled frames (or Mode B keyframes before animating) alongside the Stage 0 reference image, the active 3-panel turnaround/state sheet, any location anchor plate, and the previous shot's end frame against `references/qa_rubric.md`.
 3. Diagnose failure codes and apply targeted fixes from `references/failure_fix_playbook.md`, capping retries at 3 per shot:
-   `HOOK_WEAK`, `EXTRA_LIMB`, `STYLE_DRIFT`, `OFF_MODEL_CHARACTER`, `LIKENESS_DRIFT`, `STATE_CONTINUITY_DRIFT`, `SOLO_CHAR_BLEED`, `MULTI_CHAR_BLEED`, `TEXT_WARP`, `LITERAL_BLANK_SIGN`, `TTS_MISREAD`, `VOICE_CAST_DRIFT`, `AI_SLOP_SCRIPT`, `CAPTION_OVERLAP`, `CAPTION_CLIP_HORIZONTAL`, `AUDIO_DESYNC`, `FRAME_TIMELINE_DRIFT`, `BGM_OVERPOWERS_VO`, `BGM_TONE_MISMATCH`, `ACT_BGM_FATIGUE`, `QA_FILE_TOO_LARGE`.
+   `HOOK_WEAK`, `EXTRA_LIMB`, `STYLE_DRIFT`, `OFF_MODEL_CHARACTER`, `LIKENESS_DRIFT`, `STATE_CONTINUITY_DRIFT`, `LOCATION_CONTINUITY_DRIFT`, `EYELINE_CROSS`, `SOLO_CHAR_BLEED`, `MULTI_CHAR_BLEED`, `TEXT_WARP`, `LITERAL_BLANK_SIGN`, `TTS_MISREAD`, `VOICE_CAST_DRIFT`, `AI_SLOP_SCRIPT`, `CAPTION_OVERLAP`, `CAPTION_CLIP_HORIZONTAL`, `AUDIO_DESYNC`, `FRAME_TIMELINE_DRIFT`, `BGM_OVERPOWERS_VO`, `BGM_TONE_MISMATCH`, `ACT_BGM_FATIGUE`, `QA_FILE_TOO_LARGE`.
 
 ### Stage 5: Render at `1080p` and optional 2D-to-3D upgrade
 
 1. **Mode A:** Re-render approved shots at `1080p` (`--resolution 1080p`). Mode B clips already render at `1080x1920` (9:16) or `1920x1080` (16:9) via 2x supersampling.
 2. **Optional 2D-to-3D upgrade:** Feed `<char>_2d.png` into Template 2 in `references/sheet_prompt_templates.md`, lock `<char>_3d.png`, update `style_bible`, and re-run the proven `shot_plan.json` and `audio/shot_timings.json`.
 
-### Stage 6: Mix 3-stem audio, fast-path assemble, and watch with sound
+### Stage 6: Mix 3-stem audio, fast-path assemble, package, and watch with sound
 
-1. If building captions from an `.srt` file instead of `tts_and_captions_v2.py`:
+1. If building captions from an `.srt` file (including human mic / ElevenLabs VO) instead of `tts_and_captions_v2.py`:
    ```sh
    python3 scripts/srt_to_ass.py <input.srt> <project_dir>/audio/captions.ass \
      --aspect-ratio 9:16 --font-size 86 --max-chars 18 --margin-v 420 --keyword-color auto
    ```
-2. Run `assemble_short.sh`. It verifies zero `CAPTION_OVERLAP`, auto-detects `1080x1920` vs `1920x1080` (override with `SHORTS_ASPECT_RATIO=9:16|16:9`), uses fast-path `-c copy` concat when all clips match (falling back to per-clip conform only on mismatch), burns `.ass` captions (or pass `none` for clean `16:9` + soft `.srt`), mixes 3 audio stems (`SHORTS_VO_CLARITY=1`, `SHORTS_BGM_GAIN_DB=-16` with `8500 Hz` LP and `-3.5 dB` speech-pocket carve + sidechain ducking, non-ducked SFX), runs 2-pass `-14 LUFS` `loudnorm`, and prints a mandatory post-norm loudness verification check:
+2. Run `assemble_short.sh`. It verifies zero `CAPTION_OVERLAP`, auto-detects `1080x1920` vs `1920x1080`, checks `time_base`/SAR/stereo before fast-path `-c copy` concat (falling back to per-clip conform on mismatch), burns `.ass` captions with a 2-second keyframe cadence (`-g 60`), mixes 3 stems in lossless 24-bit PCM with peak limiting (`SHORTS_VO_CLARITY=1`, single-point `SHORTS_BGM_LP_HZ=10500` / `-3.0 dB @ 2.9 kHz` BGM carve, smooth musical sidechain ducking, non-ducked SFX), runs 2-pass `-14 LUFS` `loudnorm` (`LRA=7` on `9:16`, `LRA=9` on `16:9`), and prints a mandatory post-norm loudness verification check:
    ```sh
-   SHORTS_VO_CLARITY=1 SHORTS_BGM_GAIN_DB=-16 \
+   SHORTS_VO_CLARITY=1 SHORTS_BGM_GAIN_DB=-15 \
    bash scripts/assemble_short.sh \
      <project_dir>/clips \
      <project_dir>/audio/captions.ass \
@@ -198,10 +199,10 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
      <project_dir>/audio/bgm.wav \
      <project_dir>/audio/sfx_track.wav
    ```
-   Pass `none` for any unused stem (for example, `none` for `voiceover.wav` when keeping Mode A native Omni audio, or `none` for `captions.ass` on `16:9` YouTube uploads using `captions.srt`).
-3. **Final watch-through with audio (mandatory):**
+   Pass `none` for any unused stem (for example, `none` for `voiceover.wav` when keeping Mode A native Omni audio, or `none` for `captions.ass` on `16:9` YouTube uploads using `audio/captions.srt`).
+3. **Final watch-through with audio (mandatory) & Packaging:**
    - **Short-Form (< 90s and < 80 MB):** Open `final_short.mp4` directly with `read_file` or `view_file` and verify dialogue clarity, zero `TTS_MISREAD`/`AI_SLOP_SCRIPT`, synced SFX, clean display captions, consistent likenesses, and smooth replay loop.
-   - **Long-Form (> 90s or > 80 MB):** A 5-minute 1080p MP4 exceeds the `100 MB` `view_file` limit. Slice it into lossless 60-second review chunks, 10 keyframe screenshots, LUFS audit, and `chapters.txt` first:
+   - **Long-Form (> 90s or > 80 MB):** Slice into lossless 60-second review chunks, 10 keyframe screenshots, full + per-segment LUFS audit, and validated `chapters.txt`:
      ```sh
      bash scripts/split_qa_segments.sh \
        <project_dir>/final_episode.mp4 \
@@ -209,15 +210,16 @@ Follow `references/spoken_english_guide.md` and the sibling `../clear-natural-en
        --timings <project_dir>/audio/shot_timings.json
      ```
      Watch **every** `qa_segments/qa_min*.mp4` chunk with audio via `view_file` (or in parallel across QA subagents) and audit `qa_segments/screenshots/frame_*.png`.
+   - Export creator packaging (`packaging.md` titles/description/pinned comment/AI disclosure + 2-3 A/B `16:9` thumbnails or `9:16` cover frame).
 
 ## Long-Form Video Mode (3-15+ min parallel swarm summary)
 
 For full long-form specifications, read `references/long_form_guide.md`. Key rules that prevent failures at 60-180+ shot scale:
 
-1. **Coordinator locks truth before fanning out:** Stage 0 references, base + state turnaround sheets (`characters[].state_sheets`), merged `shot_plan.json` (from parallel `acts/act_01.json..act_0N.json` writers), `voice_cast` (with calibrated `+13%..+18%` rates for brisk 5-min drama, `--gap 0.08`, and `post_gap_sec: 0.25` on Act breaks), `audio/voiceover.wav`, `audio/shot_timings.json`, `audio/bgm.wav` (`make_bgm.py --timings`), and `audio/sfx_track.wav`.
-2. **Parallel Act workers (keyframes + animation):** Assign one subagent per Act to generate `scenes/shot_XXX.png` (keeping >= 85% of shots to 0-1 lead characters, flipping `negative_constraints` at state-change cuts) and animate via `animate_shot_v2.py --act <N> --workers 4 --skip-existing` (globally frame-locked with `<= 1` frame drift across the entire episode).
-3. **Fast-path assembly + chunked multimodal QA:** Assemble with `-c copy` fast-path (`assemble_short.sh`), slice into 60-second chunks (`split_qa_segments.sh`), and inspect every minute with audio in parallel.
-4. **Series Bible handoff (`README_series_bible.md`):** For serialized multi-episode stories, save an episode context bundle (`README_series_bible.md`, `sheets/`, `shot_plan.json`, `shot_timings.json`, `captions.ass`) documenting end-of-episode plot, costume/prop continuity states, locked `style_bible`, `voice_cast`, and `tts_pronunciations` for Episode 2+.
+1. **Coordinator locks truth before fanning out:** Stage 0 references, base + state turnaround sheets (`characters[].state_sheets`), recurring location plates (`locations[]`, Template 1E), Writers' Packet (voice cards, per-Act knowledge gate, setup/payoff ledger), merged `shot_plan.json`, calibrated `voice_cast`, `audio/voiceover.wav`, `audio/shot_timings.json`, `audio/chapters.txt`, `audio/bgm.wav` (`make_bgm.py --timings`), and `audio/sfx_track.wav` (with optional `--ambience`).
+2. **Parallel Act workers (keyframes + animation):** Assign one subagent per Act to generate `scenes/shot_XXX.png` (keeping `>= 85%` of shots to 0-1 lead characters, flipping `negative_constraints` at state-change cuts, matching 180-degree `eyeline`s) and animate via `animate_shot_v2.py --act <N> --workers 4 --skip-existing` (add `--skip-omni` in `hybrid` mode; globally frame-locked within `<= 1` frame).
+3. **Fast-path assembly + chunked multimodal QA:** Assemble with `assemble_short.sh`, slice into 60-second chunks (`split_qa_segments.sh`), and inspect every minute with audio in parallel.
+4. **Series Bible handoff (`README_series_bible.md`):** For serialized multi-episode stories, archive `README_series_bible.md` alongside `sheets/`, `shot_plan.json`, `shot_timings.json`, and `captions.ass` documenting plot/cliffhanger + Ep 2 cold-open entry, character states + voice cards, secrets matrix, unresolved setup/payoff ledger, `style_bible`, `locations[]`, `voice_cast`, and `tts_pronunciations`.
 
 ## Series and batch production (subagent playbook)
 
