@@ -1,0 +1,18 @@
+# Local trip media, working intermediates, and rendered films (never commit personal data)
+work/
+output/
+*.mp4
+*.mov
+*.MOV
+*.mp3
+*.wav
+*.m4a
+*.heic
+*.HEIC
+
+# Dependencies & OS files
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+.env

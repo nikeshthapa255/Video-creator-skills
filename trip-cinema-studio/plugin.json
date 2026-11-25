@@ -1,0 +1,12 @@
+{
+  "name": "trip-cinema-studio",
+  "displayName": "Trip Cinema Studio",
+  "version": "0.1.0",
+  "repository": "https://github.com/nikeshthapa255/Video-creator-skills",
+  "description": "Turn raw trip photos and video clips into a finished 16:9 cinematic travel film with EXIF chaptering, interactive 4-gate artifacts, Remotion route maps, and -14 LUFS mastering.",
+  "suggestedPrompts": [
+    "Turn my trip photos and clips in ./my-trip into a 16:9 cinematic travel film using the 4-gate review workflow",
+    "Download my travel album from this Google Drive folder URL and produce a 2-minute cinematic highlight film with a $0 local-only render",
+    "Run preflight checks for Trip Cinema Studio and show me which media tools are installed"
+  ]
+}

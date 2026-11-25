@@ -1,0 +1,370 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Zero-dependency macOS Native 3x3 Contact Sheet Generator for Gate 1.
+ * Uses CoreImage (kCIImageApplyOrientationProperty), qlmanage for video
+ * thumbnails (native rotation + HDR tone-mapping), and AppKit.
+ *
+ * Usage:
+ *   osascript -l JavaScript macos_contact_sheets.jxa \
+ *     --audit ./work/env_and_media_audit.json \
+ *     --out-dir ./work/contact_sheets \
+ *     --artifact-dir /path/to/artifact/contact_sheets \
+ *     --index-out ./work/contact_sheet_index.json \
+ *     [--only-chapters videos_undated,day2_2026-07-04]
+ */
+
+ObjC.import("Foundation");
+ObjC.import("CoreImage");
+ObjC.import("ImageIO");
+ObjC.import("AVFoundation");
+ObjC.import("CoreMedia");
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+function parseArgs(argv) {
+  const args = {
+    audit: null,
+    outDir: "./work/contact_sheets",
+    artifactDir: null,
+    indexOut: "./work/contact_sheet_index.json",
+    onlyChapters: null,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--audit") args.audit = argv[++i];
+    else if (a === "--out-dir") args.outDir = argv[++i];
+    else if (a === "--artifact-dir") args.artifactDir = argv[++i];
+    else if (a === "--index-out") args.indexOut = argv[++i];
+    else if (a === "--only-chapters") {
+      args.onlyChapters = new Set(
+        argv[++i]
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+    }
+  }
+  return args;
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function ensureDir(dirPath) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function writeTextFile(path, text) {
+  const parent = $(path).stringByDeletingLastPathComponent;
+  ensureDir(parent);
+  $(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+}
+
+function assignChapter(fileItem) {
+  const dateStr = fileItem.date_ist || "";
+  const dateOnly = dateStr.slice(0, 10);
+  if (fileItem.type === "video" && fileItem.date_source !== "mdls_content_creation") {
+    return "videos_undated";
+  }
+  if (dateOnly === "2026-07-03") return "day1_2026-07-03";
+  if (dateOnly === "2026-07-04") return "day2_2026-07-04";
+  if (dateOnly === "2026-07-05") return "day3_2026-07-05";
+  if (dateOnly === "2026-07-06") return "day4_2026-07-06";
+  if (fileItem.type === "video") return "videos_undated";
+  return dateOnly ? "day_" + dateOnly : "undated";
+}
+
+function loadImageThumb(ciCtx, filePath, maxPx) {
+  try {
+    const url = $.NSURL.fileURLWithPath(filePath);
+    const opts = $.NSMutableDictionary.dictionary;
+    opts.setObjectForKey($.NSNumber.numberWithBool(true), $.kCIImageApplyOrientationProperty);
+    let img = $.CIImage.imageWithContentsOfURLOptions(url, opts);
+    if (!img) return null;
+
+    const ext = img.extent;
+    if (ext.origin.x !== 0 || ext.origin.y !== 0) {
+      img = img.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y));
+    }
+    const w = img.extent.size.width;
+    const h = img.extent.size.height;
+    if (w <= 0 || h <= 0) return null;
+
+    const scale = Math.min(1.0, maxPx / Math.max(w, h));
+    if (scale < 1.0) {
+      img = img.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
+    }
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+    const cgImg = ciCtx.createCGImageFromRect(img, $.CGRectMake(0, 0, outW, outH));
+    if (!cgImg) return null;
+    return $.NSImage.alloc.initWithCGImageSize(cgImg, $.NSZeroSize);
+  } catch (e) {
+    return null;
+  }
+}
+
+function loadVideoMidFrame(filePath, durationSec) {
+  try {
+    const AVURLAsset = $.NSClassFromString("AVURLAsset");
+    const AVAssetImageGenerator = $.NSClassFromString("AVAssetImageGenerator");
+    const url = $.NSURL.fileURLWithPath(filePath);
+    const asset = AVURLAsset.URLAssetWithURLOptions(url, $({}));
+    const gen = AVAssetImageGenerator.assetImageGeneratorWithAsset(asset);
+    gen.appliesPreferredTrackTransform = true;
+    gen.maximumSize = $.CGSizeMake(640, 640);
+    gen.requestedTimeToleranceBefore = $.kCMTimePositiveInfinity;
+    gen.requestedTimeToleranceAfter = $.kCMTimePositiveInfinity;
+
+    let cgImg = null;
+    if (durationSec && durationSec > 0.2) {
+      try {
+        cgImg = gen.copyCGImageAtTimeActualTimeError($.CMTimeMakeWithSeconds(durationSec * 0.5, 600), null, null);
+      } catch (e) {
+        cgImg = null;
+      }
+    }
+    if (!cgImg) {
+      cgImg = gen.copyCGImageAtTimeActualTimeError($.kCMTimeZero, null, null);
+    }
+    if (!cgImg) return null;
+    return $.NSImage.alloc.initWithCGImageSize(cgImg, $.NSZeroSize);
+  } catch (e) {
+    return null;
+  }
+}
+
+function drawAspectFit(nsImg, x, y, boxW, boxH) {
+  const sz = nsImg.size;
+  if (!sz || sz.width <= 0 || sz.height <= 0) return;
+  const scale = Math.min(boxW / sz.width, boxH / sz.height);
+  const drawW = sz.width * scale;
+  const drawH = sz.height * scale;
+  const dx = x + (boxW - drawW) / 2.0;
+  const dy = y + (boxH - drawH) / 2.0;
+  nsImg.drawInRectFromRectOperationFraction(
+    $.NSMakeRect(dx, dy, drawW, drawH),
+    $.NSZeroRect,
+    $.NSCompositingOperationSourceOver,
+    1.0
+  );
+}
+
+function saveCanvasJPEG(canvas, outPath) {
+  const tiff = canvas.TIFFRepresentation;
+  const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+  const jpg = rep.representationUsingTypeProperties(
+    $.NSBitmapImageFileTypeJPEG,
+    $({ NSImageCompressionFactor: 0.88 })
+  );
+  jpg.writeToFileAtomically(outPath, true);
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify({
+      usage: "osascript -l JavaScript macos_contact_sheets.jxa --audit <env_and_media_audit.json> [--out-dir ./work/contact_sheets] [--artifact-dir <dir>] [--index-out ./work/contact_sheet_index.json] [--only-chapters ch1,ch2]",
+    }, null, 2);
+  }
+  if (!args.audit) throw new Error("Missing --audit <env_and_media_audit.json>.");
+
+  const audit = readJsonFile(args.audit);
+  const srcFolder = audit.source_folder;
+  const rawFiles = audit.files || [];
+
+  ensureDir(args.outDir);
+  if (args.artifactDir) ensureDir(args.artifactDir);
+
+  const chapterOrder = [
+    "day1_2026-07-03",
+    "day2_2026-07-04",
+    "day3_2026-07-05",
+    "day4_2026-07-06",
+    "videos_undated",
+  ];
+  const groups = {};
+  for (const ch of chapterOrder) groups[ch] = [];
+
+  for (const f of rawFiles) {
+    const ch = assignChapter(f);
+    if (!groups[ch]) groups[ch] = [];
+    groups[ch].push({
+      ...f,
+      chapter: ch,
+      source_path: srcFolder + "/" + f.filename,
+    });
+  }
+
+  for (const ch of Object.keys(groups)) {
+    groups[ch].sort((a, b) => {
+      const da = a.date_ist || "";
+      const db = b.date_ist || "";
+      if (da !== db) return da < db ? -1 : 1;
+      return a.filename < b.filename ? -1 : 1;
+    });
+  }
+
+  const ciCtx = $.CIContext.contextWithOptions($({}));
+  const sheetW = 1800;
+  const sheetH = 1200;
+  const cellW = 600;
+  const cellH = 400;
+  const labelH = 34;
+
+  const generatedSheets = [];
+  const indexEntries = [];
+  let globalIdx = 1;
+
+  const allChapters = chapterOrder.concat(Object.keys(groups).filter((k) => chapterOrder.indexOf(k) === -1));
+
+  for (const ch of allChapters) {
+    const items = groups[ch] || [];
+    if (items.length === 0) continue;
+
+    const shouldRender = !args.onlyChapters || args.onlyChapters.has(ch);
+    const totalPages = Math.ceil(items.length / 9);
+
+    for (let page = 0; page < totalPages; page++) {
+      const chunk = items.slice(page * 9, (page + 1) * 9);
+      const sheetName = ch + "_p" + String(page + 1).padStart(2, "0") + ".jpg";
+      const sheetPath = args.outDir + "/" + sheetName;
+
+      if (!shouldRender) {
+        for (let slot = 0; slot < chunk.length; slot++) {
+          const item = chunk[slot];
+          const idxNum = globalIdx++;
+          indexEntries.push({
+            index: idxNum,
+            filename: item.filename,
+            source_path: item.source_path,
+            chapter: ch,
+            type: item.type,
+            camera: [item.make, item.model].filter(Boolean).join(" ") || "Unknown",
+            width: item.width,
+            height: item.height,
+            orientation: item.orientation,
+            gps_lat: item.gps_lat,
+            gps_lon: item.gps_lon,
+            date_ist: item.date_ist,
+            duration_sec: item.duration_sec,
+            contact_sheet: sheetPath,
+            sheet_slot: slot + 1,
+          });
+        }
+        continue;
+      }
+
+      const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(sheetW, sheetH));
+      canvas.lockFocus;
+
+      // #141414 dark background
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.078, 0.078, 0.078, 1.0).setFill;
+      $.NSBezierPath.fillRect($.NSMakeRect(0, 0, sheetW, sheetH));
+
+      const labelAttrs = $({
+        NSFont: $.NSFont.monospacedSystemFontOfSizeWeight(13, $.NSFontWeightSemibold),
+        NSForegroundColorAttributeName: $.NSColor.whiteColor,
+      });
+      const placeholderAttrs = $({
+        NSFont: $.NSFont.systemFontOfSizeWeight(16, $.NSFontWeightMedium),
+        NSForegroundColorAttributeName: $.NSColor.colorWithCalibratedWhiteAlpha(0.65, 1.0),
+      });
+
+      for (let slot = 0; slot < chunk.length; slot++) {
+        const item = chunk[slot];
+        const idxNum = globalIdx++;
+        const col = slot % 3;
+        const row = Math.floor(slot / 3);
+        const cellX = col * cellW;
+        const cellY = sheetH - (row + 1) * cellH; // AppKit bottom-left origin
+
+        $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.16, 0.16, 0.18, 1.0).setStroke;
+        const border = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(cellX + 2, cellY + 2, cellW - 4, cellH - 4));
+        border.lineWidth = 1.0;
+        border.stroke;
+
+        const thumb = item.type === "video"
+          ? loadVideoMidFrame(item.source_path, item.duration_sec)
+          : loadImageThumb(ciCtx, item.source_path, 600);
+
+        if (thumb) {
+          drawAspectFit(thumb, cellX + 6, cellY + labelH + 4, cellW - 12, cellH - labelH - 10);
+        } else {
+          $("[Unreadable Frame]").drawAtPointWithAttributes(
+            $.NSMakePoint(cellX + 220, cellY + cellH / 2),
+            placeholderAttrs
+          );
+        }
+
+        $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.05, 0.06, 0.92).setFill;
+        $.NSBezierPath.fillRect($.NSMakeRect(cellX + 2, cellY + 2, cellW - 4, labelH));
+
+        const dims = (item.width || "?") + "x" + (item.height || "?");
+        const tag = item.type === "video"
+          ? "VID " + (item.duration_sec !== null && item.duration_sec !== undefined ? Number(item.duration_sec).toFixed(1) + "s" : "?s")
+          : (item.date_ist ? item.date_ist.slice(0, 16) : "undated");
+        const shortName = item.filename.length > 26 ? item.filename.slice(0, 23) + "..." : item.filename;
+        const label = "#" + idxNum + " | " + shortName + " | " + dims + " | " + tag;
+
+        $(label).drawAtPointWithAttributes($.NSMakePoint(cellX + 10, cellY + 10), labelAttrs);
+
+        indexEntries.push({
+          index: idxNum,
+          filename: item.filename,
+          source_path: item.source_path,
+          chapter: ch,
+          type: item.type,
+          camera: [item.make, item.model].filter(Boolean).join(" ") || "Unknown",
+          width: item.width,
+          height: item.height,
+          orientation: item.orientation,
+          gps_lat: item.gps_lat,
+          gps_lon: item.gps_lon,
+          date_ist: item.date_ist,
+          duration_sec: item.duration_sec,
+          contact_sheet: sheetPath,
+          sheet_slot: slot + 1,
+        });
+      }
+
+      canvas.unlockFocus;
+      saveCanvasJPEG(canvas, sheetPath);
+      generatedSheets.push(sheetPath);
+
+      if (args.artifactDir) {
+        const dst = args.artifactDir + "/" + sheetName;
+        const fm = $.NSFileManager.defaultManager;
+        if (fm.fileExistsAtPath(dst)) fm.removeItemAtPathError(dst, null);
+        fm.copyItemAtPathToPathError(sheetPath, dst, null);
+      }
+    }
+  }
+
+  const indexPayload = {
+    schema_version: "1.0",
+    total_indexed: indexEntries.length,
+    sheet_count: generatedSheets.length,
+    sheets: generatedSheets,
+    items: indexEntries,
+  };
+  writeTextFile(args.indexOut, JSON.stringify(indexPayload, null, 2) + "\n");
+
+  return JSON.stringify({
+    status: "ok",
+    total_indexed: indexEntries.length,
+    sheet_count: generatedSheets.length,
+    sheets: generatedSheets,
+    index_out: args.indexOut,
+  }, null, 2);
+}

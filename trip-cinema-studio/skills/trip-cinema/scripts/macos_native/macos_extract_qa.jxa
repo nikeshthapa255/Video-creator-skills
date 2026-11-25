@@ -1,0 +1,214 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Zero-dependency macOS Native QA Frame & Contact Sheet Extractor.
+ * Uses AVFoundation AVAssetImageGenerator + AppKit (100% Apple-signed).
+ *
+ * Usage:
+ *   osascript -l JavaScript macos_extract_qa.jxa \
+ *     --input ./output/trip_cinema.mp4 \
+ *     --out-dir ./work/qa \
+ *     --count 9
+ */
+
+ObjC.import("Foundation");
+ObjC.import("AVFoundation");
+ObjC.import("CoreMedia");
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+function parseArgs(argv) {
+  const args = {
+    input: null,
+    edl: null,
+    outDir: "./work/qa",
+    count: 9,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--input" || a === "-i") args.input = argv[++i];
+    else if (a === "--edl") args.edl = argv[++i];
+    else if (a === "--out-dir" || a === "-o") args.outDir = argv[++i];
+    else if (a === "--count" || a === "-n") args.count = Math.max(1, parseInt(argv[++i], 10) || 9);
+  }
+  return args;
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function ensureDir(dirPath) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function formatSec(sec) {
+  const m = Math.floor(sec / 60);
+  const s = (sec % 60).toFixed(1).padStart(4, "0");
+  return String(m).padStart(2, "0") + ":" + s + "s";
+}
+
+function grabFrameAt(gen, sec) {
+  const cmTime = $.CMTimeMakeWithSeconds(sec, 600);
+  const cgImg = gen.copyCGImageAtTimeActualTimeError(cmTime, null, null);
+  if (!cgImg) return null;
+  return $.NSImage.alloc.initWithCGImageSize(cgImg, $.NSZeroSize);
+}
+
+function saveNSImageAsJPEG(nsImg, outPath) {
+  const tiff = nsImg.TIFFRepresentation;
+  const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+  const jpg = rep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG, $({ NSImageCompressionFactor: 0.88 }));
+  jpg.writeToFileAtomically(outPath, true);
+}
+
+function renderLabeledContactSheet(gen, items, outPath, cols) {
+  if (!items || items.length === 0) return null;
+  const numCols = cols || 3;
+  const numRows = Math.max(1, Math.ceil(items.length / numCols));
+  const cellW = 640;
+  const cellH = 360;
+  const sheetW = cellW * numCols;
+  const sheetH = cellH * numRows;
+
+  const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(sheetW, sheetH));
+  canvas.lockFocus;
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.07, 0.07, 0.09, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, 0, sheetW, sheetH));
+
+  const labelAttrs = $.NSMutableDictionary.dictionary;
+  labelAttrs.setObjectForKey($.NSFont.monospacedSystemFontOfSizeWeight(15, $.NSFontWeightMedium), $.NSFontAttributeName);
+  labelAttrs.setObjectForKey($.NSColor.whiteColor, $.NSForegroundColorAttributeName);
+
+  for (let slot = 0; slot < items.length; slot++) {
+    const item = items[slot];
+    const col = slot % numCols;
+    const row = Math.floor(slot / numCols);
+    const x = col * cellW;
+    const y = sheetH - (row + 1) * cellH; // AppKit origin is bottom-left
+    const frameImg = grabFrameAt(gen, item.timeSec);
+    if (frameImg) {
+      frameImg.drawInRectFromRectOperationFraction(
+        $.NSMakeRect(x + 4, y + 4, cellW - 8, cellH - 8),
+        $.NSZeroRect,
+        $.NSCompositingOperationSourceOver,
+        1.0
+      );
+    }
+    const labelStr = item.label;
+    const lblSize = $(labelStr).sizeWithAttributes(labelAttrs);
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.04, 0.06, 0.84).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(x + 12, y + 12, lblSize.width + 18, 28));
+    $(labelStr).drawAtPointWithAttributes($.NSMakePoint(x + 21, y + 17), labelAttrs);
+  }
+
+  canvas.unlockFocus;
+  saveNSImageAsJPEG(canvas, outPath);
+  return outPath;
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify({
+      usage: "osascript -l JavaScript macos_extract_qa.jxa --input <master.mp4> [--edl ./work/edl.json] [--out-dir ./work/qa] [--count 9]",
+    }, null, 2);
+  }
+  if (!args.input) {
+    throw new Error("Missing --input <master.mp4>.");
+  }
+
+  ensureDir(args.outDir);
+  const AVURLAsset = $.NSClassFromString("AVURLAsset");
+  const AVAssetImageGenerator = $.NSClassFromString("AVAssetImageGenerator");
+  const url = $.NSURL.fileURLWithPath(args.input);
+  const asset = AVURLAsset.URLAssetWithURLOptions(url, $({}));
+  const durSec = $.CMTimeGetSeconds(asset.duration);
+  if (!durSec || durSec <= 0) {
+    throw new Error("Invalid or zero-duration video: " + args.input);
+  }
+
+  const gen = AVAssetImageGenerator.assetImageGeneratorWithAsset(asset);
+  gen.appliesPreferredTrackTransform = true;
+  gen.requestedTimeToleranceBefore = $.kCMTimeZero;
+  gen.requestedTimeToleranceAfter = $.kCMTimeZero;
+
+  // 1. End-frame check (-0.05s)
+  const endSec = Math.max(0.0, durSec - 0.05);
+  const endImg = grabFrameAt(gen, endSec);
+  const endFramePath = args.outDir + "/end_frame_check.jpg";
+  if (endImg) {
+    saveNSImageAsJPEG(endImg, endFramePath);
+  }
+
+  // 2. Evenly spaced frames into 3x3 QA contact sheet(s)
+  const timestamps = [];
+  for (let i = 0; i < args.count; i++) {
+    const t = args.count === 1 ? durSec * 0.5 : (i / (args.count - 1)) * Math.max(0.0, durSec - 0.1);
+    timestamps.push(t);
+  }
+
+  const sheets = [];
+  for (let page = 0; page < timestamps.length; page += 9) {
+    const chunk = timestamps.slice(page, page + 9).map((t, idx) => ({
+      timeSec: t,
+      label: "#" + (page + idx + 1) + " · " + formatSec(t),
+    }));
+    const sheetPath = args.outDir + "/qa_sheet_" + String(Math.floor(page / 9) + 1).padStart(2, "0") + ".jpg";
+    renderLabeledContactSheet(gen, chunk, sheetPath, 3);
+    sheets.push(sheetPath);
+  }
+
+  // 3. Shot-targeted alignment & card QA sheets when --edl is provided
+  let qaVideoAlignment = null;
+  let qaChapterCards = null;
+  if (args.edl) {
+    const edl = readJsonFile(args.edl);
+    const shots = edl.shots || [];
+    const videoItems = [];
+    const graphicItems = [];
+    let curSec = 0.0;
+    for (let i = 0; i < shots.length; i++) {
+      const s = shots[i];
+      const shotDur = Math.max(0.2, Number(s.out_sec || 3) - Number(s.in_sec || 0));
+      const midSec = Math.min(Math.max(0.0, durSec - 0.05), curSec + shotDur * 0.5);
+      curSec += shotDur;
+      const mtype = s.media_type || "photo";
+      const sid = s.shot_id || ("S" + String(i + 1).padStart(2, "0"));
+      if (mtype === "video") {
+        videoItems.push({
+          timeSec: midSec,
+          label: sid + " · " + (s.orientation || "video") + " · " + formatSec(midSec),
+        });
+      } else if (mtype === "graphic") {
+        graphicItems.push({
+          timeSec: midSec,
+          label: sid + " · " + (s.graphic_type || "card") + " · " + formatSec(midSec),
+        });
+      }
+    }
+    if (videoItems.length > 0) {
+      qaVideoAlignment = renderLabeledContactSheet(gen, videoItems, args.outDir + "/qa_video_alignment.jpg", 3);
+    }
+    if (graphicItems.length > 0) {
+      qaChapterCards = renderLabeledContactSheet(gen, graphicItems, args.outDir + "/qa_chapter_cards.jpg", 3);
+    }
+  }
+
+  return JSON.stringify({
+    input: args.input,
+    duration_sec: Number(durSec.toFixed(2)),
+    end_frame_check: endImg ? endFramePath : null,
+    qa_sheets: sheets,
+    qa_video_alignment: qaVideoAlignment,
+    qa_chapter_cards: qaChapterCards,
+  }, null, 2);
+}

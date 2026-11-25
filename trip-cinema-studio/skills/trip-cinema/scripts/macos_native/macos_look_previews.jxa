@@ -1,0 +1,261 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Zero-dependency macOS Native Gate 2 look preview generator.
+ * Uses CoreImage CIFilter + ImageIO + AppKit (100% Apple-signed).
+ *
+ * Usage:
+ *   osascript -l JavaScript macos_look_previews.jxa \
+ *     --hero /path/to/hero.jpg \
+ *     --portrait-a /path/to/p1.jpg \
+ *     --portrait-b /path/to/p2.jpg \
+ *     --out-dir ./work/look_previews
+ */
+
+ObjC.import("Foundation");
+ObjC.import("CoreImage");
+ObjC.import("ImageIO");
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+function parseArgs(argv) {
+  const args = {
+    hero: null,
+    portraitA: null,
+    portraitB: null,
+    manifest: null,
+    outDir: "./work/look_previews",
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--hero" || a === "--hero-image") args.hero = argv[++i];
+    else if (a === "--portrait-a") args.portraitA = argv[++i];
+    else if (a === "--portrait-b") args.portraitB = argv[++i];
+    else if (a === "--manifest") args.manifest = argv[++i];
+    else if (a === "--out-dir") args.outDir = argv[++i];
+  }
+  return args;
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function writeTextFile(path, text) {
+  const nsStr = $(text);
+  nsStr.writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+}
+
+function ensureDir(dirPath) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function loadOrientedCIImage(filePath) {
+  const url = $.NSURL.fileURLWithPath(filePath);
+  const src = $.CGImageSourceCreateWithURL(url, null);
+  let orient = 1;
+  if (src) {
+    const props = $.CGImageSourceCopyPropertiesAtIndex(src, 0, null);
+    if (props) {
+      const oVal = ObjC.unwrap(props)["Orientation"];
+      if (oVal) orient = Number(oVal);
+    }
+  }
+  let img = $.CIImage.imageWithContentsOfURL(url);
+  if (!img) throw new Error("Failed to load image: " + filePath);
+  if (orient > 1) {
+    img = img.imageByApplyingCGOrientation(orient);
+  }
+  // Normalize origin to (0, 0)
+  const ext = img.extent;
+  if (ext.origin.x !== 0 || ext.origin.y !== 0) {
+    img = img.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y));
+  }
+  return img;
+}
+
+function aspectFillAndCrop(ciImg, targetW, targetH) {
+  const ext = ciImg.extent;
+  const srcW = ext.size.width;
+  const srcH = ext.size.height;
+  const scale = Math.max(targetW / srcW, targetH / srcH);
+  let out = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
+  const scaledW = srcW * scale;
+  const scaledH = srcH * scale;
+  const cropX = (scaledW - targetW) / 2.0;
+  const cropY = (scaledH - targetH) / 2.0;
+  out = out.imageByCroppingToRect($.CGRectMake(cropX, cropY, targetW, targetH));
+  return out.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-cropX, -cropY));
+}
+
+function aspectFitCentered(ciImg, targetW, targetH) {
+  const ext = ciImg.extent;
+  const srcW = ext.size.width;
+  const srcH = ext.size.height;
+  const scale = Math.min(targetW / srcW, targetH / srcH);
+  let out = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
+  const dx = (targetW - srcW * scale) / 2.0;
+  const dy = (targetH - srcH * scale) / 2.0;
+  return out.imageByApplyingTransform($.CGAffineTransformMakeTranslation(dx, dy));
+}
+
+function applyLookFilter(ciImg, lookId) {
+  if (lookId === "warm_film") {
+    const colorCtrl = $.CIFilter.filterWithName("CIColorControls");
+    colorCtrl.setValueForKey(ciImg, "inputImage");
+    colorCtrl.setValueForKey(1.06, "inputContrast");
+    colorCtrl.setValueForKey(1.08, "inputSaturation");
+    colorCtrl.setValueForKey(0.01, "inputBrightness");
+
+    const temp = $.CIFilter.filterWithName("CITemperatureAndTint");
+    temp.setValueForKey(colorCtrl.outputImage, "inputImage");
+    temp.setValueForKey($.CIVector.vectorWithXY(6500, 0), "inputNeutral");
+    temp.setValueForKey($.CIVector.vectorWithXY(5600, 8), "inputTargetNeutral");
+    return temp.outputImage;
+  }
+  if (lookId === "moody_teal_orange") {
+    const colorCtrl = $.CIFilter.filterWithName("CIColorControls");
+    colorCtrl.setValueForKey(ciImg, "inputImage");
+    colorCtrl.setValueForKey(1.14, "inputContrast");
+    colorCtrl.setValueForKey(1.04, "inputSaturation");
+    colorCtrl.setValueForKey(-0.02, "inputBrightness");
+
+    const temp = $.CIFilter.filterWithName("CITemperatureAndTint");
+    temp.setValueForKey(colorCtrl.outputImage, "inputImage");
+    temp.setValueForKey($.CIVector.vectorWithXY(6500, 0), "inputNeutral");
+    temp.setValueForKey($.CIVector.vectorWithXY(7100, -10), "inputTargetNeutral");
+    return temp.outputImage;
+  }
+  if (lookId === "soft_atmospheric") {
+    const colorCtrl = $.CIFilter.filterWithName("CIColorControls");
+    colorCtrl.setValueForKey(ciImg, "inputImage");
+    colorCtrl.setValueForKey(0.93, "inputContrast");
+    colorCtrl.setValueForKey(0.90, "inputSaturation");
+    colorCtrl.setValueForKey(0.03, "inputBrightness");
+    return colorCtrl.outputImage;
+  }
+  // clean_natural
+  const colorCtrl = $.CIFilter.filterWithName("CIColorControls");
+  colorCtrl.setValueForKey(ciImg, "inputImage");
+  colorCtrl.setValueForKey(1.03, "inputContrast");
+  colorCtrl.setValueForKey(1.03, "inputSaturation");
+  return colorCtrl.outputImage;
+}
+
+function saveCIImageAsJPEG(ciCtx, ciImg, width, height, outPath, labelText) {
+  const cgImg = ciCtx.createCGImageFromRect(ciImg, $.CGRectMake(0, 0, width, height));
+  const rep = $.NSBitmapImageRep.alloc.initWithCGImage(cgImg);
+
+  if (labelText) {
+    const nsImg = $.NSImage.alloc.initWithSize($.NSMakeSize(width, height));
+    nsImg.addRepresentation(rep);
+    nsImg.lockFocus;
+    const attrs = $({
+      NSFont: $.NSFont.systemFontOfSizeWeight(18, $.NSFontWeightSemibold),
+      NSForegroundColorAttributeName: $.NSColor.whiteColor,
+    });
+    const textSize = $(labelText).sizeWithAttributes(attrs);
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.05, 0.07, 0.88).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(16, height - 54, Math.max(220, textSize.width + 28), 36));
+    $(labelText).drawAtPointWithAttributes($.NSMakePoint(30, height - 46), attrs);
+    const drawnRep = $.NSBitmapImageRep.alloc.initWithFocusedViewRect($.NSMakeRect(0, 0, width, height));
+    nsImg.unlockFocus;
+    const jpgData = drawnRep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG, $({ NSImageCompressionFactor: 0.9 }));
+    jpgData.writeToFileAtomically(outPath, true);
+    return;
+  }
+
+  const jpgData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG, $({ NSImageCompressionFactor: 0.9 }));
+  jpgData.writeToFileAtomically(outPath, true);
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify({
+      usage: "osascript -l JavaScript macos_look_previews.jxa [--manifest ./work/manifest.json | --hero <path>] [--portrait-a <path>] [--portrait-b <path>] [--out-dir ./work/look_previews]",
+    }, null, 2);
+  }
+
+  let hero = args.hero;
+  let pa = args.portraitA;
+  let pb = args.portraitB;
+
+  if (args.manifest) {
+    const manifest = readJsonFile(args.manifest);
+    const photos = (manifest.assets || []).filter((a) => a.media_type === "photo");
+    const landscapes = photos.filter((a) => a.orientation === "landscape");
+    const portraits = photos.filter((a) => a.orientation === "portrait");
+    if (!hero) hero = landscapes.length ? landscapes[0].source_path : (photos[0] ? photos[0].source_path : null);
+    if (!pa) pa = portraits.length ? portraits[0].source_path : hero;
+    if (!pb) pb = portraits.length > 1 ? portraits[1].source_path : pa;
+  }
+
+  if (!hero) {
+    throw new Error("Provide --hero or --manifest with at least one photo.");
+  }
+  if (!pa) pa = hero;
+  if (!pb) pb = pa;
+
+  ensureDir(args.outDir);
+  const ciCtx = $.CIContext.contextWithOptions($({}));
+  const heroCI = aspectFillAndCrop(loadOrientedCIImage(hero), 960, 540);
+
+  const looks = [
+    { id: "warm_film", label: "Warm Film" },
+    { id: "moody_teal_orange", label: "Moody Teal-Orange" },
+    { id: "clean_natural", label: "Clean Natural" },
+    { id: "soft_atmospheric", label: "Soft Atmospheric" },
+  ];
+
+  const lookOutputs = [];
+  for (const lk of looks) {
+    const outPath = args.outDir + "/look_" + lk.id + ".jpg";
+    const filtered = applyLookFilter(heroCI, lk.id);
+    saveCIImageAsJPEG(ciCtx, filtered, 960, 540, outPath, lk.label);
+    lookOutputs.push({ look_id: lk.id, label: lk.label, path: outPath, status: "ok" });
+  }
+
+  // 2-up comparison: left = split_diptych_pair (960x540), right = blurred_bg_pillarbox (960x540)
+  const imgA = loadOrientedCIImage(pa);
+  const imgB = loadOrientedCIImage(pb);
+  const diptychLeft = aspectFillAndCrop(imgA, 478, 540);
+  const diptychRight = aspectFillAndCrop(imgB, 478, 540).imageByApplyingTransform($.CGAffineTransformMakeTranslation(482, 0));
+
+  const blurFilter = $.CIFilter.filterWithName("CIGaussianBlur");
+  blurFilter.setValueForKey(aspectFillAndCrop(imgA, 960, 540).imageByClampingToExtent, "inputImage");
+  blurFilter.setValueForKey(24.0, "inputRadius");
+  const darkFilter = $.CIFilter.filterWithName("CIColorControls");
+  darkFilter.setValueForKey(blurFilter.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, 960, 540)), "inputImage");
+  darkFilter.setValueForKey(-0.15, "inputBrightness");
+
+  const fg = aspectFitCentered(imgA, 960, 540);
+  const pillar = fg.imageByCompositingOverImage(darkFilter.outputImage).imageByApplyingTransform($.CGAffineTransformMakeTranslation(960, 0));
+
+  const bgBlack = $.CIImage.imageWithColor($.CIColor.colorWithRedGreenBlueAlpha(0.06, 0.06, 0.08, 1.0))
+    .imageByCroppingToRect($.CGRectMake(0, 0, 1920, 540));
+
+  let comp = diptychLeft.imageByCompositingOverImage(bgBlack);
+  comp = diptychRight.imageByCompositingOverImage(comp);
+  comp = pillar.imageByCompositingOverImage(comp);
+
+  const compPath = args.outDir + "/vertical_layout_comparison.jpg";
+  saveCIImageAsJPEG(ciCtx, comp, 1920, 540, compPath, "A: Split Diptych Pair  |  B: Blurred BG Pillarbox");
+
+  const report = {
+    hero_source: hero,
+    renderer: "macos-native-coreimage-jxa",
+    looks: lookOutputs,
+    vertical_comparison: compPath,
+  };
+  writeTextFile(args.outDir + "/look_previews.json", JSON.stringify(report, null, 2) + "\n");
+  return JSON.stringify(report, null, 2);
+}

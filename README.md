@@ -1,6 +1,10 @@
 # Video-creator-skills
 
-Antigravity skills for planning, writing, animating, and assembling both **short-form vertical videos** (`30-55s`, `9:16`) and **long-form multi-act animated episodes** (`3-15+ min`, `9:16` vertical micro-dramas or `16:9` horizontal YouTube episodes). Use `viral-animated-shorts/` (v4.0) for end-to-end production from character research to mastered `-14 LUFS` export, and use `clear-natural-english/` to keep spoken narration, YouTube metadata, and docs plain and free of AI filler.
+Antigravity skills and plugins for video production:
+
+- **`viral-animated-shorts/` (v4.0):** End-to-end animated Shorts (`30-55s`, `9:16`) and long-form multi-act animated episodes (`3-15+ min`, `9:16` vertical micro-dramas or `16:9` horizontal YouTube episodes) from character research to mastered `-14 LUFS` export.
+- **`trip-cinema-studio/` (Antigravity Plugin, v0.1.0):** Turns raw folders, file lists, or Google Drive albums of real trip photos and video clips into a finished `16:9` cinematic travel film with EXIF/GPS chaptering, a 4-gate visual/audio Artifact review loop, cross-platform FFmpeg/Remotion scripts plus a zero-dependency macOS native `AVFoundation`/`CoreImage` batched engine, shot-targeted alignment QA, and a 3-persona `/swarm` film review panel.
+- **`clear-natural-english/`:** Keeps narration, YouTube metadata, and docs plain and free of AI filler.
 
 ---
 
@@ -109,6 +113,15 @@ Seven-stage pipeline (Stage 0 to Stage 6) for 2D stickman-in-3D and stylized 3D 
 - **Act-aware procedural BGM, spotted silence & calibrated SFX (`make_bgm.py`, `retrieve_music.py`, `sfx_engine.py`):** Passing `--timings audio/shot_timings.json` to `make_bgm.py` (`palace_drama`, `epic_story`) scores each Act by `acts[].bgm_intensity`, honors `ending_style: "cliffhanger"` tension holds, and automates spotted-silence drops (`shots[].bgm_cue`). `sfx_engine.py` renders 20 RMS-calibrated cues with 3-variant caching, stereo panning (`sfx_pan`), and optional `--ambience` room-tone beds.
 - **Frame-locked cinematic animation (`animate_shot_v2.py`):** Global cumulative frame lock before `--act` / `--start-idx` / `--end-idx` / `--shot-ids` slicing, `--workers`, `--skip-existing`, `--skip-omni` (for Hybrid runs), 11 eased camera presets (adding `slow_dolly_in`, `tilt_up`, `tilt_down`), `focal_anchor` (so `16:9` rule-of-thirds zooms don't drift off-subject), isotropic Frame-0 `shake_zoom`, per-shot `fade_in`/`fade_out`, and 2x supersampling for `9:16` and `16:9`.
 - **Fast-path `-c copy` assembly & chunked 60s multimodal QA (`assemble_short.sh`, `split_qa_segments.sh`):** Auto-detects `9:16` vs `16:9`, validates `time_base`/SAR/stereo before fast-path `-c copy`, mixes 3 stems in lossless 24-bit PCM with peak limiting and single-point speech carving (`10.5 kHz` LP, `-3.0 dB @ 2.9 kHz`, smooth musical sidechain ducking) before 2-pass `-14 LUFS` (`LRA=7` on `9:16`, `LRA=9` on `16:9`) + post-norm verification. For long-form videos, `split_qa_segments.sh` slices lossless 60s chunks (`< 100 MB` each), extracts 10 screenshots, logs per-segment LUFS, and validates YouTube `chapters.txt`.
+
+### `trip-cinema-studio/` (Antigravity Plugin, v0.1.0)
+
+Full Antigravity plugin (`plugin.json`, `hooks.json`, `rules/AGENTS.md`, `agents/`, `skills/trip-cinema/`) for turning raw folders, file lists, or Google Drive albums of trip photos and video clips into a standalone `16:9` cinematic travel film (`1080p`/`4K`, `-14 LUFS`, `LRA=9`, no voiceover). See [`trip-cinema-studio/README.md`](./trip-cinema-studio/README.md) for setup and usage. Key capabilities:
+
+- **Read-only safety hooks & authenticity guardrails (`hooks/raw_media_guard.sh`, `rules/AGENTS.md`):** Blocks destructive commands (`rm`, `mv`, `ffmpeg -y`) against original trip media and forbids generative I2V on close-ups of real family or friends.
+- **Interactive 4-gate Artifact review loop:** Produces visual/audio Artifacts before final rendering—**(1) Chapters & VIP People** contact sheets, **(2) Color Look, Title & Vertical Layout** real-photo previews (`Warm Film`, `Moody Teal-Orange`, `Clean Natural`, `Soft Atmospheric`, plus `split_diptych_pair` vs. `blurred_bg_pillarbox`), **(3) BGM & Pacing** auditionable CC-BY/CC0 + optional `lyria-3.5` previews, and **(4) Visual Storyboard & Cost Sign-Off**.
+- **Dual render engines (Cross-Platform + Zero-Dependency macOS Native):** Ships Python/FFmpeg/Remotion scripts (`ingest_trip.py`, `generate_look_previews.py`, `bgm_analyzer.py`, `lint_edl.py`, `render_trip.py`, `remotion_template/`) plus a zero-external-dependency Apple-signed JXA engine (`scripts/macos_native/`) using `AVFoundation` + `CoreImage` with low-impact sequential `nice -n 15` chapter batching, explicit portrait video orientation mapping, and blurred photo-backdrop editorial chapter/route-map cards.
+- **Shot-targeted alignment QA & 3-persona `/swarm` review panel (`agents/`):** Extracts 100% of video mid-frames (`qa_video_alignment.jpg`) and chapter/route cards (`qa_chapter_cards.jpg`) via `--edl`, then runs `review-director`, `review-cinematographer`, and `review-family-member` before final delivery.
 
 ### `clear-natural-english/`
 

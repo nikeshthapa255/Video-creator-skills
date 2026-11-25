@@ -1,0 +1,25 @@
+{
+  "raw-media-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./hooks/raw_media_guard.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "qa-stop-guard": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./hooks/qa_stop_guard.sh",
+        "timeout": 10
+      }
+    ]
+  }
+}
