@@ -1,15 +1,19 @@
 #!/usr/bin/env osascript -l JavaScript
 /**
- * Zero-dependency macOS Native 16:9 Master Renderer.
- * Uses AVFoundation + CoreImage + AppKit (100% Apple-signed).
+ * Trip Cinema Studio v0.2.0 — Modular Video-First macOS Native Renderer.
+ * 100% Apple-signed AVFoundation + CoreImage + AppKit + CoreGraphics (zero third-party binaries).
  *
- * Low-impact macOS protections:
- *   - Pre-downscales >2400px stills ONCE per shot before Ken Burns loop
- *   - Micro-yield + NSRunLoop drain every 2 frames so macOS UI stays responsive
- *   - Chapter-by-chapter batching:
- *       --start-shot <idx> --end-shot <excl> --video-only
- *       --mux-segments <seg1.mp4,seg2.mp4,...> --edl <edl.json> --output <final.mp4>
- *   - Status polling for AVAssetWriter (status === 1) & AVAssetExportSession (status === 1 || 2)
+ * Key v0.2.0 upgrades:
+ *   - Modular lib/{style_engine,layouts,transitions,cards}.js loaded cleanly relative to script path
+ *   - Declarative Style Packs (styles/<style_id>.json) + 16:9 (1920x1080) & 9:16 (1080x1920) aspect profiles
+ *   - Unified Hardware Rec.709 Video Decoder (AVAssetReaderVideoCompositionOutput with renderSize downscale,
+ *     preferredTransform orientation, and HDR/HLG/Dolby Vision -> ITU_R_709_2 tone mapping + TrackOutput fallback)
+ *   - Closed-form Piecewise Cubic Speed Ramping (forward-only 2-frame sliding reader + velocity CIMotionBlur)
+ *   - Live Moving-Buffer Transition Lookahead (both Shot A tail and Shot B head advance live during overlap)
+ *   - Multi-source concurrent video layouts (split_2up_video, triptych_3up_video, bento_living_grid, polaroid_stack)
+ *   - 2-Step Lossless 4-Track Audio Mux (NAT_A/NAT_B J/L-cuts + BGM Sonic Postcard ducking + SFX -> AppleM4A -> Passthrough)
+ *   - Batched rendering (--start-shot / --end-shot --video-only) + strict memory hygiene (CVPixelBufferRelease,
+ *     CMSampleBufferInvalidate, kCIContextCacheIntermediates: false, alwaysCopiesSampleData: false)
  */
 
 ObjC.import("Foundation");
@@ -28,13 +32,47 @@ function avClass(name) {
   return cls;
 }
 
+function resolveScriptDir() {
+  const fm = $.NSFileManager.defaultManager;
+  const cwd = ObjC.unwrap(fm.currentDirectoryPath);
+  const procArgs = $.NSProcessInfo.processInfo.arguments;
+  for (let i = 0; i < Number(procArgs.count); i++) {
+    const raw = ObjC.unwrap(procArgs.objectAtIndex(i));
+    if (raw && raw.endsWith(".jxa")) {
+      const absPath = raw.startsWith("/") ? raw : (cwd + "/" + raw);
+      return ObjC.unwrap($(absPath).stringByStandardizingPath.stringByDeletingLastPathComponent);
+    }
+  }
+  return cwd;
+}
+
+function loadNativeLibs(scriptDir) {
+  const libDir = scriptDir + "/lib";
+  const modules = ["style_engine.js", "layouts.js", "transitions.js", "cards.js"];
+  for (let i = 0; i < modules.length; i++) {
+    const p = libDir + "/" + modules[i];
+    const nsStr = $.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, null);
+    if (!nsStr) throw new Error("Failed to load native engine library: " + p);
+    // Indirect eval attaches TripStyleEngine / TripLayouts / TripTransitions / TripCards on global scope
+    (0, eval)(ObjC.unwrap(nsStr));
+  }
+  return {
+    StyleEngine: this.TripStyleEngine,
+    Layouts: this.TripLayouts,
+    Transitions: this.TripTransitions,
+    Cards: this.TripCards,
+  };
+}
+
 function parseArgs(argv) {
   const args = {
     edl: null,
     output: "./output/trip_cinema.mp4",
-    width: 1920,
-    height: 1080,
-    fps: 30,
+    width: null,
+    height: null,
+    fps: null,
+    styleId: null,
+    stylesDir: null,
     startShot: null,
     endShot: null,
     videoOnly: false,
@@ -47,9 +85,11 @@ function parseArgs(argv) {
     if (a === "--help" || a === "-h") args.help = true;
     else if (a === "--edl") args.edl = argv[++i];
     else if (a === "--output" || a === "-o") args.output = argv[++i];
-    else if (a === "--width") args.width = parseInt(argv[++i], 10) || 1920;
-    else if (a === "--height") args.height = parseInt(argv[++i], 10) || 1080;
-    else if (a === "--fps") args.fps = parseInt(argv[++i], 10) || 30;
+    else if (a === "--width") args.width = parseInt(argv[++i], 10) || null;
+    else if (a === "--height") args.height = parseInt(argv[++i], 10) || null;
+    else if (a === "--fps") args.fps = parseInt(argv[++i], 10) || null;
+    else if (a === "--style-id") args.styleId = argv[++i];
+    else if (a === "--styles-dir") args.stylesDir = argv[++i];
     else if (a === "--start-shot") args.startShot = parseInt(argv[++i], 10);
     else if (a === "--end-shot") args.endShot = parseInt(argv[++i], 10);
     else if (a === "--video-only") args.videoOnly = true;
@@ -98,7 +138,29 @@ function logProgress(logPath, msg) {
   }
 }
 
+function resolveCanvasDims(args, edl) {
+  let w = 1920;
+  let h = 1080;
+  if (edl && edl.aspect_profile === "9:16") {
+    w = 1080;
+    h = 1920;
+  } else if (edl && typeof edl.resolution === "string" && edl.resolution.indexOf("x") > 0) {
+    const parts = edl.resolution.split("x");
+    const pw = parseInt(parts[0], 10);
+    const ph = parseInt(parts[1], 10);
+    if (pw > 0 && ph > 0) {
+      w = pw;
+      h = ph;
+    }
+  }
+  if (args.width) w = args.width;
+  if (args.height) h = args.height;
+  const fps = args.fps || (edl && Number(edl.fps)) || 30;
+  return { width: w, height: h, fps: fps };
+}
+
 function normalizeOrigin(ciImg) {
+  if (!ciImg) return ciImg;
   const ext = ciImg.extent;
   if (ext.origin.x !== 0 || ext.origin.y !== 0) {
     return ciImg.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y));
@@ -106,7 +168,7 @@ function normalizeOrigin(ciImg) {
   return ciImg;
 }
 
-function loadOrientedCIImage(ciCtx, filePath, maxDim) {
+function loadOrientedCIImage(filePath, maxDim) {
   const limit = maxDim || 2400;
   const url = $.NSURL.fileURLWithPath(filePath);
   const opts = $.NSMutableDictionary.dictionary;
@@ -121,89 +183,615 @@ function loadOrientedCIImage(ciCtx, filePath, maxDim) {
   if (maxSide > limit) {
     const scale = limit / maxSide;
     const lanczos = $.CIFilter.filterWithName("CILanczosScaleTransform");
-    lanczos.setValueForKey(img, "inputImage");
-    lanczos.setValueForKey(scale, "inputScale");
-    lanczos.setValueForKey(1.0, "inputAspectRatio");
-    let scaled = normalizeOrigin(lanczos.outputImage);
-    const outW = Math.max(1, Math.round(w * scale));
-    const outH = Math.max(1, Math.round(h * scale));
-    if (ciCtx && typeof ciCtx.createCGImageFromRect === "function") {
-      const cg = ciCtx.createCGImageFromRect(scaled, $.CGRectMake(0, 0, outW, outH));
-      if (cg) {
-        return $.CIImage.imageWithCGImage(cg);
-      }
+    if (lanczos) {
+      lanczos.setValueForKey(img, "inputImage");
+      lanczos.setValueForKey(scale, "inputScale");
+      lanczos.setValueForKey(1.0, "inputAspectRatio");
+      img = normalizeOrigin(lanczos.outputImage);
+    } else {
+      img = normalizeOrigin(img.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale)));
     }
-    return scaled;
   }
   return img;
 }
 
-function aspectFillAndCrop(ciImg, targetW, targetH) {
-  const ext = ciImg.extent;
-  const scale = Math.max(targetW / ext.size.width, targetH / ext.size.height);
-  let out = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
-  const scaledW = ext.size.width * scale;
-  const scaledH = ext.size.height * scale;
-  const cropX = (scaledW - targetW) / 2.0;
-  const cropY = (scaledH - targetH) / 2.0;
-  out = out.imageByCroppingToRect($.CGRectMake(cropX, cropY, targetW, targetH));
-  return out.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-cropX, -cropY));
+// =========================================================================
+// CLOSED-FORM PIECEWISE CUBIC SPEED RAMPING
+// =========================================================================
+function buildSpeedModel(shot) {
+  const sp = shot && shot.speed_profile ? shot.speed_profile : null;
+  const inSec = Number((shot && shot.in_sec) || 0);
+  const outSec = Number((shot && shot.out_sec) || (inSec + 3.0));
+  const rawSpan = Math.max(0.2, outSec - inSec);
+
+  if (!sp || !sp.mode || sp.mode === "constant") {
+    const rate = sp && sp.rate !== undefined ? Math.max(0.15, Number(sp.rate)) : 1.0;
+    const outDur = shot && shot.duration_sec > 0 ? Number(shot.duration_sec) : Math.max(0.2, rawSpan / rate);
+    return {
+      mode: "constant",
+      inSec: inSec,
+      outDur: outDur,
+      sourceSpan: outDur * rate,
+      peakSpeed: rate,
+      evalAt: function (tOut) {
+        const t = Math.max(0, tOut);
+        return { sourceTime: inSec + t * rate, speed: rate };
+      },
+    };
+  }
+
+  // 5-phase cubic_ramp (or explicit segments[])
+  let segs = [];
+  if (Array.isArray(sp.segments) && sp.segments.length > 0) {
+    segs = sp.segments.map((s) => ({
+      dur: Math.max(0.0, Number(s.dur_sec || 0)),
+      v0: Math.max(0.15, Number(s.v_start !== undefined ? s.v_start : 1.0)),
+      v1: Math.max(0.15, Number(s.v_end !== undefined ? s.v_end : 1.0)),
+    })).filter((s) => s.dur > 0.0001);
+  } else {
+    const vHi = Math.max(0.5, Number(sp.v_hi !== undefined ? sp.v_hi : 3.5));
+    const vLo = Math.max(0.2, Number(sp.v_lo !== undefined ? sp.v_lo : 0.5));
+    const d1 = Math.max(0.0, Number(sp.d1 !== undefined ? sp.d1 : 0.30));
+    const d2 = Math.max(0.0, Number(sp.d2 !== undefined ? sp.d2 : 0.35));
+    const d3 = Math.max(0.0, Number(sp.d3 !== undefined ? sp.d3 : 1.60));
+    const d4 = Math.max(0.0, Number(sp.d4 !== undefined ? sp.d4 : 0.35));
+    const d5 = Math.max(0.0, Number(sp.d5 !== undefined ? sp.d5 : 0.30));
+    const phases = [
+      { dur: d1, v0: vHi, v1: vHi },
+      { dur: d2, v0: vHi, v1: vLo },
+      { dur: d3, v0: vLo, v1: vLo },
+      { dur: d4, v0: vLo, v1: vHi },
+      { dur: d5, v0: vHi, v1: vHi },
+    ];
+    segs = phases.filter((s) => s.dur > 0.0001);
+  }
+
+  if (segs.length === 0) {
+    return buildSpeedModel({ in_sec: inSec, out_sec: outSec, duration_sec: shot && shot.duration_sec });
+  }
+
+  // Pre-integrate cumulative output time and exact analytical source span S_req
+  let tAcc = 0.0;
+  let sAcc = 0.0;
+  let peak = 1.0;
+  const compiled = segs.map((seg) => {
+    const dS = seg.dur * (seg.v0 + seg.v1) * 0.5;
+    peak = Math.max(peak, seg.v0, seg.v1);
+    const item = {
+      t0: tAcc,
+      t1: tAcc + seg.dur,
+      dur: seg.dur,
+      s0: sAcc,
+      v0: seg.v0,
+      v1: seg.v1,
+    };
+    tAcc += seg.dur;
+    sAcc += dS;
+    return item;
+  });
+
+  const outDur = shot && shot.duration_sec > 0 ? Number(shot.duration_sec) : Math.max(0.2, tAcc);
+  const timeScale = tAcc > 0.001 ? tAcc / outDur : 1.0;
+
+  return {
+    mode: "cubic_ramp",
+    inSec: inSec,
+    outDur: outDur,
+    sourceSpan: sAcc,
+    peakSpeed: peak,
+    evalAt: function (tOut) {
+      const t = Math.max(0.0, Math.min(tAcc, tOut * timeScale));
+      for (let i = 0; i < compiled.length; i++) {
+        const seg = compiled[i];
+        if (t <= seg.t1 || i === compiled.length - 1) {
+          const u = Math.max(0.0, Math.min(1.0, (t - seg.t0) / Math.max(0.0001, seg.dur)));
+          const dv = seg.v1 - seg.v0;
+          const speed = seg.v0 + dv * (3.0 * u * u - 2.0 * u * u * u);
+          const deltaS = seg.dur * (seg.v0 * u + dv * (u * u * u - 0.5 * u * u * u * u));
+          return { sourceTime: inSec + seg.s0 + deltaS, speed: speed };
+        }
+      }
+      return { sourceTime: inSec + sAcc, speed: 1.0 };
+    },
+  };
 }
 
-function aspectFitCentered(ciImg, targetW, targetH, zoomFactor) {
-  const z = zoomFactor || 1.0;
-  const ext = ciImg.extent;
-  const scale = Math.min(targetW / ext.size.width, targetH / ext.size.height) * z;
-  let out = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
-  const dx = (targetW - ext.size.width * scale) / 2.0;
-  const dy = (targetH - ext.size.height * scale) / 2.0;
-  out = out.imageByApplyingTransform($.CGAffineTransformMakeTranslation(dx, dy));
-  return out.imageByCroppingToRect($.CGRectMake(0, 0, targetW, targetH));
+// =========================================================================
+// UNIFIED HARDWARE REC.709 VIDEO DECODER (AVAssetReaderVideoCompositionOutput + Fallback)
+// =========================================================================
+function computeTransformBounds(natW, natH, t) {
+  const corners = [
+    { x: 0, y: 0 },
+    { x: natW, y: 0 },
+    { x: 0, y: natH },
+    { x: natW, y: natH },
+  ];
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < 4; i++) {
+    const px = t.a * corners[i].x + t.c * corners[i].y + t.tx;
+    const py = t.b * corners[i].x + t.d * corners[i].y + t.ty;
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
+  }
+  return {
+    minX: minX,
+    minY: minY,
+    dispW: Math.max(2, maxX - minX),
+    dispH: Math.max(2, maxY - minY),
+  };
 }
 
-function applyLookFilter(ciImg, lookId) {
-  if (lookId === "warm_film") {
-    const c = $.CIFilter.filterWithName("CIColorControls");
-    c.setValueForKey(ciImg, "inputImage");
-    c.setValueForKey(1.06, "inputContrast");
-    c.setValueForKey(1.08, "inputSaturation");
-    c.setValueForKey(0.01, "inputBrightness");
-    const t = $.CIFilter.filterWithName("CITemperatureAndTint");
-    t.setValueForKey(c.outputImage, "inputImage");
-    t.setValueForKey($.CIVector.vectorWithXY(6500, 0), "inputNeutral");
-    t.setValueForKey($.CIVector.vectorWithXY(5600, 8), "inputTargetNeutral");
-    return t.outputImage;
-  }
-  if (lookId === "moody_teal_orange") {
-    const c = $.CIFilter.filterWithName("CIColorControls");
-    c.setValueForKey(ciImg, "inputImage");
-    c.setValueForKey(1.14, "inputContrast");
-    c.setValueForKey(1.04, "inputSaturation");
-    c.setValueForKey(-0.02, "inputBrightness");
-    const t = $.CIFilter.filterWithName("CITemperatureAndTint");
-    t.setValueForKey(c.outputImage, "inputImage");
-    t.setValueForKey($.CIVector.vectorWithXY(6500, 0), "inputNeutral");
-    t.setValueForKey($.CIVector.vectorWithXY(7100, -10), "inputTargetNeutral");
-    return t.outputImage;
-  }
-  if (lookId === "soft_atmospheric") {
-    const c = $.CIFilter.filterWithName("CIColorControls");
-    c.setValueForKey(ciImg, "inputImage");
-    c.setValueForKey(0.93, "inputContrast");
-    c.setValueForKey(0.90, "inputSaturation");
-    c.setValueForKey(0.03, "inputBrightness");
-    return c.outputImage;
-  }
-  const c = $.CIFilter.filterWithName("CIColorControls");
-  c.setValueForKey(ciImg, "inputImage");
-  c.setValueForKey(1.03, "inputContrast");
-  c.setValueForKey(1.03, "inputSaturation");
-  return c.outputImage;
+function mapPreferredTransformToCGOrientation(t) {
+  const ta = Math.round(t.a);
+  const tb = Math.round(t.b);
+  const tc = Math.round(t.c);
+  const td = Math.round(t.d);
+  if (ta === 0 && tb === 1 && tc === -1 && td === 0) return 6;  // 90° CW portrait (standard iPhone)
+  if (ta === 0 && tb === -1 && tc === 1 && td === 0) return 8;  // 90° CCW portrait
+  if (ta === -1 && tb === 0 && tc === 0 && td === -1) return 3; // 180° inverted
+  return 1;
 }
 
-function applyFadeOverlay(ciImg, fIdx, numFrames, fps, fadeInSec, fadeOutSec, width, height) {
-  const t = fIdx / fps;
-  const dur = numFrames / fps;
+function safeInvalidateSample(sb) {
+  if (!sb) return;
+  try {
+    $.CMSampleBufferInvalidate(sb);
+  } catch (e) {
+    // Ignore if already invalidated
+  }
+}
+
+function createVideoStream(sourcePath, opts) {
+  const AVURLAsset = avClass("AVURLAsset");
+  const AVAssetReader = avClass("AVAssetReader");
+  const CompOut = avClass("AVAssetReaderVideoCompositionOutput");
+  const MComp = avClass("AVMutableVideoComposition");
+  const MInst = avClass("AVMutableVideoCompositionInstruction");
+  const MLayer = avClass("AVMutableVideoCompositionLayerInstruction");
+  const TrackOut = avClass("AVAssetReaderTrackOutput");
+
+  const asset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(sourcePath), $({}));
+  const vTracks = asset.tracksWithMediaType($.AVMediaTypeVideo);
+  if (!vTracks || Number(vTracks.count) === 0) {
+    throw new Error("Video asset has no video track: " + sourcePath);
+  }
+  const vTrack = vTracks.objectAtIndex(0);
+  const assetDur = Math.max(0.1, $.CMTimeGetSeconds(asset.duration));
+  const startSec = Math.max(0.0, Math.min(assetDur - 0.05, Number(opts.startSec || 0.0)));
+  const spanSec = Math.max(0.1, Math.min(assetDur - startSec, Number(opts.spanSec || assetDur) + 0.5));
+  const timeRange = $.CMTimeRangeMake($.CMTimeMakeWithSeconds(startSec, 600), $.CMTimeMakeWithSeconds(spanSec, 600));
+
+  const natSize = vTrack.naturalSize;
+  const natW = Math.max(2, Number(natSize.width) || 1920);
+  const natH = Math.max(2, Number(natSize.height) || 1080);
+  let prefT = vTrack.preferredTransform;
+  const prefDet = Math.abs((Number(prefT.a) * Number(prefT.d)) - (Number(prefT.b) * Number(prefT.c)));
+  if (!isFinite(prefDet) || prefDet < 1e-4) {
+    prefT = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+  }
+  const bounds = computeTransformBounds(natW, natH, prefT);
+  const srcFps = Math.max(24, Math.min(240, Number(vTrack.nominalFrameRate) || 30));
+
+  const targetW = Math.max(64, Number(opts.targetW) || 1920);
+  const targetH = Math.max(64, Number(opts.targetH) || 1080);
+  const fitMode = opts.fitMode || "fill";
+  let scale = fitMode === "fit"
+    ? Math.min(1.0, Math.min(targetW / bounds.dispW, targetH / bounds.dispH))
+    : Math.min(1.0, Math.max(targetW / bounds.dispW, targetH / bounds.dispH));
+  // Cap decoded max side to 2160px to keep RAM & GPU bandwidth strictly bounded
+  const maxDecodedSide = Math.max(bounds.dispW, bounds.dispH) * scale;
+  if (maxDecodedSide > 2160) {
+    scale *= 2160 / maxDecodedSide;
+  }
+  const outW = Math.max(2, Math.round((bounds.dispW * scale) / 2) * 2);
+  const outH = Math.max(2, Math.round((bounds.dispH * scale) / 2) * 2);
+
+  let reader = null;
+  let output = null;
+  let useTrackFallback = false;
+  let cgOrient = 1;
+
+  // Primary: AVAssetReaderVideoCompositionOutput (Hardware 4K->targetBox downscale + portrait upright + HDR->Rec.709!)
+  try {
+    reader = AVAssetReader.assetReaderWithAssetError(asset, null);
+    if (!reader) throw new Error("AVAssetReader init returned nil");
+    reader.timeRange = timeRange;
+
+    const vComp = MComp.videoComposition;
+    vComp.renderSize = $.CGSizeMake(outW, outH);
+    vComp.frameDuration = $.CMTimeMake(100, Math.round(srcFps * 100));
+    vComp.colorPrimaries = "ITU_R_709_2";
+    vComp.colorTransferFunction = "ITU_R_709_2";
+    vComp.colorYCbCrMatrix = "ITU_R_709_2";
+
+    const inst = MInst.videoCompositionInstruction;
+    inst.timeRange = $.CMTimeRangeMake($.kCMTimeZero, asset.duration);
+    const layerInst = MLayer.videoCompositionLayerInstructionWithAssetTrack(vTrack);
+    const sx = outW / bounds.dispW;
+    const sy = outH / bounds.dispH;
+    const M = $.CGAffineTransformMake(
+      prefT.a * sx,
+      prefT.b * sy,
+      prefT.c * sx,
+      prefT.d * sy,
+      (prefT.tx - bounds.minX) * sx,
+      (prefT.ty - bounds.minY) * sy
+    );
+    layerInst.setTransformAtTime(M, $.kCMTimeZero);
+    inst.layerInstructions = $([layerInst]);
+    vComp.instructions = $([inst]);
+
+    const outOpts = $.NSMutableDictionary.dictionary;
+    outOpts.setObjectForKey($.NSNumber.numberWithUnsignedInt(1111970369), "PixelFormatType");
+    output = CompOut.assetReaderVideoCompositionOutputWithVideoTracksVideoSettings($([vTrack]), outOpts);
+    output.videoComposition = vComp;
+    output.alwaysCopiesSampleData = false;
+    reader.addOutput(output);
+    if (!reader.startReading) {
+      throw new Error("VideoCompositionOutput startReading returned false");
+    }
+  } catch (e) {
+    // Fallback: AVAssetReaderTrackOutput with verified CGImagePropertyOrientation upright fix
+    if (reader) {
+      try { reader.cancelReading; } catch (_) {}
+    }
+    useTrackFallback = true;
+    cgOrient = mapPreferredTransformToCGOrientation(prefT);
+    reader = AVAssetReader.assetReaderWithAssetError(asset, null);
+    reader.timeRange = timeRange;
+    const outOpts = $.NSMutableDictionary.dictionary;
+    outOpts.setObjectForKey($.NSNumber.numberWithUnsignedInt(1111970369), "PixelFormatType");
+    output = TrackOut.assetReaderTrackOutputWithTrackOutputSettings(vTrack, outOpts);
+    output.alwaysCopiesSampleData = false;
+    reader.addOutput(output);
+    reader.startReading;
+  }
+
+  // Forward-only 2-frame sliding window [prev, curr]
+  let prev = null;
+  let curr = null;
+  let eof = false;
+
+  function pullNext() {
+    if (eof) return null;
+    const sb = output.copyNextSampleBuffer;
+    if (!sb) {
+      eof = true;
+      return null;
+    }
+    const pts = $.CMTimeGetSeconds($.CMSampleBufferGetPresentationTimeStamp(sb));
+    if (!isFinite(pts)) {
+      eof = true;
+      return null;
+    }
+    const imgBuf = $.CMSampleBufferGetImageBuffer(sb);
+    if (!imgBuf) {
+      safeInvalidateSample(sb);
+      return pullNext();
+    }
+    let ci = $.CIImage.imageWithCVImageBuffer(imgBuf);
+    if (useTrackFallback && cgOrient !== 1) {
+      ci = ci.imageByApplyingCGOrientation(cgOrient);
+    }
+    ci = normalizeOrigin(ci);
+    return { sb: sb, ci: ci, pts: pts };
+  }
+
+  // Prime first frame
+  curr = pullNext();
+
+  return {
+    sourcePath: sourcePath,
+    decoderMode: useTrackFallback ? "track_output_fallback" : "video_composition_rec709",
+    decodedSize: outW + "x" + outH,
+    assetDuration: assetDur,
+    srcFps: srcFps,
+    frameAt: function (targetPtsSec) {
+      while (!eof && curr && curr.pts < targetPtsSec - 0.002) {
+        const next = pullNext();
+        if (!next) break;
+        if (prev && prev.sb) safeInvalidateSample(prev.sb);
+        prev = curr;
+        curr = next;
+      }
+      if (prev && curr) {
+        return Math.abs(prev.pts - targetPtsSec) < Math.abs(curr.pts - targetPtsSec) ? prev.ci : curr.ci;
+      }
+      return curr ? curr.ci : (prev ? prev.ci : null);
+    },
+    close: function () {
+      if (prev && prev.sb) safeInvalidateSample(prev.sb);
+      if (curr && curr.sb) safeInvalidateSample(curr.sb);
+      prev = null;
+      curr = null;
+      try { reader.cancelReading; } catch (e) {}
+    },
+  };
+}
+
+// =========================================================================
+// TIMELINE CALCULATION (Shared between Video Render & Audio Mux — ZERO A/V DRIFT)
+// =========================================================================
+function resolveShotTransition(shot, style, Transitions) {
+  let raw = shot.transition_out;
+  let explicitDur = shot.transition_duration_sec;
+  if (raw && typeof raw === "object") {
+    if (raw.duration_sec !== undefined) explicitDur = raw.duration_sec;
+    raw = raw.type;
+  }
+  if (!raw && shot.transition) {
+    raw = shot.transition;
+  }
+  const tType = Transitions.normalizeTransitionType(raw || "cut");
+  const defaultDur = Number((style && style.transitions && style.transitions.default_duration_sec) || 0.45);
+  const durSec = tType === "cut" ? 0.0 : Math.max(0.10, Math.min(1.5, Number(explicitDur || defaultDur)));
+  return {
+    type: tType,
+    durationSec: durSec,
+    focal_anchor: shot.focal_anchor,
+  };
+}
+
+function computeTimeline(shots, style, fps, Transitions) {
+  const entries = [];
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i];
+    const sm = buildSpeedModel(s);
+    const numFrames = Math.max(1, Math.round(sm.outDur * fps));
+    const trans = resolveShotTransition(s, style, Transitions);
+    entries.push({
+      shot: s,
+      speedModel: sm,
+      durSec: numFrames / fps,
+      numFrames: numFrames,
+      transOut: trans,
+      overlapOutFrames: 0,
+      overlapInFrames: 0,
+      startFrame: 0,
+      startSec: 0,
+      endSec: 0,
+    });
+  }
+
+  let cursorFrames = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const cur = entries[i];
+    cur.startFrame = cursorFrames;
+    cur.startSec = cursorFrames / fps;
+    cur.endSec = (cursorFrames + cur.numFrames) / fps;
+
+    if (i < entries.length - 1 && cur.transOut.type !== "cut") {
+      const next = entries[i + 1];
+      const maxAllowSec = Math.min(cur.durSec * 0.45, next.durSec * 0.45);
+      const ovSec = Math.min(cur.transOut.durationSec, maxAllowSec);
+      const ovFrames = Math.max(2, Math.round(ovSec * fps));
+      if (ovFrames < cur.numFrames && ovFrames < next.numFrames) {
+        cur.overlapOutFrames = ovFrames;
+        next.overlapInFrames = ovFrames;
+      }
+    }
+    cursorFrames += cur.numFrames - cur.overlapOutFrames;
+  }
+
+  return {
+    entries: entries,
+    totalFrames: cursorFrames,
+    totalDurSec: cursorFrames / fps,
+  };
+}
+
+// =========================================================================
+// SHOT PRODUCER (Unified Single/Multi-Source Photos, Videos, Speed Ramps, Graphics)
+// =========================================================================
+function resolveEffectiveLayout(shot, style, width, height) {
+  const explicit = shot.layout || shot.aspect_handling;
+  if (explicit) return String(explicit).toLowerCase().trim();
+  const hasTiles = Array.isArray(shot.tiles) && shot.tiles.length >= 2;
+  if (hasTiles) {
+    if (shot.tiles.length >= 3) return "triptych_3up_video";
+    return "split_2up_video";
+  }
+  if (shot.pair_source_path) return "split_diptych_pair";
+  const isPortraitMedia = shot.orientation === "portrait";
+  const isLandscapeCanvas = width > height;
+  if (isPortraitMedia && isLandscapeCanvas) {
+    return (style && style.layouts && style.layouts.default_portrait_layout) || "blurred_bg_pillarbox";
+  }
+  return "single";
+}
+
+function createShotProducer(entry, style, libs, width, height, fps) {
+  const shot = entry.shot;
+  const mtype = shot.media_type || "photo";
+  const numFrames = entry.numFrames;
+  const fm = $.NSFileManager.defaultManager;
+
+  // Graphic card producer
+  if (mtype === "graphic") {
+    const backdropImg = (shot.backdrop_path && fm.fileExistsAtPath(shot.backdrop_path))
+      ? loadOrientedCIImage(shot.backdrop_path, 2400)
+      : null;
+    const heroImg = (shot.source_path && fm.fileExistsAtPath(shot.source_path))
+      ? loadOrientedCIImage(shot.source_path, 2400)
+      : backdropImg;
+    const maskImg = (shot.mask_path && fm.fileExistsAtPath(shot.mask_path))
+      ? loadOrientedCIImage(shot.mask_path, 2400)
+      : null;
+    const assets = { backdropImg: backdropImg, heroImg: heroImg, maskImg: maskImg };
+
+    return {
+      renderFrame: function (localFrameIdx) {
+        const prog = numFrames > 1 ? localFrameIdx / (numFrames - 1) : 1.0;
+        return libs.Cards.renderCardFrame(shot, prog, width, height, assets, style);
+      },
+      close: function () {},
+    };
+  }
+
+  // Build normalized list of source descriptors (supports tiles[], pair_source_path, extra_source_paths[], or single source_path)
+  const layoutName = resolveEffectiveLayout(shot, style, width, height);
+  const rawSources = [];
+  if (Array.isArray(shot.tiles) && shot.tiles.length > 0) {
+    for (let i = 0; i < shot.tiles.length; i++) {
+      const t = shot.tiles[i];
+      rawSources.push({
+        sourcePath: t.source_path,
+        mediaType: t.media_type || mtype,
+        inSec: Number(t.in_sec !== undefined ? t.in_sec : (shot.in_sec || 0)),
+        outSec: Number(t.out_sec !== undefined ? t.out_sec : (shot.out_sec || (entry.durSec + Number(t.in_sec || 0)))),
+        anchor: t.focal_anchor || shot.focal_anchor,
+        caption: t.caption || "",
+        dateLabel: t.date_label || "",
+      });
+    }
+  } else {
+    rawSources.push({
+      sourcePath: shot.source_path,
+      mediaType: mtype,
+      inSec: Number(shot.in_sec || 0),
+      outSec: Number(shot.out_sec || (Number(shot.in_sec || 0) + entry.durSec)),
+      anchor: shot.focal_anchor,
+      caption: shot.caption || "",
+      dateLabel: shot.date_stamp || shot.date_label || "",
+    });
+    if (shot.pair_source_path) {
+      rawSources.push({
+        sourcePath: shot.pair_source_path,
+        mediaType: mtype,
+        inSec: Number(shot.in_sec || 0),
+        outSec: Number(shot.out_sec || (Number(shot.in_sec || 0) + entry.durSec)),
+        anchor: shot.focal_anchor,
+        caption: "",
+        dateLabel: "",
+      });
+    }
+    if (Array.isArray(shot.extra_source_paths)) {
+      for (let i = 0; i < shot.extra_source_paths.length; i++) {
+        rawSources.push({
+          sourcePath: shot.extra_source_paths[i],
+          mediaType: "photo",
+          inSec: 0,
+          outSec: entry.durSec,
+          anchor: [0.5, 0.5],
+          caption: "",
+          dateLabel: "",
+        });
+      }
+    }
+  }
+
+  const boxes = libs.Layouts.computeTileBoxes(layoutName, rawSources.length, width, height, style);
+  const fitMode = layoutName === "blurred_bg_pillarbox" ? "fit" : "fill";
+  const speedModel = entry.speedModel;
+  const openStreams = [];
+
+  const preparedSources = rawSources.map((rs, idx) => {
+    const box = boxes[Math.min(idx, boxes.length - 1)] || { w: width, h: height };
+    if (rs.mediaType === "video") {
+      const span = idx === 0 && rawSources.length === 1
+        ? speedModel.sourceSpan
+        : Math.max(0.2, rs.outSec - rs.inSec, entry.durSec);
+      const stream = createVideoStream(rs.sourcePath, {
+        startSec: rs.inSec,
+        spanSec: span,
+        targetW: box.w,
+        targetH: box.h,
+        fitMode: fitMode,
+      });
+      openStreams.push(stream);
+      return {
+        isVideo: true,
+        stream: stream,
+        inSec: rs.inSec,
+        useShotSpeedModel: idx === 0 && rawSources.length === 1,
+        anchor: rs.anchor,
+        caption: rs.caption,
+        dateLabel: rs.dateLabel,
+      };
+    }
+    const maxDim = Math.max(1200, Math.min(2400, Math.max(box.w, box.h) * 1.4));
+    return {
+      isVideo: false,
+      ciImg: loadOrientedCIImage(rs.sourcePath, maxDim),
+      anchor: rs.anchor,
+      caption: rs.caption,
+      dateLabel: rs.dateLabel,
+    };
+  });
+
+  const lookOverride = shot.look_id || null;
+
+  return {
+    renderFrame: function (localFrameIdx, globalFrameIdx) {
+      const tOut = localFrameIdx / fps;
+      const prog = numFrames > 1 ? localFrameIdx / (numFrames - 1) : 0.0;
+      let currentSpeed = 1.0;
+
+      const frameSources = preparedSources.map((ps) => {
+        if (!ps.isVideo) {
+          return {
+            ciImg: ps.ciImg,
+            isVideo: false,
+            anchor: ps.anchor,
+            caption: ps.caption,
+            dateLabel: ps.dateLabel,
+          };
+        }
+        let targetPts = ps.inSec + tOut;
+        if (ps.useShotSpeedModel) {
+          const ev = speedModel.evalAt(tOut);
+          targetPts = ev.sourceTime;
+          currentSpeed = ev.speed;
+        }
+        const vidCI = ps.stream.frameAt(targetPts);
+        return {
+          ciImg: vidCI || $.CIImage.imageWithColor($.CIColor.colorWithRedGreenBlueAlpha(0.05, 0.05, 0.07, 1.0)).imageByCroppingToRect($.CGRectMake(0, 0, width, height)),
+          isVideo: true,
+          anchor: ps.anchor,
+          caption: ps.caption,
+          dateLabel: ps.dateLabel,
+        };
+      });
+
+      let frame = libs.Layouts.renderLayoutFrame(layoutName, frameSources, {
+        width: width,
+        height: height,
+        progress: prog,
+        frameIdx: globalFrameIdx,
+        fps: fps,
+        style: style,
+        shot: shot,
+      });
+
+      // Velocity-scaled CIMotionBlur during fast speed-ramp phases (v > 1.5x)
+      if (currentSpeed > 1.5) {
+        const mb = $.CIFilter.filterWithName("CIMotionBlur");
+        if (mb) {
+          const rad = Math.min(12.0, (currentSpeed - 1.0) * 3.2);
+          mb.setValueForKey(frame.imageByClampingToExtent, "inputImage");
+          mb.setValueForKey(rad, "inputRadius");
+          mb.setValueForKey(0.0, "inputAngle");
+          frame = mb.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, width, height));
+        }
+      }
+
+      frame = libs.StyleEngine.applyStyleGrade(frame, style, lookOverride);
+      return frame.imageByCroppingToRect($.CGRectMake(0, 0, width, height));
+    },
+    close: function () {
+      for (let i = 0; i < openStreams.length; i++) openStreams[i].close();
+    },
+  };
+}
+
+// =========================================================================
+// PIXEL BUFFER RENDERING & VIDEO-ONLY WRITER (LIVE MOVING TRANSITION LOOKAHEAD)
+// =========================================================================
+function applyFadeOverlay(ciImg, localF, totalF, fps, fadeInSec, fadeOutSec, width, height) {
+  const t = localF / fps;
+  const dur = totalF / fps;
   let alpha = 1.0;
   if (fadeInSec > 0 && t < fadeInSec) alpha = Math.min(alpha, t / fadeInSec);
   if (fadeOutSec > 0 && dur - t < fadeOutSec) alpha = Math.min(alpha, Math.max(0.0, (dur - t) / fadeOutSec));
@@ -213,438 +801,6 @@ function applyFadeOverlay(ciImg, fIdx, numFrames, fps, fadeInSec, fadeOutSec, wi
   dark.setValueForKey(ciImg, "inputImage");
   dark.setValueForKey(-(1.0 - alpha), "inputBrightness");
   return dark.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, width, height));
-}
-
-function renderKenBurnsFrame(ciImg, progress, anchor, dir, width, height) {
-  const fx = Math.min(0.95, Math.max(0.05, anchor && anchor[0] !== undefined ? Number(anchor[0]) : 0.5));
-  const fy = Math.min(0.95, Math.max(0.05, anchor && anchor[1] !== undefined ? Number(anchor[1]) : 0.5));
-  const zoom = dir === "out" ? 1.14 - 0.14 * progress : 1.0 + 0.14 * progress;
-
-  const ext = ciImg.extent;
-  const baseScale = Math.max(width / ext.size.width, height / ext.size.height) * zoom;
-  let scaled = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(baseScale, baseScale));
-  const sW = ext.size.width * baseScale;
-  const sH = ext.size.height * baseScale;
-  const cropX = Math.max(0, Math.min(sW - width, (sW - width) * fx));
-  const cropY = Math.max(0, Math.min(sH - height, (sH - height) * (1.0 - fy)));
-  scaled = scaled.imageByCroppingToRect($.CGRectMake(cropX, cropY, width, height));
-  return scaled.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-cropX, -cropY));
-}
-
-function renderPortraitComposite(imgA, imgB, handling, progress, width, height) {
-  const bgBlack = $.CIImage.imageWithColor($.CIColor.colorWithRedGreenBlueAlpha(0.05, 0.05, 0.07, 1.0))
-    .imageByCroppingToRect($.CGRectMake(0, 0, width, height));
-  const gentleZoom = 1.0 + 0.04 * (progress || 0.0);
-
-  if (handling === "split_diptych_pair" && imgB) {
-    const halfW = Math.floor(width / 2) - 4;
-    const left = aspectFillAndCrop(imgA, halfW, height);
-    const right = aspectFillAndCrop(imgB, halfW, height).imageByApplyingTransform(
-      $.CGAffineTransformMakeTranslation(Math.floor(width / 2) + 4, 0)
-    );
-    const combined = right.imageByCompositingOverImage(left.imageByCompositingOverImage(bgBlack));
-    return renderKenBurnsFrame(combined, progress * 0.3, [0.5, 0.5], "in", width, height);
-  }
-
-  const blur = $.CIFilter.filterWithName("CIGaussianBlur");
-  blur.setValueForKey(aspectFillAndCrop(imgA, width, height).imageByClampingToExtent, "inputImage");
-  blur.setValueForKey(28.0, "inputRadius");
-  const dark = $.CIFilter.filterWithName("CIColorControls");
-  dark.setValueForKey(blur.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, width, height)), "inputImage");
-  dark.setValueForKey(-0.15, "inputBrightness");
-
-  const fg = aspectFitCentered(imgA, width, height, gentleZoom);
-  return fg.imageByCompositingOverImage(dark.outputImage);
-}
-
-function easeOutCubic(t) {
-  const c = Math.min(1.0, Math.max(0.0, t));
-  return 1.0 - Math.pow(1.0 - c, 3);
-}
-
-function easeInOutCubic(t) {
-  const c = Math.min(1.0, Math.max(0.0, t));
-  return c < 0.5 ? 4 * c * c * c : 1.0 - Math.pow(-2 * c + 2, 3) / 2;
-}
-
-function resolveSerifFont(size) {
-  const candidates = ["Baskerville-SemiBold", "Georgia-Bold", "TimesNewRomanPS-BoldMT"];
-  for (let i = 0; i < candidates.length; i++) {
-    const f = $.NSFont.fontWithNameSize(candidates[i], size);
-    if (f) return f;
-  }
-  return $.NSFont.systemFontOfSizeWeight(size, $.NSFontWeightBold);
-}
-
-function buildCardBackdropCI(backdropImg, progress, blurRadius, lookId, width, height) {
-  const zoom = 1.02 + 0.07 * progress;
-  const ext = backdropImg.extent;
-  const scale = Math.max(width / ext.size.width, height / ext.size.height) * zoom;
-  let scaled = backdropImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
-  const sW = ext.size.width * scale;
-  const sH = ext.size.height * scale;
-  const cropX = (sW - width) * 0.5;
-  const cropY = (sH - height) * 0.5;
-  scaled = scaled.imageByCroppingToRect($.CGRectMake(cropX, cropY, width, height));
-  scaled = scaled.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-cropX, -cropY));
-
-  const blur = $.CIFilter.filterWithName("CIGaussianBlur");
-  blur.setValueForKey(scaled.imageByClampingToExtent, "inputImage");
-  blur.setValueForKey(blurRadius, "inputRadius");
-  let blurred = blur.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, width, height));
-  return applyLookFilter(blurred, lookId);
-}
-
-function drawCardScrim(width, height, hasBackdrop) {
-  if (!hasBackdrop) {
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.055, 0.062, 0.078, 1.0).setFill;
-    $.NSBezierPath.fillRect($.NSMakeRect(0, 0, width, height));
-    return;
-  }
-  // Dark charcoal-warm base scrim (~58% opacity) so typography pops cleanly
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.055, 0.052, 0.060, 0.58).setFill;
-  $.NSBezierPath.fillRect($.NSMakeRect(0, 0, width, height));
-
-  // Stronger edge vignette (non-variadic NSGradient initializer for JXA)
-  const vigGrad = $.NSGradient.alloc.initWithStartingColorEndingColor(
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.04, 0.05, 0.0),
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.03, 0.03, 0.04, 0.58)
-  );
-  if (vigGrad) {
-    vigGrad.drawFromCenterRadiusToCenterRadiusOptions(
-      $.NSMakePoint(width * 0.5, height * 0.5),
-      height * 0.25,
-      $.NSMakePoint(width * 0.5, height * 0.5),
-      Math.max(width, height) * 0.65,
-      $.NSGradientDrawsAfterEndingLocation
-    );
-  }
-}
-
-function makeTextShadow() {
-  const shadow = $.NSShadow.alloc.init;
-  shadow.shadowOffset = $.NSMakeSize(0, -3);
-  shadow.shadowBlurRadius = 16.0;
-  shadow.shadowColor = $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.0, 0.0, 0.0, 0.65);
-  return shadow;
-}
-
-function makeTextAttrs(font, color, shadow) {
-  const d = $.NSMutableDictionary.dictionary;
-  if (font) d.setObjectForKey(font, $.NSFontAttributeName);
-  if (color) d.setObjectForKey(color, $.NSForegroundColorAttributeName);
-  if (shadow) d.setObjectForKey(shadow, $.NSShadowAttributeName);
-  return d;
-}
-
-function drawEditorialCardOverlay(shot, progress, width, height) {
-  const gold = $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 1.0); // #E8C58E
-  const goldBorder = $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.28);
-  const shadow = makeTextShadow();
-
-  // Subtle 48px inset framing border
-  const framePath = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(48, 48, width - 96, height - 96));
-  framePath.lineWidth = 1.5;
-  goldBorder.setStroke;
-  framePath.stroke;
-
-  // Eyebrow (slides up gently during first 20% of progress)
-  if (shot.eyebrow) {
-    const eyeEase = easeOutCubic(Math.min(1.0, progress / 0.20));
-    const eyeYOff = (1.0 - eyeEase) * -14.0;
-    const eyeAttrs = makeTextAttrs(
-      $.NSFont.systemFontOfSizeWeight(20, $.NSFontWeightMedium),
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, eyeEase),
-      shadow
-    );
-    const eyeStr = String(shot.eyebrow);
-    const eSize = $(eyeStr).sizeWithAttributes(eyeAttrs);
-    $(eyeStr).drawAtPointWithAttributes(
-      $.NSMakePoint((width - eSize.width) / 2, height * 0.60 + eyeYOff),
-      eyeAttrs
-    );
-  }
-
-  // Main serif title (cubic ease-out)
-  const titleEase = easeOutCubic(Math.min(1.0, progress / 0.28));
-  const titleYOff = (1.0 - titleEase) * -18.0;
-  const titleStr = shot.title || "Chapter";
-  const tAttrs = makeTextAttrs(
-    resolveSerifFont(74),
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.98, 0.97, 0.95, titleEase),
-    shadow
-  );
-  const tSize = $(titleStr).sizeWithAttributes(tAttrs);
-  $(titleStr).drawAtPointWithAttributes(
-    $.NSMakePoint((width - tSize.width) / 2, height * 0.48 + titleYOff),
-    tAttrs
-  );
-
-  // Animated horizontal gold hairline divider expanding symmetrically from center (0 -> 220px)
-  const lineEase = easeOutCubic(Math.max(0.0, (progress - 0.08) / 0.28));
-  const lineW = 220.0 * lineEase;
-  if (lineW > 1.0) {
-    const divPath = $.NSBezierPath.bezierPath;
-    divPath.lineWidth = 1.5;
-    const divY = height * 0.445;
-    divPath.moveToPoint($.NSMakePoint((width - lineW) / 2, divY));
-    divPath.lineToPoint($.NSMakePoint((width + lineW) / 2, divY));
-    gold.setStroke;
-    divPath.stroke;
-  }
-
-  // Subtitle / coordinates line (#EAE4D9 at 0.88 alpha)
-  const subStr = [shot.date_label, shot.coordinates_label].filter(Boolean).join("  ·  ");
-  if (subStr) {
-    const subEase = easeOutCubic(Math.max(0.0, (progress - 0.12) / 0.28));
-    const sAttrs = makeTextAttrs(
-      $.NSFont.systemFontOfSizeWeight(24, $.NSFontWeightRegular),
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.918, 0.894, 0.851, 0.88 * subEase),
-      shadow
-    );
-    const sSize = $(subStr).sizeWithAttributes(sAttrs);
-    $(subStr).drawAtPointWithAttributes(
-      $.NSMakePoint((width - sSize.width) / 2, height * 0.375),
-      sAttrs
-    );
-  }
-}
-
-function quadBezierPoint(p0, ctrl, p1, t) {
-  const u = 1.0 - t;
-  return {
-    x: u * u * p0.x + 2 * u * t * ctrl.x + t * t * p1.x,
-    y: u * u * p0.y + 2 * u * t * ctrl.y + t * t * p1.y,
-  };
-}
-
-function drawRouteMapOverlay(shot, progress, width, height) {
-  const wps = shot.waypoints;
-  const shadow = makeTextShadow();
-
-  // Faint latitude/longitude architectural grid lines
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.07).setStroke;
-  for (let gx = 160; gx < width; gx += 160) {
-    const p = $.NSBezierPath.bezierPath;
-    p.lineWidth = 1.0;
-    p.moveToPoint($.NSMakePoint(gx, 48));
-    p.lineToPoint($.NSMakePoint(gx, height - 48));
-    p.stroke;
-  }
-  for (let gy = 135; gy < height; gy += 135) {
-    const p = $.NSBezierPath.bezierPath;
-    p.lineWidth = 1.0;
-    p.moveToPoint($.NSMakePoint(48, gy));
-    p.lineToPoint($.NSMakePoint(width - 48, gy));
-    p.stroke;
-  }
-
-  // Subtle 48px inset framing border
-  const framePath = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(48, 48, width - 96, height - 96));
-  framePath.lineWidth = 1.5;
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.25).setStroke;
-  framePath.stroke;
-
-  // Optional header title (44pt serif white + gold underline)
-  if (shot.title) {
-    const hAttrs = makeTextAttrs(
-      resolveSerifFont(44),
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.98, 0.97, 0.95, 0.96),
-      shadow
-    );
-    $(shot.title).drawAtPointWithAttributes($.NSMakePoint(96, height - 126), hAttrs);
-    const uPath = $.NSBezierPath.bezierPath;
-    uPath.lineWidth = 1.5;
-    uPath.moveToPoint($.NSMakePoint(96, height - 138));
-    uPath.lineToPoint($.NSMakePoint(236, height - 138));
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.85).setStroke;
-    uPath.stroke;
-  }
-
-  const padX = 320;
-  const padY = 230;
-  const lats = wps.map((w) => w.lat);
-  const lons = wps.map((w) => w.lon);
-  const minLat = Math.min.apply(null, lats);
-  const maxLat = Math.max.apply(null, lats);
-  const minLon = Math.min.apply(null, lons);
-  const maxLon = Math.max.apply(null, lons);
-  const latSpan = Math.max(0.01, maxLat - minLat);
-  const lonSpan = Math.max(0.01, maxLon - minLon);
-
-  const pts = wps.map((w) => ({
-    label: w.label || "",
-    subtitle: w.subtitle || "",
-    x: padX + ((w.lon - minLon) / lonSpan) * (width - padX * 2),
-    y: padY + ((w.lat - minLat) / latSpan) * (height - padY * 2),
-  }));
-
-  // Subtle concentric topographic/radar rings around each stop
-  for (let i = 0; i < pts.length; i++) {
-    const radii = [24, 44, 66];
-    for (let rIdx = 0; rIdx < radii.length; rIdx++) {
-      const r = radii[rIdx];
-      const ring = $.NSBezierPath.bezierPathWithOvalInRect($.NSMakeRect(pts[i].x - r, pts[i].y - r, r * 2, r * 2));
-      ring.lineWidth = 1.0;
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.14 - rIdx * 0.035).setStroke;
-      ring.stroke;
-    }
-  }
-
-  const numSegs = Math.max(1, pts.length - 1);
-  const routeEase = easeInOutCubic(Math.min(1.0, progress / 0.82));
-  const totalPos = routeEase * numSegs;
-
-  // Build progressive curved Bezier path
-  const routePath = $.NSBezierPath.bezierPath;
-  routePath.lineCapStyle = $.NSLineCapStyleRound;
-  routePath.moveToPoint($.NSMakePoint(pts[0].x, pts[0].y));
-  let headPt = { x: pts[0].x, y: pts[0].y };
-
-  for (let i = 0; i < numSegs; i++) {
-    const segT = Math.min(1.0, Math.max(0.0, totalPos - i));
-    if (segT <= 0.0) break;
-    const p0 = pts[i];
-    const p1 = pts[i + 1];
-    const dx = p1.x - p0.x;
-    const dy = p1.y - p0.y;
-    const sign = i % 2 === 0 ? 1.0 : -1.0;
-    const ctrl = {
-      x: (p0.x + p1.x) * 0.5 - dy * 0.18 * sign,
-      y: (p0.y + p1.y) * 0.5 + dx * 0.18 * sign,
-    };
-    const steps = 36;
-    const maxStep = Math.max(1, Math.round(steps * segT));
-    for (let s = 1; s <= maxStep; s++) {
-      const t = (s / maxStep) * segT;
-      headPt = quadBezierPoint(p0, ctrl, p1, t);
-      routePath.lineToPoint($.NSMakePoint(headPt.x, headPt.y));
-    }
-  }
-
-  // Soft golden glow halo under crisp #E8C58E line
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.26).setStroke;
-  routePath.lineWidth = 10.0;
-  routePath.stroke;
-
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.96).setStroke;
-  routePath.lineWidth = 3.5;
-  routePath.stroke;
-
-  // Glowing animated travel marker dot
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.35).setFill;
-  $.NSBezierPath.bezierPathWithOvalInRect($.NSMakeRect(headPt.x - 13, headPt.y - 13, 26, 26)).fill;
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(1.0, 0.95, 0.85, 1.0).setFill;
-  $.NSBezierPath.bezierPathWithOvalInRect($.NSMakeRect(headPt.x - 6, headPt.y - 6, 12, 12)).fill;
-
-  // Crisp pin badges fading in as route reaches each stop
-  for (let i = 0; i < pts.length; i++) {
-    const reach = Math.min(1.0, Math.max(0.0, (totalPos - (i - 0.15)) / 0.25));
-    const pinAlpha = i === 0 ? Math.min(1.0, progress / 0.15) : easeOutCubic(reach);
-    if (pinAlpha <= 0.02) continue;
-
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, pinAlpha).setFill;
-    $.NSBezierPath.bezierPathWithOvalInRect($.NSMakeRect(pts[i].x - 7, pts[i].y - 7, 14, 14)).fill;
-
-    const lblAttrs = makeTextAttrs(
-      $.NSFont.systemFontOfSizeWeight(24, $.NSFontWeightBold),
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.98, 0.97, 0.95, pinAlpha),
-      shadow
-    );
-    const subAttrs = makeTextAttrs(
-      $.NSFont.systemFontOfSizeWeight(16, $.NSFontWeightMedium),
-      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, pinAlpha * 0.95),
-      null
-    );
-
-    const lblText = pts[i].label;
-    const subText = pts[i].subtitle;
-    const lblSize = $(lblText).sizeWithAttributes(lblAttrs);
-    const subSize = subText ? $(subText).sizeWithAttributes(subAttrs) : { width: 0, height: 0 };
-    const pillW = Math.max(lblSize.width, subSize.width) + 32;
-    const pillH = subText ? 64 : 42;
-    const pillX = pts[i].x + 20;
-    const pillY = pts[i].y - pillH * 0.5;
-
-    const pill = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
-      $.NSMakeRect(pillX, pillY, pillW, pillH),
-      10,
-      10
-    );
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.07, 0.075, 0.095, 0.86 * pinAlpha).setFill;
-    pill.fill;
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.910, 0.773, 0.557, 0.45 * pinAlpha).setStroke;
-    pill.lineWidth = 1.2;
-    pill.stroke;
-
-    $(lblText).drawAtPointWithAttributes(
-      $.NSMakePoint(pillX + 16, pillY + (subText ? 30 : 9)),
-      lblAttrs
-    );
-    if (subText) {
-      $(subText).drawAtPointWithAttributes($.NSMakePoint(pillX + 16, pillY + 9), subAttrs);
-    }
-  }
-}
-
-function renderGraphicCardCI(shot, progress, width, height, backdropImg, lookId) {
-  const gType = shot.graphic_type || "chapter_title";
-  const hasBackdrop = Boolean(backdropImg);
-
-  const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(width, height));
-  canvas.lockFocus;
-  drawCardScrim(width, height, hasBackdrop);
-
-  if (gType === "route_map" && Array.isArray(shot.waypoints) && shot.waypoints.length > 0) {
-    drawRouteMapOverlay(shot, progress, width, height);
-  } else {
-    drawEditorialCardOverlay(shot, progress, width, height);
-  }
-
-  canvas.unlockFocus;
-  const rep = $.NSBitmapImageRep.imageRepWithData(canvas.TIFFRepresentation);
-  let overlayCI = $.CIImage.imageWithCGImage(rep.CGImage);
-  const oExt = overlayCI.extent;
-  if (oExt.size.width !== width || oExt.size.height !== height) {
-    overlayCI = overlayCI.imageByApplyingTransform(
-      $.CGAffineTransformMakeScale(width / oExt.size.width, height / oExt.size.height)
-    );
-  }
-
-  if (!hasBackdrop) return overlayCI;
-  const blurRadius = gType === "route_map" ? 26.0 : 16.0;
-  const bgCI = buildCardBackdropCI(backdropImg, progress, blurRadius, lookId || "warm_film", width, height);
-  return overlayCI.imageByCompositingOverImage(bgCI);
-}
-
-function renderCIImageToPixelBuffer(ciCtx, ciImg, pb, width, height, colorSpace) {
-  const rect = $.CGRectMake(0, 0, width, height);
-  $.CVPixelBufferLockBaseAddress(pb, 0);
-  const base = $.CVPixelBufferGetBaseAddress(pb);
-  const bpr = $.CVPixelBufferGetBytesPerRow(pb);
-  const cgCtx = $.CGBitmapContextCreate(
-    base,
-    width,
-    height,
-    8,
-    bpr,
-    colorSpace,
-    8194 // kCGImageAlphaPremultipliedFirst (2) | kCGBitmapByteOrder32Little (2 << 12)
-  );
-  if (cgCtx) {
-    if (ciCtx && typeof ciCtx.createCGImageFromRect === "function") {
-      const cgImg = ciCtx.createCGImageFromRect(ciImg, rect);
-      if (cgImg) $.CGContextDrawImage(cgCtx, rect, cgImg);
-    } else {
-      const rep = $.NSCIImageRep.imageRepWithCIImage(ciImg);
-      const nsGfx = $.NSGraphicsContext.graphicsContextWithCGContextFlipped(cgCtx, false);
-      $.NSGraphicsContext.saveGraphicsState;
-      $.NSGraphicsContext.setCurrentContext(nsGfx);
-      rep.drawInRect($.NSMakeRect(0, 0, width, height));
-      $.NSGraphicsContext.restoreGraphicsState;
-    }
-  }
-  $.CVPixelBufferUnlockBaseAddress(pb, 0);
 }
 
 function allocPixelBuffer(width, height) {
@@ -657,126 +813,121 @@ function allocPixelBuffer(width, height) {
   return pbRef[0];
 }
 
+function renderCIImageToPixelBuffer(ciCtx, ciImg, pb, width, height, colorSpace709) {
+  const rect = $.CGRectMake(0, 0, width, height);
+  if (ciCtx && typeof ciCtx.renderToCVPixelBufferBoundsColorSpace === "function" && colorSpace709) {
+    ciCtx.renderToCVPixelBufferBoundsColorSpace(ciImg, pb, rect, colorSpace709);
+    return;
+  }
+  if (ciCtx && typeof ciCtx.renderToCVPixelBuffer === "function") {
+    ciCtx.renderToCVPixelBuffer(ciImg, pb);
+    return;
+  }
+  // Fallback CPU rasterization via NSCIImageRep
+  $.CVPixelBufferLockBaseAddress(pb, 0);
+  const base = $.CVPixelBufferGetBaseAddress(pb);
+  const bpr = $.CVPixelBufferGetBytesPerRow(pb);
+  const cgCtx = $.CGBitmapContextCreate(base, width, height, 8, bpr, colorSpace709, 8194);
+  if (cgCtx) {
+    const rep = $.NSCIImageRep.imageRepWithCIImage(ciImg);
+    const nsGfx = $.NSGraphicsContext.graphicsContextWithCGContextFlipped(cgCtx, false);
+    $.NSGraphicsContext.saveGraphicsState;
+    $.NSGraphicsContext.setCurrentContext(nsGfx);
+    rep.drawInRect($.NSMakeRect(0, 0, width, height));
+    $.NSGraphicsContext.restoreGraphicsState;
+  }
+  $.CVPixelBufferUnlockBaseAddress(pb, 0);
+}
+
 function microYield(frameIdx) {
   if (frameIdx % 2 === 0) {
-    $.NSThread.sleepForTimeInterval(0.008);
+    $.NSThread.sleepForTimeInterval(0.005);
     $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.001));
   }
 }
 
-function appendVideoFrames(shotsSlice, totalEdlCount, startOffset, lookId, adaptor, videoInput, ciCtx, width, height, fps, logPath) {
-  const colorSpace = $.CGColorSpaceCreateDeviceRGB();
+function appendVideoFrames(shotsSlice, totalEdlCount, startOffset, style, libs, adaptor, videoInput, ciCtx, width, height, fps, logPath) {
+  const colorSpace709 = $.CGColorSpaceCreateWithName($.kCGColorSpaceITUR_709) || $.CGColorSpaceCreateDeviceRGB();
+  const timeline = computeTimeline(shotsSlice, style, fps, libs.Transitions);
+  const entries = timeline.entries;
   let globalFrame = 0;
 
-  for (let i = 0; i < shotsSlice.length; i++) {
-    const sIdx = startOffset + i;
-    const shot = shotsSlice[i];
-    const inSec = Number(shot.in_sec || 0);
-    const outSec = Number(shot.out_sec || 3);
-    const durSec = Math.max(0.2, outSec - inSec);
-    const numFrames = Math.max(1, Math.round(durSec * fps));
-    const mtype = shot.media_type || "photo";
-    const fadeIn = shot.fade_in !== undefined ? Number(shot.fade_in) : (mtype === "graphic" || sIdx === 0 ? 0.35 : 0.0);
-    const fadeOut = shot.fade_out !== undefined ? Number(shot.fade_out) : (mtype === "graphic" || sIdx === totalEdlCount - 1 ? 0.35 : 0.0);
-
-    logProgress(logPath, "[shot " + (i + 1) + "/" + shotsSlice.length + " (global " + (sIdx + 1) + "/" + totalEdlCount + ")] " + (shot.shot_id || mtype) + " (" + numFrames + "f)");
-
-    if (mtype === "graphic") {
-      const backdropImg = shot.backdrop_path ? loadOrientedCIImage(ciCtx, shot.backdrop_path, 2400) : null;
-      for (let f = 0; f < numFrames; f++) {
-        while (!videoInput.readyForMoreMediaData) $.NSThread.sleepForTimeInterval(0.005);
-        const prog = numFrames > 1 ? f / (numFrames - 1) : 1.0;
-        let ciFrame = renderGraphicCardCI(shot, prog, width, height, backdropImg, lookId);
-        ciFrame = applyFadeOverlay(ciFrame, f, numFrames, fps, fadeIn, fadeOut, width, height);
-        const pb = allocPixelBuffer(width, height);
-        renderCIImageToPixelBuffer(ciCtx, ciFrame, pb, width, height, colorSpace);
-        adaptor.appendPixelBufferWithPresentationTime(pb, $.CMTimeMake(globalFrame++, fps));
-        microYield(f);
-      }
-      continue;
-    }
-
-    if (mtype === "photo") {
-      const imgA = loadOrientedCIImage(ciCtx, shot.source_path, 2400);
-      const imgB = shot.pair_source_path ? loadOrientedCIImage(ciCtx, shot.pair_source_path, 2400) : null;
-      const isPortrait = shot.orientation === "portrait";
-      for (let f = 0; f < numFrames; f++) {
-        while (!videoInput.readyForMoreMediaData) $.NSThread.sleepForTimeInterval(0.005);
-        const prog = numFrames > 1 ? f / (numFrames - 1) : 0.0;
-        let ciFrame = isPortrait
-          ? renderPortraitComposite(imgA, imgB, shot.aspect_handling || "blurred_bg_pillarbox", prog, width, height)
-          : renderKenBurnsFrame(imgA, prog, shot.focal_anchor, shot.ken_burns_dir || "in", width, height);
-        ciFrame = applyLookFilter(ciFrame, lookId);
-        ciFrame = applyFadeOverlay(ciFrame, f, numFrames, fps, fadeIn, fadeOut, width, height);
-        const pb = allocPixelBuffer(width, height);
-        renderCIImageToPixelBuffer(ciCtx, ciFrame, pb, width, height, colorSpace);
-        adaptor.appendPixelBufferWithPresentationTime(pb, $.CMTimeMake(globalFrame++, fps));
-        microYield(f);
-      }
-      continue;
-    }
-
-    const AVURLAsset = avClass("AVURLAsset");
-    const AVAssetReader = avClass("AVAssetReader");
-    const AVAssetReaderTrackOutput = avClass("AVAssetReaderTrackOutput");
-    const asset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(shot.source_path), $({}));
-    const vTracks = asset.tracksWithMediaType($.AVMediaTypeVideo);
-    if (!vTracks || vTracks.count === 0) continue;
-    const vTrack = vTracks.objectAtIndex(0);
-    const reader = AVAssetReader.assetReaderWithAssetError(asset, null);
-    reader.timeRange = $.CMTimeRangeMake($.CMTimeMakeWithSeconds(inSec, 600), $.CMTimeMakeWithSeconds(durSec, 600));
-    const outOpts = $.NSMutableDictionary.dictionary;
-    outOpts.setObjectForKey($.NSNumber.numberWithUnsignedInt(1111970369), "PixelFormatType");
-    const output = AVAssetReaderTrackOutput.assetReaderTrackOutputWithTrackOutputSettings(vTrack, outOpts);
-    reader.addOutput(output);
-    reader.startReading;
-
-    // Map Y-down AVAssetTrack.preferredTransform to Quartz Y-up CGImagePropertyOrientation
-    const prefTransform = vTrack.preferredTransform;
-    const ta = Math.round(prefTransform.a);
-    const tb = Math.round(prefTransform.b);
-    const tc = Math.round(prefTransform.c);
-    const td = Math.round(prefTransform.d);
-    let cgOrient = 1;
-    if (ta === 0 && tb === 1 && tc === -1 && td === 0) cgOrient = 6;       // 90° CW portrait (standard iPhone)
-    else if (ta === 0 && tb === -1 && tc === 1 && td === 0) cgOrient = 8; // 90° CCW portrait
-    else if (ta === -1 && tb === 0 && tc === 0 && td === -1) cgOrient = 3; // 180° inverted
-
-    let lastImg = null;
-    let nextSample = output.copyNextSampleBuffer;
-    let nextPts = nextSample ? $.CMTimeGetSeconds($.CMSampleBufferGetPresentationTimeStamp(nextSample)) : Infinity;
-
-    for (let f = 0; f < numFrames; f++) {
-      const targetPts = inSec + f / fps;
-      while (nextSample && nextPts <= targetPts + 0.001) {
-        const imgBuf = $.CMSampleBufferGetImageBuffer(nextSample);
-        if (imgBuf) {
-          let ci = $.CIImage.imageWithCVImageBuffer(imgBuf);
-          if (cgOrient !== 1) ci = ci.imageByApplyingCGOrientation(cgOrient);
-          lastImg = normalizeOrigin(ci);
-        }
-        nextSample = output.copyNextSampleBuffer;
-        nextPts = nextSample ? $.CMTimeGetSeconds($.CMSampleBufferGetPresentationTimeStamp(nextSample)) : Infinity;
-      }
-      if (!lastImg) continue;
-      while (!videoInput.readyForMoreMediaData) $.NSThread.sleepForTimeInterval(0.005);
-      const prog = numFrames > 1 ? f / (numFrames - 1) : 0.0;
-      let ciFrame = shot.orientation === "portrait"
-        ? renderPortraitComposite(lastImg, null, "blurred_bg_pillarbox", prog, width, height)
-        : aspectFillAndCrop(lastImg, width, height);
-      ciFrame = applyLookFilter(ciFrame, lookId);
-      ciFrame = applyFadeOverlay(ciFrame, f, numFrames, fps, fadeIn, fadeOut, width, height);
-      const pb = allocPixelBuffer(width, height);
-      renderCIImageToPixelBuffer(ciCtx, ciFrame, pb, width, height, colorSpace);
-      adaptor.appendPixelBufferWithPresentationTime(pb, $.CMTimeMake(globalFrame++, fps));
-      microYield(f);
-    }
-    reader.cancelReading;
+  function writeFrame(ciFrame) {
+    while (!videoInput.readyForMoreMediaData) $.NSThread.sleepForTimeInterval(0.004);
+    const pb = allocPixelBuffer(width, height);
+    renderCIImageToPixelBuffer(ciCtx, ciFrame, pb, width, height, colorSpace709);
+    adaptor.appendPixelBufferWithPresentationTime(pb, $.CMTimeMake(globalFrame, fps));
+    $.CVPixelBufferRelease(pb);
+    microYield(globalFrame);
+    globalFrame++;
   }
+
+  let currProducer = null;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const shot = entry.shot;
+    const sIdx = startOffset + i;
+    const mtype = shot.media_type || "photo";
+    const fadeIn = shot.fade_in !== undefined ? Number(shot.fade_in) : (entry.overlapInFrames === 0 && (mtype === "graphic" || sIdx === 0) ? 0.35 : 0.0);
+    const fadeOut = shot.fade_out !== undefined ? Number(shot.fade_out) : (entry.overlapOutFrames === 0 && (mtype === "graphic" || sIdx === totalEdlCount - 1) ? 0.35 : 0.0);
+
+    if (!currProducer) {
+      currProducer = createShotProducer(entry, style, libs, width, height, fps);
+    }
+
+    logProgress(
+      logPath,
+      "[shot " + (i + 1) + "/" + entries.length + " (global " + (sIdx + 1) + "/" + totalEdlCount + ")] " +
+      (shot.shot_id || mtype) + " (" + entry.numFrames + "f, transOut=" + entry.transOut.type + ":" + entry.overlapOutFrames + "f)"
+    );
+
+    // 1. Render solo body of Shot i (excluding frames already blended in incoming/outgoing transitions)
+    const soloStart = entry.overlapInFrames;
+    const soloEnd = entry.numFrames - entry.overlapOutFrames;
+    for (let f = soloStart; f < soloEnd; f++) {
+      let ciFrame = currProducer.renderFrame(f, globalFrame);
+      if (mtype !== "graphic") {
+        ciFrame = libs.StyleEngine.applyStyleTextures(ciFrame, globalFrame, width, height, style, fps);
+      }
+      ciFrame = applyFadeOverlay(ciFrame, f, entry.numFrames, fps, fadeIn, fadeOut, width, height);
+      writeFrame(ciFrame);
+    }
+
+    // 2. Live Moving-Buffer Transition Lookahead into Shot i+1
+    if (entry.overlapOutFrames > 0 && i < entries.length - 1) {
+      const nextEntry = entries[i + 1];
+      const nextProducer = createShotProducer(nextEntry, style, libs, width, height, fps);
+      const ovCount = entry.overlapOutFrames;
+
+      for (let k = 0; k < ovCount; k++) {
+        const fA = (entry.numFrames - ovCount) + k;
+        const fB = k;
+        const p = (k + 0.5) / ovCount;
+
+        // BOTH Shot A tail and Shot B head advance live every frame!
+        const frameA = currProducer.renderFrame(fA, globalFrame);
+        const frameB = nextProducer.renderFrame(fB, globalFrame);
+        let blended = libs.Transitions.applyTransition(frameA, frameB, p, entry.transOut, width, height, style);
+        if (mtype !== "graphic" || (nextEntry.shot.media_type || "photo") !== "graphic") {
+          blended = libs.StyleEngine.applyStyleTextures(blended, globalFrame, width, height, style, fps);
+        }
+        writeFrame(blended);
+      }
+
+      currProducer.close();
+      currProducer = nextProducer;
+    } else {
+      currProducer.close();
+      currProducer = null;
+    }
+  }
+
+  if (currProducer) currProducer.close();
   return globalFrame / fps;
 }
 
-function renderVideoOnly(shotsSlice, totalEdlCount, startOffset, lookId, outPath, width, height, fps, logPath) {
+function renderVideoOnly(shotsSlice, totalEdlCount, startOffset, style, libs, outPath, width, height, fps, logPath) {
   ensureParentDir(outPath);
   const fm = $.NSFileManager.defaultManager;
   if (fm.fileExistsAtPath(outPath)) fm.removeItemAtPathError(outPath, null);
@@ -787,7 +938,8 @@ function renderVideoOnly(shotsSlice, totalEdlCount, startOffset, lookId, outPath
 
   const writer = AVAssetWriter.assetWriterWithURLFileTypeError($.NSURL.fileURLWithPath(outPath), $.AVFileTypeMPEG4, null);
   const compProps = $.NSMutableDictionary.dictionary;
-  compProps.setObjectForKey($.NSNumber.numberWithInt(12000000), $.AVVideoAverageBitRateKey);
+  const bitrate = width * height > 2500000 ? 24000000 : 14000000;
+  compProps.setObjectForKey($.NSNumber.numberWithInt(bitrate), $.AVVideoAverageBitRateKey);
 
   const videoSettings = $.NSMutableDictionary.dictionary;
   videoSettings.setObjectForKey($.AVVideoCodecTypeH264, $.AVVideoCodecKey);
@@ -811,12 +963,16 @@ function renderVideoOnly(shotsSlice, totalEdlCount, startOffset, lookId, outPath
   writer.startWriting;
   writer.startSessionAtSourceTime($.kCMTimeZero);
 
-  const ciCtx = $.CIContext.contextWithOptions($({}));
-  const renderedDur = appendVideoFrames(shotsSlice, totalEdlCount, startOffset, lookId, adaptor, videoInput, ciCtx, width, height, fps, logPath);
+  // Disable intermediate CoreImage caching to guarantee flat peak RSS across video batches
+  const ciOpts = $.NSMutableDictionary.dictionary;
+  ciOpts.setObjectForKey($.NSNumber.numberWithBool(false), $.kCIContextCacheIntermediates);
+  const ciCtx = $.CIContext.contextWithOptions(ciOpts);
+
+  const renderedDur = appendVideoFrames(shotsSlice, totalEdlCount, startOffset, style, libs, adaptor, videoInput, ciCtx, width, height, fps, logPath);
   videoInput.markAsFinished;
 
   logProgress(logPath, "Finishing AVAssetWriter (" + renderedDur.toFixed(2) + "s) -> " + outPath);
-  writer.finishWritingWithCompletionHandler(function() {});
+  writer.finishWritingWithCompletionHandler(function () {});
   while (Number(writer.status) === 1) {
     $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
   }
@@ -828,133 +984,429 @@ function renderVideoOnly(shotsSlice, totalEdlCount, startOffset, lookId, outPath
   return renderedDur;
 }
 
-function muxSegmentsAndAudio(edl, segmentPaths, finalOutputPath, logPath) {
+// =========================================================================
+// 2-STEP LOSSLESS 4-TRACK AUDIO MUX (NAT_A / NAT_B / BGM / SFX -> M4A -> PASSTHROUGH)
+// =========================================================================
+function mergeIntervals(intervals) {
+  if (!intervals || intervals.length === 0) return [];
+  const sorted = intervals.slice().sort((a, b) => a.start - b.start);
+  const merged = [Object.assign({}, sorted[0])];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const last = merged[merged.length - 1];
+    if (cur.start <= last.end + 0.5) {
+      last.end = Math.max(last.end, cur.end);
+      last.duckDb = Math.min(last.duckDb, cur.duckDb);
+    } else {
+      merged.push(Object.assign({}, cur));
+    }
+  }
+  return merged;
+}
+
+function resolveShotAudioSource(shot) {
+  const mtype = shot.media_type || "photo";
+  if (Array.isArray(shot.tiles) && shot.tiles.length > 0) {
+    if (shot.audio_lead_tile === -1) return null;
+    let leadTile = null;
+    if (typeof shot.audio_lead_tile === "number" && shot.audio_lead_tile >= 0 && shot.audio_lead_tile < shot.tiles.length) {
+      leadTile = shot.tiles[shot.audio_lead_tile];
+    } else {
+      for (let i = 0; i < shot.tiles.length; i++) {
+        if (shot.tiles[i].audio_lead) {
+          leadTile = shot.tiles[i];
+          break;
+        }
+      }
+    }
+    if (!leadTile || leadTile.media_type !== "video" || !leadTile.source_path) return null;
+    return {
+      path: leadTile.source_path,
+      inSec: Number(leadTile.in_sec || 0),
+    };
+  }
+  if (mtype === "video" && shot.source_path) {
+    return {
+      path: shot.source_path,
+      inSec: Number(shot.in_sec || 0),
+    };
+  }
+  return null;
+}
+
+function runExportSession(comp, preset, fileType, outPath, audioMix) {
+  const fm = $.NSFileManager.defaultManager;
+  if (fm.fileExistsAtPath(outPath)) fm.removeItemAtPathError(outPath, null);
+  const AVAssetExportSession = avClass("AVAssetExportSession");
+  const AVMutableAudioMix = avClass("AVMutableAudioMix");
+
+  const exporter = AVAssetExportSession.exportSessionWithAssetPresetName(comp, preset);
+  if (!exporter) throw new Error("Failed to create AVAssetExportSession for preset: " + ObjC.unwrap(preset));
+  exporter.outputURL = $.NSURL.fileURLWithPath(outPath);
+  exporter.outputFileType = fileType;
+  exporter.shouldOptimizeForNetworkUse = true;
+  if (audioMix && Number(audioMix.count) > 0) {
+    const mix = AVMutableAudioMix.audioMix;
+    mix.inputParameters = audioMix;
+    exporter.audioMix = mix;
+  }
+
+  exporter.exportAsynchronouslyWithCompletionHandler(function () {});
+  while (Number(exporter.status) === 1 || Number(exporter.status) === 2) {
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  }
+  if (Number(exporter.status) !== 3) {
+    const errDesc = exporter.error ? ObjC.unwrap(exporter.error.localizedDescription) : ("status=" + Number(exporter.status));
+    throw new Error("AVAssetExportSession (" + ObjC.unwrap(preset) + ") failed: " + errDesc);
+  }
+}
+
+function muxSegmentsAndAudio(edl, style, libs, segmentPaths, finalOutputPath, fps, logPath) {
   ensureParentDir(finalOutputPath);
   const fm = $.NSFileManager.defaultManager;
-  if (fm.fileExistsAtPath(finalOutputPath)) fm.removeItemAtPathError(finalOutputPath, null);
 
   const AVMutableComposition = avClass("AVMutableComposition");
   const AVURLAsset = avClass("AVURLAsset");
   const AVMutableAudioMixInputParameters = avClass("AVMutableAudioMixInputParameters");
-  const AVMutableAudioMix = avClass("AVMutableAudioMix");
-  const AVAssetExportSession = avClass("AVAssetExportSession");
 
-  const comp = AVMutableComposition.composition;
-  const vCompTrack = comp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeVideo, 0);
-
-  let videoCursor = $.kCMTimeZero;
-  for (const segPath of segmentPaths) {
-    const segAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(segPath), $({}));
-    const vTracks = segAsset.tracksWithMediaType($.AVMediaTypeVideo);
-    if (!vTracks || vTracks.count === 0) throw new Error("Segment has no video track: " + segPath);
-    const range = $.CMTimeRangeMake($.kCMTimeZero, segAsset.duration);
-    vCompTrack.insertTimeRangeOfTrackAtTimeError(range, vTracks.objectAtIndex(0), videoCursor, null);
-    videoCursor = $.CMTimeAdd(videoCursor, segAsset.duration);
+  // Measure total concatenated video duration first
+  let totalDurSec = 0.0;
+  for (let i = 0; i < segmentPaths.length; i++) {
+    const segAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(segmentPaths[i]), $({}));
+    totalDurSec += $.CMTimeGetSeconds(segAsset.duration);
   }
-  const totalDurSec = $.CMTimeGetSeconds(videoCursor);
+  if (totalDurSec <= 0.05) throw new Error("Concatenated video segments have zero duration.");
 
+  // ---- STEP 1: Build 4-Track Audio-Only Composition (NAT_A, NAT_B, BGM, SFX) -> AppleM4A ----
+  const audioComp = AVMutableComposition.composition;
   const mixParams = $.NSMutableArray.array;
-  let cursorSec = 0.0;
-  for (const shot of edl.shots) {
-    const inSec = Number(shot.in_sec || 0);
-    const outSec = Number(shot.out_sec || 3);
-    const durSec = Math.max(0.2, outSec - inSec);
-    if ((shot.media_type || "photo") === "video" && shot.source_path) {
-      const asset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(shot.source_path), $({}));
-      const aTracks = asset.tracksWithMediaType($.AVMediaTypeAudio);
-      if (aTracks && aTracks.count > 0) {
-        const compTrack = comp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
-        const range = $.CMTimeRangeMake($.CMTimeMakeWithSeconds(inSec, 600), $.CMTimeMakeWithSeconds(durSec, 600));
-        compTrack.insertTimeRangeOfTrackAtTimeError(range, aTracks.objectAtIndex(0), $.CMTimeMakeWithSeconds(cursorSec, 600), null);
-        const p = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(compTrack);
-        p.setVolumeAtTime(0.85, $.CMTimeMakeWithSeconds(cursorSec, 600));
-        mixParams.addObject(p);
-      }
+  const styleAudio = (style && style.audio) || {};
+  const bgmPath = edl.bgm_path || (edl.bgm && edl.bgm.audio_path) || null;
+  const hasBgm = Boolean(bgmPath && fm.fileExistsAtPath(bgmPath));
+
+  const timeline = computeTimeline(edl.shots || [], style, fps, libs.Transitions);
+  const natTrackA = audioComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
+  const natTrackB = audioComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
+  const natParamsA = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(natTrackA);
+  const natParamsB = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(natTrackB);
+  let natEndA = 0.0;
+  let natEndB = 0.0;
+  let natUsedA = false;
+  let natUsedB = false;
+  let natChannelToggle = 0;
+
+  const duckWindows = [];
+  const sfxCues = [];
+
+  for (let i = 0; i < timeline.entries.length; i++) {
+    const entry = timeline.entries[i];
+    const shot = entry.shot;
+    const aCfg = shot.audio || {};
+    const isSonic = Boolean(aCfg.sonic_postcard || shot.audio_mode === "sonic_postcard");
+    const duckDb = Number(aCfg.duck_db !== undefined ? aCfg.duck_db : (styleAudio.duck_bgm_db || -13.0));
+
+    if (aCfg.sfx_path && fm.fileExistsAtPath(aCfg.sfx_path)) {
+      sfxCues.push({
+        path: aCfg.sfx_path,
+        timeSec: Math.max(0.0, entry.endSec + Number(aCfg.sfx_offset_sec || 0.0)),
+        volume: 0.45,
+      });
     }
-    cursorSec += durSec;
+
+    const srcInfo = resolveShotAudioSource(shot);
+    const autoMuteRamp = entry.speedModel.peakSpeed > 1.3 && !isSonic;
+    if (!srcInfo || aCfg.mute === true || shot.audio_mode === "muted" || autoMuteRamp || !fm.fileExistsAtPath(srcInfo.path)) {
+      continue;
+    }
+
+    const asset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(srcInfo.path), $({}));
+    const aTracks = asset.tracksWithMediaType($.AVMediaTypeAudio);
+    if (!aTracks || Number(aTracks.count) === 0) continue;
+
+    const assetDur = $.CMTimeGetSeconds(asset.duration);
+    const jCut = Math.max(0.0, Math.min(Number(aCfg.j_cut_sec || 0.0), srcInfo.inSec, entry.startSec));
+    const lCut = Math.max(0.0, Number(aCfg.l_cut_sec || 0.0));
+
+    // Checkerboard alternating clips across NAT_A and NAT_B so J/L overlaps never collide
+    const useA = natChannelToggle % 2 === 0;
+    natChannelToggle++;
+    const track = useA ? natTrackA : natTrackB;
+    const params = useA ? natParamsA : natParamsB;
+    const prevTrackEnd = useA ? natEndA : natEndB;
+
+    const desiredStart = Math.max(prevTrackEnd + 0.02, entry.startSec - jCut);
+    const actualJ = Math.max(0.0, entry.startSec - desiredStart);
+    const srcStart = Math.max(0.0, srcInfo.inSec - actualJ);
+    const desiredEnd = Math.min(totalDurSec, entry.endSec + lCut);
+    const clipDur = Math.min(desiredEnd - desiredStart, Math.max(0.0, assetDur - srcStart));
+    if (clipDur < 0.08) continue;
+
+    const srcRange = $.CMTimeRangeMake($.CMTimeMakeWithSeconds(srcStart, 600), $.CMTimeMakeWithSeconds(clipDur, 600));
+    track.insertTimeRangeOfTrackAtTimeError(srcRange, aTracks.objectAtIndex(0), $.CMTimeMakeWithSeconds(desiredStart, 600), null);
+
+    const baseNatVol = aCfg.volume !== undefined
+      ? Number(aCfg.volume)
+      : (isSonic ? 0.96 : (hasBgm ? Number(styleAudio.default_nat_bed_volume || 0.25) : 0.85));
+
+    const fadeIn = Math.min(clipDur * 0.35, actualJ > 0.05 ? 0.35 : 0.12);
+    const fadeOut = Math.min(clipDur * 0.35, lCut > 0.05 ? 0.45 : 0.14);
+    if (fadeIn > 0.02) {
+      params.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
+        0.0,
+        baseNatVol,
+        $.CMTimeRangeMake($.CMTimeMakeWithSeconds(desiredStart, 600), $.CMTimeMakeWithSeconds(fadeIn, 600))
+      );
+    } else {
+      params.setVolumeAtTime(baseNatVol, $.CMTimeMakeWithSeconds(desiredStart, 600));
+    }
+    if (fadeOut > 0.02) {
+      params.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
+        baseNatVol,
+        0.0,
+        $.CMTimeRangeMake($.CMTimeMakeWithSeconds(desiredStart + clipDur - fadeOut, 600), $.CMTimeMakeWithSeconds(fadeOut, 600))
+      );
+    }
+
+    if (useA) {
+      natEndA = desiredStart + clipDur;
+      natUsedA = true;
+    } else {
+      natEndB = desiredStart + clipDur;
+      natUsedB = true;
+    }
+
+    if (isSonic) {
+      duckWindows.push({ start: desiredStart, end: desiredStart + clipDur, duckDb: duckDb });
+    }
   }
 
-  if (edl.bgm_path && fm.fileExistsAtPath(edl.bgm_path)) {
-    const bgmAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(edl.bgm_path), $({}));
+  if (natUsedA) mixParams.addObject(natParamsA);
+  else audioComp.removeTrack(natTrackA);
+  if (natUsedB) mixParams.addObject(natParamsB);
+  else audioComp.removeTrack(natTrackB);
+
+  // Track 3: BGM with smooth Sonic Postcard (-13 dB) volume ramps & end fade-out
+  if (hasBgm) {
+    const bgmAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(bgmPath), $({}));
     const bgmTracks = bgmAsset.tracksWithMediaType($.AVMediaTypeAudio);
-    if (bgmTracks && bgmTracks.count > 0) {
+    if (bgmTracks && Number(bgmTracks.count) > 0) {
       const bgmSrc = bgmTracks.objectAtIndex(0);
       const bgmDur = $.CMTimeGetSeconds(bgmAsset.duration);
-      const bgmCompTrack = comp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
+      const bgmTrack = audioComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
       let filled = 0.0;
       while (filled < totalDurSec && bgmDur > 0.1) {
         const segDur = Math.min(bgmDur, totalDurSec - filled);
-        const r = $.CMTimeRangeMake($.kCMTimeZero, $.CMTimeMakeWithSeconds(segDur, 600));
-        bgmCompTrack.insertTimeRangeOfTrackAtTimeError(r, bgmSrc, $.CMTimeMakeWithSeconds(filled, 600), null);
+        bgmTrack.insertTimeRangeOfTrackAtTimeError(
+          $.CMTimeRangeMake($.kCMTimeZero, $.CMTimeMakeWithSeconds(segDur, 600)),
+          bgmSrc,
+          $.CMTimeMakeWithSeconds(filled, 600),
+          null
+        );
         filled += segDur;
       }
-      const p = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(bgmCompTrack);
-      p.setVolumeAtTime(0.65, $.kCMTimeZero);
-      if (totalDurSec > 2.0) {
-        p.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
-          0.65,
+
+      const bgmParams = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(bgmTrack);
+      const bgmVol = Number((edl.bgm && edl.bgm.volume) || styleAudio.default_bgm_volume || 0.72);
+      const endFadeDur = totalDurSec > 2.5 ? 1.8 : Math.min(0.8, totalDurSec * 0.4);
+      const endFadeStart = Math.max(0.0, totalDurSec - endFadeDur);
+
+      bgmParams.setVolumeAtTime(bgmVol, $.kCMTimeZero);
+
+      const mergedDucks = mergeIntervals(duckWindows);
+      let cursor = 0.0;
+      for (let d = 0; d < mergedDucks.length; d++) {
+        const w = mergedDucks[d];
+        const duckLinear = Math.max(0.03, bgmVol * Math.pow(10.0, (w.duckDb || -13.0) / 20.0));
+        const downStart = Math.max(cursor, w.start - 0.45);
+        const downEnd = Math.min(endFadeStart, Math.max(downStart + 0.05, w.start));
+        const holdEnd = Math.min(endFadeStart, Math.max(downEnd, w.end));
+        const upEnd = Math.min(endFadeStart, holdEnd + 0.75);
+
+        if (downEnd > downStart + 0.02) {
+          bgmParams.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
+            bgmVol,
+            duckLinear,
+            $.CMTimeRangeMake($.CMTimeMakeWithSeconds(downStart, 600), $.CMTimeMakeWithSeconds(downEnd - downStart, 600))
+          );
+        } else {
+          bgmParams.setVolumeAtTime(duckLinear, $.CMTimeMakeWithSeconds(downStart, 600));
+        }
+        if (upEnd > holdEnd + 0.02) {
+          bgmParams.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
+            duckLinear,
+            bgmVol,
+            $.CMTimeRangeMake($.CMTimeMakeWithSeconds(holdEnd, 600), $.CMTimeMakeWithSeconds(upEnd - holdEnd, 600))
+          );
+        }
+        cursor = upEnd;
+      }
+
+      if (endFadeDur > 0.05) {
+        bgmParams.setVolumeRampFromStartVolumeToEndVolumeTimeRange(
+          bgmVol,
           0.0,
-          $.CMTimeRangeMake($.CMTimeMakeWithSeconds(totalDurSec - 1.8, 600), $.CMTimeMakeWithSeconds(1.8, 600))
+          $.CMTimeRangeMake($.CMTimeMakeWithSeconds(endFadeStart, 600), $.CMTimeMakeWithSeconds(endFadeDur, 600))
         );
       }
-      mixParams.addObject(p);
+      mixParams.addObject(bgmParams);
     }
   }
 
-  logProgress(logPath, "Exporting muxed master (" + totalDurSec.toFixed(2) + "s) -> " + finalOutputPath);
-  const exporter = AVAssetExportSession.exportSessionWithAssetPresetName(comp, $.AVAssetExportPresetHighestQuality);
-  exporter.outputURL = $.NSURL.fileURLWithPath(finalOutputPath);
-  exporter.outputFileType = $.AVFileTypeMPEG4;
-  exporter.shouldOptimizeForNetworkUse = true;
-  if (mixParams.count > 0) {
-    const audioMix = AVMutableAudioMix.audioMix;
-    audioMix.inputParameters = mixParams;
-    exporter.audioMix = audioMix;
+  // Track 4: Optional SFX track
+  if (Array.isArray(edl.sfx_events)) {
+    for (let i = 0; i < edl.sfx_events.length; i++) {
+      const ev = edl.sfx_events[i];
+      if (ev && ev.path && fm.fileExistsAtPath(ev.path)) {
+        sfxCues.push({
+          path: ev.path,
+          timeSec: Math.max(0.0, Number(ev.time_sec || 0) - Number(ev.peak_offset_sec || 0)),
+          volume: Number(ev.volume || 0.45),
+        });
+      }
+    }
+  }
+  if (sfxCues.length > 0) {
+    sfxCues.sort((a, b) => a.timeSec - b.timeSec);
+    const sfxTrack = audioComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
+    const sfxParams = AVMutableAudioMixInputParameters.audioMixInputParametersWithTrack(sfxTrack);
+    let sfxCursor = 0.0;
+    let sfxInserted = false;
+    for (let i = 0; i < sfxCues.length; i++) {
+      const cue = sfxCues[i];
+      if (cue.timeSec >= totalDurSec - 0.05) continue;
+      const startAt = Math.max(sfxCursor + 0.02, cue.timeSec);
+      const sfxAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(cue.path), $({}));
+      const sTracks = sfxAsset.tracksWithMediaType($.AVMediaTypeAudio);
+      if (!sTracks || Number(sTracks.count) === 0) continue;
+      const sDur = Math.min($.CMTimeGetSeconds(sfxAsset.duration), totalDurSec - startAt);
+      if (sDur < 0.03) continue;
+      sfxTrack.insertTimeRangeOfTrackAtTimeError(
+        $.CMTimeRangeMake($.kCMTimeZero, $.CMTimeMakeWithSeconds(sDur, 600)),
+        sTracks.objectAtIndex(0),
+        $.CMTimeMakeWithSeconds(startAt, 600),
+        null
+      );
+      sfxParams.setVolumeAtTime(cue.volume, $.CMTimeMakeWithSeconds(startAt, 600));
+      sfxCursor = startAt + sDur;
+      sfxInserted = true;
+    }
+    if (sfxInserted) mixParams.addObject(sfxParams);
+    else audioComp.removeTrack(sfxTrack);
   }
 
-  exporter.exportAsynchronouslyWithCompletionHandler(function() {});
-  while (Number(exporter.status) === 1 || Number(exporter.status) === 2) {
-    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  let mixedAudioPath = null;
+  if (Number(mixParams.count) > 0) {
+    mixedAudioPath = finalOutputPath + ".audio_mix_tmp.m4a";
+    logProgress(logPath, "Step 1/2: Exporting 4-track audio mix via AVAssetExportPresetAppleM4A -> " + mixedAudioPath);
+    runExportSession(audioComp, $.AVAssetExportPresetAppleM4A, $.AVFileTypeAppleM4A, mixedAudioPath, mixParams);
   }
 
-  if (Number(exporter.status) !== 3) {
-    const errDesc = exporter.error ? ObjC.unwrap(exporter.error.localizedDescription) : ("status=" + Number(exporter.status));
-    throw new Error("AVAssetExportSession failed: " + errDesc);
+  // ---- STEP 2: Lossless Video+Audio Passthrough Mux (ZERO video re-encode!) ----
+  const finalComp = AVMutableComposition.composition;
+  const vCompTrack = finalComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeVideo, 0);
+  let videoCursor = $.kCMTimeZero;
+  for (let i = 0; i < segmentPaths.length; i++) {
+    const segAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(segmentPaths[i]), $({}));
+    const vTracks = segAsset.tracksWithMediaType($.AVMediaTypeVideo);
+    if (!vTracks || Number(vTracks.count) === 0) throw new Error("Segment has no video track: " + segmentPaths[i]);
+    vCompTrack.insertTimeRangeOfTrackAtTimeError(
+      $.CMTimeRangeMake($.kCMTimeZero, segAsset.duration),
+      vTracks.objectAtIndex(0),
+      videoCursor,
+      null
+    );
+    videoCursor = $.CMTimeAdd(videoCursor, segAsset.duration);
   }
-  return totalDurSec;
+
+  if (mixedAudioPath && fm.fileExistsAtPath(mixedAudioPath)) {
+    const m4aAsset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(mixedAudioPath), $({}));
+    const m4aTracks = m4aAsset.tracksWithMediaType($.AVMediaTypeAudio);
+    if (m4aTracks && Number(m4aTracks.count) > 0) {
+      const aCompTrack = finalComp.addMutableTrackWithMediaTypePreferredTrackID($.AVMediaTypeAudio, 0);
+      const audioDur = $.CMTimeMinimum(m4aAsset.duration, videoCursor);
+      aCompTrack.insertTimeRangeOfTrackAtTimeError(
+        $.CMTimeRangeMake($.kCMTimeZero, audioDur),
+        m4aTracks.objectAtIndex(0),
+        $.kCMTimeZero,
+        null
+      );
+    }
+  }
+
+  logProgress(logPath, "Step 2/2: Lossless Passthrough mux (" + $.CMTimeGetSeconds(videoCursor).toFixed(2) + "s) -> " + finalOutputPath);
+  runExportSession(finalComp, $.AVAssetExportPresetPassthrough, $.AVFileTypeMPEG4, finalOutputPath, null);
+
+  if (mixedAudioPath && fm.fileExistsAtPath(mixedAudioPath)) {
+    fm.removeItemAtPathError(mixedAudioPath, null);
+  }
+  return $.CMTimeGetSeconds(videoCursor);
 }
 
+// =========================================================================
+// MAIN ENTRYPOINT
+// =========================================================================
 function run(argv) {
   const args = parseArgs(argv);
   if (args.help) {
     return JSON.stringify({
-      usage: "osascript -l JavaScript macos_render_trip.jxa --edl ./work/edl.json --output <out.mp4> [--start-shot 0 --end-shot 10 --video-only] [--mux-segments s1.mp4,s2.mp4] [--width 1920] [--height 1080] [--fps 30] [--dry-run]",
+      version: "0.2.0",
+      usage: "osascript -l JavaScript macos_render_trip.jxa --edl ./work/edl.json --output <out.mp4> [--style-id <id>] [--styles-dir <dir>] [--start-shot 0 --end-shot 6 --video-only] [--mux-segments s1.mp4,s2.mp4] [--width 1920] [--height 1080] [--fps 30] [--dry-run]",
+      capabilities: [
+        "7 Style Packs (lib/style_engine.js)",
+        "7 Single & Multi-Video Layouts (lib/layouts.js)",
+        "10 Live Moving-Buffer Transitions (lib/transitions.js)",
+        "6 Style-Aware Graphic Cards + Synced Elevation Profile (lib/cards.js)",
+        "Unified Rec.709 Hardware Video Decoder (AVAssetReaderVideoCompositionOutput)",
+        "Closed-Form Piecewise Cubic Speed Ramping",
+        "2-Step Lossless 4-Track J/L-Cut + Sonic Postcard Audio Mux (AppleM4A -> Passthrough)",
+      ],
     }, null, 2);
   }
   if (!args.edl) throw new Error("Missing --edl <edl.json>.");
 
+  const scriptDir = resolveScriptDir();
+  const libs = loadNativeLibs(scriptDir);
   const edl = readJsonFile(args.edl);
   const allShots = edl.shots || [];
   if (allShots.length === 0) throw new Error("EDL has no shots.");
 
+  const stylesDir = args.stylesDir || ObjC.unwrap($(scriptDir + "/../../styles").stringByStandardizingPath);
+  const styleId = args.styleId || edl.style_id || "cinema_doc";
+  const legacyLook = edl.look_id || edl.color_look || null;
+  const style = libs.StyleEngine.loadStylePack(styleId, stylesDir, legacyLook, edl.style_overrides);
+
+  const dims = resolveCanvasDims(args, edl);
   const startIdx = args.startShot !== null ? Math.max(0, args.startShot) : 0;
   const endIdx = args.endShot !== null ? Math.min(allShots.length, args.endShot) : allShots.length;
   const shotsSlice = allShots.slice(startIdx, endIdx);
+  const timeline = computeTimeline(shotsSlice, style, dims.fps, libs.Transitions);
 
-  const estDuration = shotsSlice.reduce((acc, s) => acc + Math.max(0.2, Number(s.out_sec || 3) - Number(s.in_sec || 0)), 0);
   if (args.dryRun) {
+    const transitionCount = timeline.entries.filter((e) => e.overlapOutFrames > 0).length;
+    const speedRampCount = timeline.entries.filter((e) => e.speedModel.mode === "cubic_ramp" || (e.speedModel.mode === "constant" && Math.abs(e.speedModel.peakSpeed - 1.0) > 0.05)).length;
+    const multiVideoCount = shotsSlice.filter((s) => Array.isArray(s.tiles) && s.tiles.length >= 2).length;
+    const sonicPostcards = shotsSlice.filter((s) => (s.audio && s.audio.sonic_postcard) || s.audio_mode === "sonic_postcard").length;
     return JSON.stringify({
       status: "dry_run",
-      renderer: "macos-native-avfoundation-jxa",
+      version: "0.2.0",
+      renderer: "macos-native-avfoundation-jxa-v2",
       output: args.output,
       mode: args.muxSegments ? "mux_segments" : (args.videoOnly ? "video_only_slice" : "full_render"),
-      resolution: args.width + "x" + args.height,
-      fps: args.fps,
+      aspect_profile: edl.aspect_profile || (dims.height > dims.width ? "9:16" : "16:9"),
+      resolution: dims.width + "x" + dims.height,
+      fps: dims.fps,
+      style_id: style.style_id,
+      style_display_name: style.display_name,
+      styles_dir: stylesDir,
       start_shot: startIdx,
       end_shot: endIdx,
       shot_count: shotsSlice.length,
-      estimated_duration_sec: Number(estDuration.toFixed(2)),
-      look_id: edl.look_id || "clean_natural",
+      estimated_duration_sec: Number(timeline.totalDurSec.toFixed(2)),
+      overlap_transitions: transitionCount,
+      speed_ramped_shots: speedRampCount,
+      multi_source_grid_shots: multiVideoCount,
+      sonic_postcards: sonicPostcards,
+      libs_loaded: ["style_engine.js", "layouts.js", "transitions.js", "cards.js"],
     }, null, 2);
   }
 
@@ -963,22 +1415,27 @@ function run(argv) {
   if (fm.fileExistsAtPath(logPath)) fm.removeItemAtPathError(logPath, null);
 
   if (args.muxSegments && args.muxSegments.length > 0) {
-    const dur = muxSegmentsAndAudio(edl, args.muxSegments, args.output, logPath);
+    const dur = muxSegmentsAndAudio(edl, style, libs, args.muxSegments, args.output, dims.fps, logPath);
     return JSON.stringify({
       status: "muxed",
-      renderer: "macos-native-avfoundation-jxa",
+      version: "0.2.0",
+      renderer: "macos-native-avfoundation-jxa-v2",
       output: args.output,
+      style_id: style.style_id,
       segment_count: args.muxSegments.length,
       duration_sec: Number(dur.toFixed(2)),
     }, null, 2);
   }
 
   if (args.videoOnly) {
-    const dur = renderVideoOnly(shotsSlice, allShots.length, startIdx, edl.look_id || "clean_natural", args.output, args.width, args.height, args.fps, logPath);
+    const dur = renderVideoOnly(shotsSlice, allShots.length, startIdx, style, libs, args.output, dims.width, dims.height, dims.fps, logPath);
     return JSON.stringify({
       status: "rendered_video_only",
-      renderer: "macos-native-avfoundation-jxa",
+      version: "0.2.0",
+      renderer: "macos-native-avfoundation-jxa-v2",
       output: args.output,
+      style_id: style.style_id,
+      resolution: dims.width + "x" + dims.height,
       start_shot: startIdx,
       end_shot: endIdx,
       shot_count: shotsSlice.length,
@@ -987,14 +1444,17 @@ function run(argv) {
   }
 
   const videoTmpPath = args.output + ".video_tmp.mp4";
-  const renderedDur = renderVideoOnly(shotsSlice, allShots.length, startIdx, edl.look_id || "clean_natural", videoTmpPath, args.width, args.height, args.fps, logPath);
-  muxSegmentsAndAudio(edl, [videoTmpPath], args.output, logPath);
+  const renderedDur = renderVideoOnly(shotsSlice, allShots.length, startIdx, style, libs, videoTmpPath, dims.width, dims.height, dims.fps, logPath);
+  muxSegmentsAndAudio(edl, style, libs, [videoTmpPath], args.output, dims.fps, logPath);
   if (fm.fileExistsAtPath(videoTmpPath)) fm.removeItemAtPathError(videoTmpPath, null);
 
   return JSON.stringify({
     status: "rendered",
-    renderer: "macos-native-avfoundation-jxa",
+    version: "0.2.0",
+    renderer: "macos-native-avfoundation-jxa-v2",
     output: args.output,
+    style_id: style.style_id,
+    resolution: dims.width + "x" + dims.height,
     duration_sec: Number(renderedDur.toFixed(2)),
     shot_count: shotsSlice.length,
   }, null, 2);

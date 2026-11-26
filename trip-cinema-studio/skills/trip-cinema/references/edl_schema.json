@@ -1,30 +1,68 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://trip-cinema-studio.local/schemas/edl.schema.json",
-  "title": "Trip Cinema Studio Edit Decision List (EDL)",
+  "title": "Trip Cinema Studio Edit Decision List (EDL v2.0)",
+  "description": "Backward-compatible EDL v2.0 schema supporting declarative Style Packs, Video-First 80% video timelines, closed-form cubic speed ramps, multi-video grids, live moving transitions, 4-track J/L-cut and Sonic Postcard audio, and style-aware graphic cards.",
   "type": "object",
   "required": [
     "version",
     "resolution",
     "fps",
-    "color_look",
-    "vertical_layout",
-    "bgm",
-    "chapters",
     "shots"
   ],
   "properties": {
     "version": {
       "type": "string",
-      "const": "1.0"
+      "enum": ["1.0", "2.0"],
+      "default": "2.0"
     },
     "title": {
       "type": "string",
       "description": "Film title derived from trip dates/locations."
     },
+    "style_id": {
+      "type": "string",
+      "enum": [
+        "cinema_doc",
+        "analog_scrapbook",
+        "wes_postcard",
+        "kinetic_montage",
+        "editorial_bento",
+        "super8_nostalgia",
+        "sitcom_cast"
+      ],
+      "default": "cinema_doc",
+      "description": "Declarative Style Pack preset ID matching skills/trip-cinema/styles/<style_id>.json."
+    },
+    "look_id": {
+      "type": "string",
+      "enum": [
+        "warm_film",
+        "moody_teal_orange",
+        "clean_natural",
+        "soft_atmospheric"
+      ],
+      "description": "Optional explicit color grade override; defaults to the active Style Pack's color_grade."
+    },
+    "color_look": {
+      "type": "string",
+      "enum": [
+        "warm_film",
+        "moody_teal_orange",
+        "clean_natural",
+        "soft_atmospheric"
+      ],
+      "description": "Legacy v1.0 alias for look_id."
+    },
+    "aspect_profile": {
+      "type": "string",
+      "enum": ["16:9", "9:16"],
+      "default": "16:9",
+      "description": "Master canvas aspect ratio: 16:9 horizontal feature (1920x1080/3840x2160) or 9:16 vertical teaser (1080x1920)."
+    },
     "resolution": {
       "type": "string",
-      "enum": ["1920x1080", "3840x2160"],
+      "enum": ["1920x1080", "3840x2160", "1080x1920"],
       "default": "1920x1080"
     },
     "fps": {
@@ -32,64 +70,66 @@
       "enum": [24, 29.97, 30, 60],
       "default": 30
     },
-    "color_look": {
-      "type": "string",
-      "enum": ["warm_film", "moody_teal_orange", "clean_natural", "soft_atmospheric"]
-    },
     "vertical_layout": {
       "type": "string",
-      "enum": ["split_diptych_pair", "blurred_bg_pillarbox"]
+      "enum": [
+        "split_diptych_pair",
+        "blurred_bg_pillarbox",
+        "split_2up_video",
+        "triptych_3up_video",
+        "bento_living_grid",
+        "polaroid_stack",
+        "super8_frame"
+      ],
+      "description": "Default portrait layout fallback when individual shots omit shot.layout."
     },
     "budget_mode": {
       "type": "string",
-      "enum": ["local_zero_cost", "hybrid_i2v"]
+      "enum": ["local_zero_cost", "hybrid_i2v"],
+      "default": "local_zero_cost"
     },
     "i2v_cost_cap_usd": {
       "type": "number",
-      "minimum": 0
+      "minimum": 0,
+      "default": 0
+    },
+    "bgm_path": {
+      "type": "string",
+      "description": "Flat audio file path shortcut for background music (runtime-compatible alias for bgm.audio_path)."
     },
     "bgm": {
       "type": "object",
-      "required": ["audio_path", "target_lufs", "target_lra"],
       "properties": {
         "audio_path": { "type": "string" },
         "source_type": { "type": "string", "enum": ["cc0", "lyria_3_5", "user_local"] },
         "bpm": { "type": "number", "minimum": 30, "maximum": 240 },
-        "target_lufs": { "type": "number", "const": -14 },
-        "target_lra": { "type": "number", "const": 9 },
-        "beat_map_path": { "type": "string" }
+        "target_lufs": { "type": "number", "default": -14 },
+        "target_lra": { "type": "number", "default": 9 },
+        "beat_map_path": { "type": "string" },
+        "volume": { "type": "number", "minimum": 0, "maximum": 1.5 }
       }
     },
     "chapters": {
       "type": "array",
-      "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["chapter_id", "title", "start_date"],
+        "required": ["chapter_id", "title"],
         "properties": {
           "chapter_id": { "type": "string" },
           "title": { "type": "string" },
           "subtitle": { "type": "string" },
           "eyebrow": {
             "type": "string",
-            "description": "Short editorial eyebrow label above the chapter title (e.g., 'DAY 01 · TOKYO')."
+            "description": "Short editorial eyebrow label above the chapter title (e.g., 'DAY 01 · MOUNTAIN PASS')."
           },
           "backdrop_path": {
             "type": "string",
-            "description": "Hero photo path from this chapter used as a softly blurred, vignetted, slow-zooming backdrop for the editorial chapter card (never a plain black slide)."
+            "description": "Hero photo or video frame from this chapter used as a blurred, vignetted, slow-zooming chapter card backdrop."
           },
           "start_date": { "type": "string" },
           "gps_waypoints": {
             "type": "array",
-            "items": {
-              "type": "object",
-              "required": ["lat", "lon"],
-              "properties": {
-                "lat": { "type": "number" },
-                "lon": { "type": "number" },
-                "label": { "type": "string" }
-              }
-            }
+            "items": { "$ref": "#/$defs/waypoint" }
           }
         }
       }
@@ -102,82 +142,340 @@
         "required": [
           "shot_id",
           "chapter_id",
-          "source_path",
-          "media_type",
-          "in_sec",
-          "out_sec",
-          "duration_sec",
-          "motion_type",
-          "has_human_closeup",
-          "locked_by_user"
+          "media_type"
         ],
         "properties": {
           "shot_id": { "type": "string" },
           "chapter_id": { "type": "string" },
-          "source_path": { "type": "string" },
+          "source_path": {
+            "type": "string",
+            "description": "Primary media path for photo/video shots or hero image for text_behind_subject/cast_intro graphics."
+          },
           "pair_source_path": {
             "type": "string",
-            "description": "Second vertical photo path when aspect_handling is split_diptych_pair."
-          },
-          "aspect_handling": {
-            "type": "string",
-            "enum": ["split_diptych_pair", "blurred_bg_pillarbox"]
+            "description": "Legacy second portrait path when layout/aspect_handling is split_diptych_pair."
           },
           "media_type": {
             "type": "string",
-            "enum": ["photo", "video"]
+            "enum": ["photo", "video", "graphic"]
           },
-          "orientation": {
-            "type": "string",
-            "enum": ["landscape", "portrait", "square"]
-          },
-          "in_sec": { "type": "number", "minimum": 0 },
-          "out_sec": { "type": "number", "minimum": 0 },
-          "duration_sec": { "type": "number", "exclusiveMinimum": 0 },
-          "source_duration_sec": { "type": "number", "minimum": 0 },
-          "use_i2v": { "type": "boolean", "default": false },
-          "motion_type": {
+          "graphic_type": {
             "type": "string",
             "enum": [
-              "native_video",
-              "vidstab_video",
-              "ken_burns_in",
-              "ken_burns_out",
-              "ken_burns_pan",
-              "depth_parallax_2_5d",
-              "omni_i2v_scenic"
-            ]
+              "chapter_title",
+              "route_map",
+              "trip_wrapped",
+              "cast_intro",
+              "text_behind_subject",
+              "blooper_title"
+            ],
+            "description": "Card archetype when media_type is 'graphic'."
           },
-          "focal_anchor": {
-            "type": "object",
-            "properties": {
-              "x": { "type": "number", "minimum": 0, "maximum": 1 },
-              "y": { "type": "number", "minimum": 0, "maximum": 1 }
-            }
-          },
-          "has_human_closeup": {
-            "type": "boolean",
-            "description": "Must be false whenever motion_type is omni_i2v_scenic."
-          },
-          "locked_by_user": { "type": "boolean" },
-          "stabilize": { "type": "boolean", "default": false },
-          "transition": {
-            "type": "string",
-            "enum": ["cut", "xfade_dissolve", "j_cut", "l_cut"],
-            "default": "cut"
-          },
-          "overlay": {
-            "type": "string",
-            "enum": ["none", "chapter_title", "route_map"],
-            "default": "none"
-          },
+          "title": { "type": "string" },
+          "subtitle": { "type": "string" },
           "eyebrow": {
             "type": "string",
             "description": "Short editorial eyebrow label rendered above the chapter/title card heading."
           },
           "backdrop_path": {
             "type": "string",
-            "description": "Hero photo path from the chapter used as a softly blurred, vignetted, slow-zooming backdrop for visual editorial chapter cards (never flat black slides)."
+            "description": "Hero photo path used as a blurred, vignetted, slow-zooming backdrop for graphic cards."
+          },
+          "mask_path": {
+            "type": "string",
+            "description": "Optional pre-extracted PNG foreground alpha mask (from macos_extract_masks.jxa) for text_behind_subject or cast_intro."
+          },
+          "waypoints": {
+            "type": "array",
+            "description": "Ordered GPS stops for graphic_type='route_map'.",
+            "items": { "$ref": "#/$defs/waypoint" }
+          },
+          "elevation_profile": {
+            "description": "Enable or configure a synced elevation sparkline beneath route_map cards.",
+            "oneOf": [
+              { "type": "boolean" },
+              {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean", "default": true },
+                  "unit": { "type": "string", "enum": ["m", "ft"], "default": "m" },
+                  "min_m": { "type": "number" },
+                  "max_m": { "type": "number" },
+                  "points": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["label", "elevation_m"],
+                      "properties": {
+                        "label": { "type": "string" },
+                        "elevation_m": { "type": "number" }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "stats": {
+            "type": "array",
+            "description": "Verified EXIF/GPS stat cards for graphic_type='trip_wrapped'. Omit metrics with <30% coverage.",
+            "items": {
+              "type": "object",
+              "required": ["label", "value"],
+              "properties": {
+                "label": { "type": "string" },
+                "value": { "type": ["string", "number"] },
+                "unit": { "type": "string" },
+                "icon": { "type": "string" },
+                "coverage_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+              }
+            }
+          },
+          "cast_member": {
+            "type": "object",
+            "description": "Traveler nameplate metadata for graphic_type='cast_intro'.",
+            "properties": {
+              "name": { "type": "string" },
+              "nickname": { "type": "string" },
+              "role": { "type": "string" }
+            }
+          },
+          "layout": {
+            "type": "string",
+            "enum": [
+              "single",
+              "split_diptych_pair",
+              "blurred_bg_pillarbox",
+              "split_2up_video",
+              "triptych_3up_video",
+              "bento_living_grid",
+              "polaroid_stack",
+              "super8_frame"
+            ],
+            "default": "single",
+            "description": "Visual composition layout for single or multi-source shots."
+          },
+          "aspect_handling": {
+            "type": "string",
+            "enum": [
+              "single",
+              "split_diptych_pair",
+              "blurred_bg_pillarbox",
+              "split_2up_video",
+              "triptych_3up_video",
+              "bento_living_grid",
+              "polaroid_stack",
+              "super8_frame"
+            ],
+            "description": "Legacy v1.0 alias for shot.layout."
+          },
+          "tiles": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 4,
+            "description": "Concurrent video and/or photo sources for split_2up_video, triptych_3up_video, bento_living_grid, polaroid_stack, or split_diptych_pair.",
+            "items": {
+              "type": "object",
+              "required": ["source_path", "media_type"],
+              "properties": {
+                "source_path": { "type": "string" },
+                "media_type": { "type": "string", "enum": ["photo", "video"] },
+                "in_sec": { "type": "number", "minimum": 0, "default": 0 },
+                "out_sec": { "type": "number", "minimum": 0 },
+                "source_duration_sec": { "type": "number", "minimum": 0 },
+                "focal_anchor": { "$ref": "#/$defs/focal_anchor" },
+                "caption": { "type": "string" },
+                "date_label": { "type": "string" },
+                "audio_lead": { "type": "boolean", "default": false },
+                "weight": { "type": "number", "exclusiveMinimum": 0, "default": 1.0 },
+                "has_human_closeup": { "type": "boolean", "default": false }
+              }
+            }
+          },
+          "audio_lead_tile": {
+            "type": "integer",
+            "minimum": -1,
+            "description": "0-based tile index supplying diegetic audio in multi-video grids (-1 mutes all tiles)."
+          },
+          "orientation": {
+            "type": "string",
+            "enum": ["landscape", "portrait", "square"]
+          },
+          "in_sec": { "type": "number", "minimum": 0, "default": 0 },
+          "out_sec": { "type": "number", "minimum": 0 },
+          "duration_sec": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Output timeline duration in seconds (for speed ramps, equals d1+d2+d3+d4+d5)."
+          },
+          "source_duration_sec": { "type": "number", "minimum": 0 },
+          "source_fps": { "type": "number", "exclusiveMinimum": 0 },
+          "speed_profile": {
+            "type": "object",
+            "description": "Temporal speed control for video clips. Only apply cubic_ramp or slow-mo (<1.0x) to >=50fps footage without dialogue/laughter.",
+            "required": ["mode"],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["constant", "cubic_ramp"]
+              },
+              "rate": {
+                "type": "number",
+                "minimum": 0.2,
+                "maximum": 8.0,
+                "default": 1.0,
+                "description": "Playback speed multiplier when mode='constant' (e.g., 0.5 for 60fps->30fps slow-mo)."
+              },
+              "v_hi": {
+                "type": "number",
+                "minimum": 1.0,
+                "maximum": 8.0,
+                "default": 3.5,
+                "description": "Fast entry/exit speed multiplier for 5-phase cubic_ramp."
+              },
+              "v_lo": {
+                "type": "number",
+                "minimum": 0.25,
+                "maximum": 1.5,
+                "default": 0.5,
+                "description": "Hero slow-motion speed multiplier for 5-phase cubic_ramp."
+              },
+              "d1": { "type": "number", "minimum": 0, "default": 0.3, "description": "Fast-in output duration (sec)." },
+              "d2": { "type": "number", "minimum": 0, "default": 0.35, "description": "Cubic ease-down output duration (sec)." },
+              "d3": { "type": "number", "minimum": 0, "default": 1.6, "description": "Hero-slow output duration (sec)." },
+              "d4": { "type": "number", "minimum": 0, "default": 0.35, "description": "Cubic ease-up output duration (sec)." },
+              "d5": { "type": "number", "minimum": 0, "default": 0.3, "description": "Fast-out output duration (sec)." }
+            }
+          },
+          "use_i2v": { "type": "boolean", "default": false },
+          "motion_type": {
+            "type": "string",
+            "enum": [
+              "native_video",
+              "vidstab_video",
+              "speed_ramp_video",
+              "ken_burns_in",
+              "ken_burns_out",
+              "ken_burns_pan",
+              "static_locked",
+              "depth_parallax_2_5d",
+              "omni_i2v_scenic",
+              "graphic_motion"
+            ]
+          },
+          "ken_burns_dir": {
+            "type": "string",
+            "enum": ["in", "out", "pan_left", "pan_right", "static"],
+            "default": "in"
+          },
+          "focal_anchor": { "$ref": "#/$defs/focal_anchor" },
+          "has_human_closeup": {
+            "type": "boolean",
+            "default": false,
+            "description": "Must be false whenever motion_type is omni_i2v_scenic or use_i2v is true."
+          },
+          "locked_by_user": { "type": "boolean", "default": false },
+          "blooper": {
+            "type": "boolean",
+            "default": false,
+            "description": "Flags humorous candid/outtake shots placed in the post-credits blooper stinger."
+          },
+          "stabilize": { "type": "boolean", "default": false },
+          "transition_out": {
+            "type": "string",
+            "enum": [
+              "cut",
+              "dissolve",
+              "whip_pan_left",
+              "whip_pan_right",
+              "whip_pan_up",
+              "whip_pan_down",
+              "light_leak",
+              "film_burn",
+              "flash_cut",
+              "zoom_punch",
+              "paper_wipe"
+            ],
+            "default": "cut",
+            "description": "Live moving overlap transition from this shot into the next shot. Non-cut transitions require >=0.4s source handle headroom on adjacent video clips."
+          },
+          "transition_duration_sec": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 1.5,
+            "default": 0.45
+          },
+          "transition": {
+            "type": "string",
+            "enum": ["cut", "xfade_dissolve", "j_cut", "l_cut"],
+            "default": "cut",
+            "description": "Legacy v1.0 transition alias."
+          },
+          "audio": {
+            "type": "object",
+            "description": "Per-shot 4-track audio routing (NAT_A/NAT_B J/L-cut overlaps, Sonic Postcard BGM ducking, and SFX).",
+            "properties": {
+              "j_cut_sec": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 3.0,
+                "default": 0,
+                "description": "Pre-roll this shot's audio before the visual cut (requires source in_sec >= j_cut_sec)."
+              },
+              "l_cut_sec": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 3.0,
+                "default": 0,
+                "description": "Carry this shot's audio past the visual cut (requires source_duration_sec - out_sec >= l_cut_sec)."
+              },
+              "sonic_postcard": {
+                "type": "boolean",
+                "default": false,
+                "description": "Feature authentic diegetic audio (laughter, waves, bells) and duck BGM cleanly by duck_db."
+              },
+              "duck_db": {
+                "type": "number",
+                "minimum": -30,
+                "maximum": 0,
+                "default": -13,
+                "description": "BGM attenuation in dB during sonic_postcard pockets."
+              },
+              "mute": {
+                "type": "boolean",
+                "default": false,
+                "description": "Mute clip audio (required for wind_hazard clips and speed ramps >1.3x)."
+              },
+              "volume": { "type": "number", "minimum": 0, "maximum": 2.0 },
+              "sfx_id": {
+                "type": "string",
+                "description": "Named transition or beat SFX cue (e.g. 'whoosh', 'shutter_click', 'paper_rip', 'typewriter_ding')."
+              },
+              "sfx_path": {
+                "type": "string",
+                "description": "Optional local WAV/M4A path for the SFX cue."
+              },
+              "sfx_offset_sec": {
+                "type": "number",
+                "minimum": -1.0,
+                "maximum": 1.0,
+                "default": 0
+              }
+            }
+          },
+          "overlay": {
+            "type": "string",
+            "enum": ["none", "chapter_title", "route_map"],
+            "default": "none",
+            "description": "Legacy v1.0 overlay alias."
+          },
+          "date_stamp": {
+            "type": "string",
+            "description": "Optional short date stamp printed on Super 8 or Polaroid frames."
+          },
+          "caption": {
+            "type": "string",
+            "description": "Optional short caption for Polaroid margins or editorial EXIF badges."
           },
           "fade_in": {
             "type": "number",
@@ -191,6 +489,40 @@
             "default": 0,
             "description": "Fade-out duration in seconds."
           }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "focal_anchor": {
+      "description": "Normalized [x, y] or {x, y} focus point in [0..1] (supports both v1.0 object and v2.0 array runtime formats).",
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        {
+          "type": "object",
+          "required": ["x", "y"],
+          "properties": {
+            "x": { "type": "number", "minimum": 0, "maximum": 1 },
+            "y": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      ]
+    },
+    "waypoint": {
+      "type": "object",
+      "required": ["lat", "lon"],
+      "properties": {
+        "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+        "lon": { "type": "number", "minimum": -180, "maximum": 180 },
+        "label": { "type": "string" },
+        "elevation_m": {
+          "type": "number",
+          "description": "Optional altitude in meters for synced route map elevation sparklines."
         }
       }
     }

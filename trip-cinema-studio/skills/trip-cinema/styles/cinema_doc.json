@@ -1,0 +1,121 @@
+{
+  "style_id": "cinema_doc",
+  "display_name": "Cinema Documentary",
+  "tagline": "Raw-premium wide cinema, editorial gold titles, and breathing sonic postcards.",
+  "description": "Natural filmic color, wide 16:9 framing, editorial serif chapter cards over blurred hero photo backdrops, J/L-cut audio bridges, and quiet environmental pockets.",
+  "best_for": [
+    "Multi-stop cultural journeys",
+    "Mountain treks and scenic landscapes",
+    "Homeland and heritage trips",
+    "Balanced 80% video / 20% photo documentaries"
+  ],
+  "vibe_tags": ["filmic", "documentary", "editorial", "atmospheric"],
+  "palette": {
+    "bg": "#0F1115",
+    "surface": "#181B22",
+    "text_primary": "#F5F2EB",
+    "text_secondary": "#B9B2A3",
+    "accent": "#D4AF37",
+    "accent_secondary": "#7A9E9F",
+    "border": "#2E333D",
+    "swatches": ["#0F1115", "#D4AF37", "#F5F2EB", "#7A9E9F", "#3A404D"]
+  },
+  "typography": {
+    "display_font": "Baskerville-SemiBold",
+    "display_css": "Baskerville, Georgia, 'Times New Roman', serif",
+    "meta_font": "HelveticaNeue-Medium",
+    "meta_css": "'Helvetica Neue', Helvetica, Arial, sans-serif",
+    "accent_font": "Georgia-Italic",
+    "accent_css": "Georgia, serif",
+    "display_uppercase": false,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.03,
+    "meta_letter_spacing": 0.22
+  },
+  "color_grade": {
+    "look_id": "warm_film",
+    "coreimage": {
+      "contrast": 1.06,
+      "saturation": 1.06,
+      "brightness": 0.01,
+      "temperature_target": 5800,
+      "tint_target": 6,
+      "sepia_intensity": 0.0,
+      "exposure_ev": 0.05,
+      "fade_blacks": 0.02
+    },
+    "ffmpeg_vf": "eq=contrast=1.06:saturation=1.06:gamma=1.02,colorbalance=rs=0.05:gs=0.02:bs=-0.05:rm=0.03:bm=-0.03"
+  },
+  "textures": {
+    "grain_amount": 0.14,
+    "vignette_intensity": 0.55,
+    "vignette_radius": 1.6,
+    "gate_weave_px": 0.0,
+    "overlay_fps_step": 0,
+    "letterbox_ratio": 0,
+    "frame_style": "editorial_clean",
+    "halation_amount": 0.08
+  },
+  "layouts": {
+    "default_portrait_layout": "split_diptych_pair",
+    "supported_layouts": [
+      "single",
+      "split_diptych_pair",
+      "blurred_bg_pillarbox",
+      "split_2up_video",
+      "triptych_3up_video",
+      "bento_living_grid"
+    ],
+    "gutter_px": 10,
+    "corner_radius_px": 0,
+    "border_px": 0,
+    "polaroid_tilt_deg": 0.0,
+    "pillarbox_dim_alpha": 0.28,
+    "pillarbox_blur_sigma": 28.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "editorial_gold_serif",
+    "backdrop_blur_sigma": 22.0,
+    "backdrop_dim_alpha": 0.45,
+    "backdrop_zoom_pct": 0.06,
+    "use_roman_numerals": false,
+    "show_divider_rule": true,
+    "show_date_stamp": false,
+    "route_map_skin": "dark_topo",
+    "cast_intro_style": "editorial_frame"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "dissolve",
+    "allowed": ["cut", "dissolve", "light_leak", "zoom_punch"],
+    "default_duration_sec": 0.5,
+    "signature_label": "J/L Bridges + Soft Dissolves"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 70,
+    "target_bpm_max": 95,
+    "target_bpm_label": "70-95 BPM",
+    "avg_shot_sec_min": 2.0,
+    "avg_shot_sec_max": 5.5,
+    "max_consecutive_photos": 2,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": true,
+    "max_speed_ramp_ratio": 0.12,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 4,
+    "enable_blooper_stinger_default": false,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 3
+  },
+  "audio": {
+    "default_bgm_volume": 0.78,
+    "duck_bgm_db": -14.0,
+    "sonic_postcard_nat_gain_db": 1.0,
+    "default_nat_bed_volume": 0.24,
+    "default_j_cut_sec": 0.8,
+    "default_l_cut_sec": 0.7,
+    "sfx_pack": "ambient_foley",
+    "music_genre_hint": "Minimalist ambient cello, acoustic strings, or cinematic piano leaving room for environmental sound."
+  }
+}

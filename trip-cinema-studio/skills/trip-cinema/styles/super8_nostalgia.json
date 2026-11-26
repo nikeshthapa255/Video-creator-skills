@@ -1,0 +1,121 @@
+{
+  "style_id": "super8_nostalgia",
+  "display_name": "Super 8 Nostalgia",
+  "tagline": "Warm Kodak film stock, rounded Super 8 overscan, organic gate weave, and amber film burns.",
+  "description": "Sun-drenched analog warmth with lifted blacks, golden highlights, subtle sprocket overscan, organic gate weave, retro corner date stamps, and warm light-leak transitions.",
+  "best_for": [
+    "Summer beach and coastal holidays",
+    "Family reunions and anniversaries",
+    "Candid trips with kids and elders",
+    "Golden-hour nostalgic travel reels"
+  ],
+  "vibe_tags": ["vintage", "super8", "nostalgic", "warm"],
+  "palette": {
+    "bg": "#14110E",
+    "surface": "#231D17",
+    "text_primary": "#F7ECD8",
+    "text_secondary": "#CBB89D",
+    "accent": "#E88D48",
+    "accent_secondary": "#D64531",
+    "border": "#090807",
+    "swatches": ["#14110E", "#E88D48", "#D64531", "#F7ECD8", "#6B5642"]
+  },
+  "typography": {
+    "display_font": "Georgia-Bold",
+    "display_css": "Georgia, 'Times New Roman', serif",
+    "meta_font": "Menlo-Bold",
+    "meta_css": "Menlo, 'Courier New', monospace",
+    "accent_font": "AmericanTypewriter",
+    "accent_css": "'American Typewriter', Courier, monospace",
+    "display_uppercase": false,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.04,
+    "meta_letter_spacing": 0.16
+  },
+  "color_grade": {
+    "look_id": "warm_film",
+    "coreimage": {
+      "contrast": 1.02,
+      "saturation": 1.04,
+      "brightness": 0.02,
+      "temperature_target": 5200,
+      "tint_target": 12,
+      "sepia_intensity": 0.10,
+      "exposure_ev": 0.06,
+      "fade_blacks": 0.09
+    },
+    "ffmpeg_vf": "eq=contrast=1.02:saturation=1.04:brightness=0.02:gamma=1.06,colorbalance=rs=0.09:gs=0.04:bs=-0.08:rh=0.08:gh=0.03:bh=-0.06"
+  },
+  "textures": {
+    "grain_amount": 0.34,
+    "vignette_intensity": 0.85,
+    "vignette_radius": 1.35,
+    "gate_weave_px": 2.4,
+    "overlay_fps_step": 18,
+    "letterbox_ratio": 0,
+    "frame_style": "super8_overscan",
+    "halation_amount": 0.28
+  },
+  "layouts": {
+    "default_portrait_layout": "super8_frame",
+    "supported_layouts": [
+      "super8_frame",
+      "blurred_bg_pillarbox",
+      "split_diptych_pair",
+      "split_2up_video",
+      "single",
+      "polaroid_stack"
+    ],
+    "gutter_px": 14,
+    "corner_radius_px": 28,
+    "border_px": 18,
+    "polaroid_tilt_deg": 2.0,
+    "pillarbox_dim_alpha": 0.35,
+    "pillarbox_blur_sigma": 28.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "vintage_super8_date",
+    "backdrop_blur_sigma": 22.0,
+    "backdrop_dim_alpha": 0.42,
+    "backdrop_zoom_pct": 0.05,
+    "use_roman_numerals": false,
+    "show_divider_rule": true,
+    "show_date_stamp": true,
+    "route_map_skin": "vintage_sepia",
+    "cast_intro_style": "polaroid_frame"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "film_burn",
+    "allowed": ["cut", "film_burn", "light_leak", "dissolve", "flash_cut"],
+    "default_duration_sec": 0.5,
+    "signature_label": "Film Burns + Warm Light Leaks"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 85,
+    "target_bpm_max": 110,
+    "target_bpm_label": "85-110 BPM",
+    "avg_shot_sec_min": 2.0,
+    "avg_shot_sec_max": 3.8,
+    "max_consecutive_photos": 4,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": false,
+    "max_speed_ramp_ratio": 0.05,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 4,
+    "enable_blooper_stinger_default": true,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 3
+  },
+  "audio": {
+    "default_bgm_volume": 0.78,
+    "duck_bgm_db": -14.0,
+    "sonic_postcard_nat_gain_db": 1.0,
+    "default_nat_bed_volume": 0.25,
+    "default_j_cut_sec": 0.7,
+    "default_l_cut_sec": 0.6,
+    "sfx_pack": "projector_reel",
+    "music_genre_hint": "Tape-saturated acoustic folk, warm dream-pop, or sunlit nostalgic indie."
+  }
+}

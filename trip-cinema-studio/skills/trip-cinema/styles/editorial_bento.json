@@ -1,0 +1,121 @@
+{
+  "style_id": "editorial_bento",
+  "display_name": "Editorial Bento Magazine",
+  "tagline": "Quiet-luxury linen canvas, living 2/3-up Bento grids, and micro EXIF typography.",
+  "description": "Inspired by Monocle and Cereal Magazine: warm linen canvas, ink charcoal hairlines, asymmetric multi-tile Bento grids pairing live video with crisp photography, and calm architectural motion.",
+  "best_for": [
+    "Design and culinary city trips",
+    "Honeymoons and luxury stays",
+    "Photography-forward mixed media trips",
+    "Architectural and museum itineraries"
+  ],
+  "vibe_tags": ["editorial", "minimal", "bento", "luxury"],
+  "palette": {
+    "bg": "#F4F1EA",
+    "surface": "#EAE4D7",
+    "text_primary": "#1C1C1B",
+    "text_secondary": "#66635C",
+    "accent": "#8C6D46",
+    "accent_secondary": "#3D544C",
+    "border": "#D2CBBF",
+    "swatches": ["#F4F1EA", "#1C1C1B", "#8C6D46", "#3D544C", "#EAE4D7"]
+  },
+  "typography": {
+    "display_font": "Georgia-Bold",
+    "display_css": "Georgia, Baskerville, 'Times New Roman', serif",
+    "meta_font": "HelveticaNeue-Medium",
+    "meta_css": "'Helvetica Neue', 'Avenir Next', Helvetica, sans-serif",
+    "accent_font": "Menlo-Regular",
+    "accent_css": "Menlo, 'SF Mono', monospace",
+    "display_uppercase": false,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.02,
+    "meta_letter_spacing": 0.18
+  },
+  "color_grade": {
+    "look_id": "clean_natural",
+    "coreimage": {
+      "contrast": 1.03,
+      "saturation": 0.98,
+      "brightness": 0.01,
+      "temperature_target": 6200,
+      "tint_target": 3,
+      "sepia_intensity": 0.0,
+      "exposure_ev": 0.02,
+      "fade_blacks": 0.01
+    },
+    "ffmpeg_vf": "eq=contrast=1.03:saturation=0.98:brightness=0.01:gamma=1.01,colorbalance=rs=0.02:gs=0.01:bs=-0.01"
+  },
+  "textures": {
+    "grain_amount": 0.08,
+    "vignette_intensity": 0.20,
+    "vignette_radius": 2.1,
+    "gate_weave_px": 0.0,
+    "overlay_fps_step": 0,
+    "letterbox_ratio": 0,
+    "frame_style": "bento_hairline",
+    "halation_amount": 0.0
+  },
+  "layouts": {
+    "default_portrait_layout": "bento_living_grid",
+    "supported_layouts": [
+      "bento_living_grid",
+      "split_diptych_pair",
+      "split_2up_video",
+      "triptych_3up_video",
+      "single",
+      "blurred_bg_pillarbox"
+    ],
+    "gutter_px": 14,
+    "corner_radius_px": 16,
+    "border_px": 1,
+    "polaroid_tilt_deg": 0.0,
+    "pillarbox_dim_alpha": 0.16,
+    "pillarbox_blur_sigma": 24.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "swiss_linen_minimal",
+    "backdrop_blur_sigma": 26.0,
+    "backdrop_dim_alpha": 0.20,
+    "backdrop_zoom_pct": 0.03,
+    "use_roman_numerals": false,
+    "show_divider_rule": true,
+    "show_date_stamp": true,
+    "route_map_skin": "linen_minimal",
+    "cast_intro_style": "editorial_frame"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "dissolve",
+    "allowed": ["cut", "dissolve", "paper_wipe"],
+    "default_duration_sec": 0.55,
+    "signature_label": "Architectural Dissolves + Bento Morphs"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 80,
+    "target_bpm_max": 105,
+    "target_bpm_label": "80-105 BPM",
+    "avg_shot_sec_min": 2.8,
+    "avg_shot_sec_max": 4.8,
+    "max_consecutive_photos": 5,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": false,
+    "max_speed_ramp_ratio": 0.0,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 4,
+    "enable_blooper_stinger_default": false,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 2
+  },
+  "audio": {
+    "default_bgm_volume": 0.76,
+    "duck_bgm_db": -14.0,
+    "sonic_postcard_nat_gain_db": 0.5,
+    "default_nat_bed_volume": 0.20,
+    "default_j_cut_sec": 0.7,
+    "default_l_cut_sec": 0.6,
+    "sfx_pack": "minimal_click",
+    "music_genre_hint": "Minimalist neo-classical piano, warm strings, or downtempo acoustic jazz."
+  }
+}

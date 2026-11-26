@@ -1,0 +1,1425 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Gate 2 Visual Style-Pack Preview Card Generator (1280x720).
+ * 100% Apple-signed macOS Native JXA (AVFoundation + CoreImage + AppKit + CoreGraphics).
+ * Zero third-party binaries.
+ *
+ * Accepts either photo OR video files for --hero, --portrait-a, and --portrait-b
+ * (automatically extracting upright mid-frames via AVAssetImageGenerator for videos).
+ *
+ * Usage:
+ *   osascript -l JavaScript macos_style_previews.jxa \
+ *     --styles-dir ../../styles \
+ *     --style-ids cinema_doc,analog_scrapbook,editorial_bento,kinetic_montage \
+ *     --hero /path/to/hero.jpg_or_mov \
+ *     --portrait-a /path/to/p1.jpg_or_mov \
+ *     --portrait-b /path/to/p2.jpg_or_mov \
+ *     --trip-title "Summer in Kyoto" \
+ *     --out-dir ./work/style_previews \
+ *     [--artifact-dir /path/to/artifact/style_previews]
+ */
+
+ObjC.import("Foundation");
+ObjC.import("CoreFoundation");
+ObjC.import("AVFoundation");
+ObjC.import("CoreMedia");
+ObjC.import("CoreImage");
+ObjC.import("ImageIO");
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+const VIDEO_EXTS = new Set([
+  ".mov", ".mp4", ".m4v", ".mkv", ".avi", ".mts", ".m2ts", ".webm",
+]);
+
+const DEFAULT_STYLE_IDS = [
+  "cinema_doc",
+  "analog_scrapbook",
+  "editorial_bento",
+  "kinetic_montage",
+];
+
+function avClass(name) {
+  const cls = $.NSClassFromString(name);
+  if (!cls) throw new Error("Required Objective-C class not found: " + name);
+  return cls;
+}
+
+function parseArgs(argv) {
+  const args = {
+    stylesDir: null,
+    styleIds: null,
+    hero: null,
+    portraitA: null,
+    portraitB: null,
+    manifest: null,
+    tripTitle: "Trip Cinema",
+    outDir: "./work/style_previews",
+    artifactDir: null,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--styles-dir") args.stylesDir = argv[++i];
+    else if (a === "--style-ids") {
+      args.styleIds = argv[++i]
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (a === "--hero" || a === "--hero-image") args.hero = argv[++i];
+    else if (a === "--portrait-a") args.portraitA = argv[++i];
+    else if (a === "--portrait-b") args.portraitB = argv[++i];
+    else if (a === "--manifest") args.manifest = argv[++i];
+    else if (a === "--trip-title") args.tripTitle = argv[++i];
+    else if (a === "--out-dir") args.outDir = argv[++i];
+    else if (a === "--artifact-dir") args.artifactDir = argv[++i];
+  }
+  return args;
+}
+
+function ensureDir(dirPath) {
+  if (!dirPath) return;
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON file: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function writeTextFile(path, text) {
+  const parent = ObjC.unwrap($(path).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  $(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+}
+
+function copyFileOverwrite(srcPath, dstPath) {
+  const fm = $.NSFileManager.defaultManager;
+  const parent = ObjC.unwrap($(dstPath).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  if (fm.fileExistsAtPath(dstPath)) fm.removeItemAtPathError(dstPath, null);
+  fm.copyItemAtPathToPathError(srcPath, dstPath, null);
+}
+
+function pathExtLower(filePath) {
+  const ext = ObjC.unwrap($(filePath).pathExtension) || "";
+  return ext ? "." + ext.toLowerCase() : "";
+}
+
+function parseHexRGB(hexStr, fallback) {
+  const fb = fallback || [0.1, 0.1, 0.12];
+  if (!hexStr || typeof hexStr !== "string") return fb;
+  const clean = hexStr.trim().replace(/^#/, "");
+  if (clean.length === 3) {
+    const r = parseInt(clean[0] + clean[0], 16) / 255.0;
+    const g = parseInt(clean[1] + clean[1], 16) / 255.0;
+    const b = parseInt(clean[2] + clean[2], 16) / 255.0;
+    return isFinite(r) ? [r, g, b] : fb;
+  }
+  if (clean.length >= 6) {
+    const r = parseInt(clean.slice(0, 2), 16) / 255.0;
+    const g = parseInt(clean.slice(2, 4), 16) / 255.0;
+    const b = parseInt(clean.slice(4, 6), 16) / 255.0;
+    return isFinite(r) ? [r, g, b] : fb;
+  }
+  return fb;
+}
+
+function nsColorFromHex(hexStr, alpha) {
+  const rgb = parseHexRGB(hexStr, [0.1, 0.1, 0.12]);
+  return $.NSColor.colorWithCalibratedRedGreenBlueAlpha(
+    rgb[0],
+    rgb[1],
+    rgb[2],
+    alpha !== undefined ? alpha : 1.0
+  );
+}
+
+function isLightHex(hexStr) {
+  const rgb = parseHexRGB(hexStr, [0.1, 0.1, 0.1]);
+  const luma = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+  return luma > 0.55;
+}
+
+function resolveFont(name, size, fallbackWeight) {
+  if (name) {
+    const f = $.NSFont.fontWithNameSize(name, size);
+    if (f && !f.isNil()) return f;
+  }
+  return $.NSFont.systemFontOfSizeWeight(size, fallbackWeight || $.NSFontWeightSemibold);
+}
+
+function makeTextAttrs(font, color, kern) {
+  const dict = $.NSMutableDictionary.dictionary;
+  dict.setObjectForKey(font, $.NSFontAttributeName);
+  dict.setObjectForKey(color, $.NSForegroundColorAttributeName);
+  if (kern && isFinite(kern) && kern !== 0) {
+    dict.setObjectForKey($.NSNumber.numberWithDouble(kern), $.NSKernAttributeName);
+  }
+  return dict;
+}
+
+function makeDropShadow(blur, offsetX, offsetY, alpha) {
+  const sh = $.NSShadow.alloc.init;
+  sh.shadowColor = $.NSColor.colorWithCalibratedWhiteAlpha(0.0, alpha !== undefined ? alpha : 0.35);
+  sh.shadowOffset = $.NSMakeSize(offsetX || 0, offsetY || -5);
+  sh.shadowBlurRadius = blur !== undefined ? blur : 12.0;
+  return sh;
+}
+
+function normalizeOrigin(ciImg) {
+  const ext = ciImg.extent;
+  if (ext.origin.x !== 0 || ext.origin.y !== 0) {
+    return ciImg.imageByApplyingTransform(
+      $.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)
+    );
+  }
+  return ciImg;
+}
+
+function runSubprocess(launchPath, argList) {
+  try {
+    const task = $.NSTask.alloc.init;
+    task.launchPath = launchPath;
+    task.arguments = $(argList);
+    const outPipe = $.NSPipe.pipe;
+    const errPipe = $.NSPipe.pipe;
+    task.standardOutput = outPipe;
+    task.standardError = errPipe;
+    task.launch;
+    const outData = outPipe.fileHandleForReading.readDataToEndOfFile;
+    const errData = errPipe.fileHandleForReading.readDataToEndOfFile;
+    task.waitUntilExit;
+    const stdout = outData
+      ? ObjC.unwrap($.NSString.alloc.initWithDataEncoding(outData, $.NSUTF8StringEncoding)) || ""
+      : "";
+    const stderr = errData
+      ? ObjC.unwrap($.NSString.alloc.initWithDataEncoding(errData, $.NSUTF8StringEncoding)) || ""
+      : "";
+    return { status: Number(task.terminationStatus), stdout: stdout, stderr: stderr };
+  } catch (e) {
+    return { status: -1, stdout: "", stderr: String(e) };
+  }
+}
+
+function resolveChromeVp9HelperPath() {
+  const fm = $.NSFileManager.defaultManager;
+  try {
+    const procArgs = ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments) || [];
+    for (let i = 0; i < procArgs.length; i++) {
+      const a = String(procArgs[i] || "");
+      if (a.endsWith(".jxa")) {
+        const dir = ObjC.unwrap($(a).stringByDeletingLastPathComponent);
+        const sibling = dir + "/macos_chrome_vp9.rb";
+        if (fm.fileExistsAtPath(sibling)) return sibling;
+      }
+    }
+  } catch (e) {}
+  const fallbacks = [
+    "./macos_chrome_vp9.rb",
+    "./scripts/macos_native/macos_chrome_vp9.rb",
+    "./skills/trip-cinema/scripts/macos_native/macos_chrome_vp9.rb",
+  ];
+  for (let i = 0; i < fallbacks.length; i++) {
+    if (fm.fileExistsAtPath(fallbacks[i])) return fallbacks[i];
+  }
+  return null;
+}
+
+function extractVideoMidFrameViaChrome(ciCtx, filePath, midSec, maxDim) {
+  const helper = resolveChromeVp9HelperPath();
+  if (!helper) return null;
+  const fm = $.NSFileManager.defaultManager;
+  const pid = $.NSProcessInfo.processInfo.processIdentifier;
+  const tmpDir = "/tmp/style_preview_vp9_" + pid + "_" + Math.floor(Math.random() * 1e6);
+  try {
+    ensureDir(tmpDir);
+    const tStr = isFinite(midSec) && midSec > 0 ? midSec.toFixed(3) : "0.0";
+    const proc = runSubprocess("/usr/bin/ruby", [
+      helper,
+      "--mode", "frames",
+      "--input", filePath,
+      "--times", tStr,
+      "--out-dir", tmpDir,
+      "--max-dim", String(maxDim || 1400),
+    ]);
+    const jpgPath = tmpDir + "/frame_000.jpg";
+    if (proc.status !== 0 || !fm.fileExistsAtPath(jpgPath)) return null;
+    const loaded = $.CIImage.imageWithContentsOfURL($.NSURL.fileURLWithPath(jpgPath));
+    if (!loaded || (loaded.isNil && loaded.isNil())) return null;
+    const norm = normalizeOrigin(loaded);
+    const ext = norm.extent;
+    const cg = ciCtx.createCGImageFromRect(norm, $.CGRectMake(0, 0, Math.round(ext.size.width), Math.round(ext.size.height)));
+    if (!cg) return null;
+    return normalizeOrigin($.CIImage.imageWithCGImage(cg));
+  } catch (e) {
+    return null;
+  } finally {
+    try {
+      if (fm.fileExistsAtPath(tmpDir)) fm.removeItemAtPathError(tmpDir, null);
+    } catch (e) {}
+  }
+}
+
+/**
+ * Load either a photo (with EXIF orientation applied) OR a video file (extracting
+ * an upright mid-frame via AVAssetImageGenerator, with automatic Chrome WebCodecs
+ * fallback for VP9/AV1) as a normalized CIImage.
+ */
+function loadMediaAsCIImage(ciCtx, filePath, maxDim) {
+  const limit = maxDim || 1400;
+  const ext = pathExtLower(filePath);
+  const url = $.NSURL.fileURLWithPath(filePath);
+
+  if (VIDEO_EXTS.has(ext)) {
+    const AVURLAsset = avClass("AVURLAsset");
+    const AVAssetImageGenerator = avClass("AVAssetImageGenerator");
+    const asset = AVURLAsset.URLAssetWithURLOptions(url, $({}));
+    const dur = $.CMTimeGetSeconds(asset.duration);
+    const gen = AVAssetImageGenerator.assetImageGeneratorWithAsset(asset);
+    gen.appliesPreferredTrackTransform = true;
+    gen.maximumSize = $.CGSizeMake(limit, limit);
+    gen.requestedTimeToleranceBefore = $.kCMTimePositiveInfinity;
+    gen.requestedTimeToleranceAfter = $.kCMTimePositiveInfinity;
+
+    const tryValidCI = (cg) => {
+      if (!cg) return null;
+      try {
+        if (typeof $.CGImageGetWidth === "function" && Number($.CGImageGetWidth(cg)) <= 0) return null;
+        const ci = $.CIImage.imageWithCGImage(cg);
+        if (!ci || (ci.isNil && ci.isNil())) return null;
+        const e = ci.extent;
+        if (!e || !e.size || e.size.width <= 0 || e.size.height <= 0) return null;
+        return normalizeOrigin(ci);
+      } catch (err) {
+        return null;
+      }
+    };
+
+    const midSec = isFinite(dur) && dur > 0.2 ? dur * 0.5 : 0.0;
+    let decodedCI = null;
+    if (midSec > 0) {
+      try {
+        decodedCI = tryValidCI(
+          gen.copyCGImageAtTimeActualTimeError($.CMTimeMakeWithSeconds(midSec, 600), null, null)
+        );
+      } catch (e) {
+        decodedCI = null;
+      }
+    }
+    if (!decodedCI) {
+      try {
+        decodedCI = tryValidCI(gen.copyCGImageAtTimeActualTimeError($.kCMTimeZero, null, null));
+      } catch (e) {
+        decodedCI = null;
+      }
+    }
+    if (decodedCI) return decodedCI;
+    // Fallback to Chrome WebCodecs for VP9 Profile 1/3 or AV1 clips
+    const chromeImg = extractVideoMidFrameViaChrome(ciCtx, filePath, midSec, limit);
+    if (chromeImg) return chromeImg;
+    throw new Error("Failed to decode video mid-frame: " + filePath);
+  }
+
+  const opts = $.NSMutableDictionary.dictionary;
+  opts.setObjectForKey($.NSNumber.numberWithBool(true), $.kCIImageApplyOrientationProperty);
+  let img = $.CIImage.imageWithContentsOfURLOptions(url, opts);
+  if (!img) throw new Error("Failed to load image: " + filePath);
+  img = normalizeOrigin(img);
+
+  const w = img.extent.size.width;
+  const h = img.extent.size.height;
+  const maxSide = Math.max(w, h);
+  if (maxSide > limit) {
+    const scale = limit / maxSide;
+    img = normalizeOrigin(img.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale)));
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+    const cg = ciCtx.createCGImageFromRect(img, $.CGRectMake(0, 0, outW, outH));
+    if (cg) {
+      return normalizeOrigin($.CIImage.imageWithCGImage(cg));
+    }
+  }
+  return img;
+}
+
+function aspectFillAndCropCI(ciImg, targetW, targetH) {
+  const ext = ciImg.extent;
+  const srcW = Math.max(1, ext.size.width);
+  const srcH = Math.max(1, ext.size.height);
+  const scale = Math.max(targetW / srcW, targetH / srcH);
+  let out = ciImg.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
+  const scaledW = srcW * scale;
+  const scaledH = srcH * scale;
+  const cropX = (scaledW - targetW) / 2.0;
+  const cropY = (scaledH - targetH) / 2.0;
+  out = out.imageByCroppingToRect($.CGRectMake(cropX, cropY, targetW, targetH));
+  return out.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-cropX, -cropY));
+}
+
+function applyStyleGradeAndTexture(ciImg, style, width, height) {
+  const cg = (style.color_grade && style.color_grade.coreimage) || {};
+  const tex = style.textures || {};
+  let img = aspectFillAndCropCI(ciImg, width, height);
+  const rect = $.CGRectMake(0, 0, width, height);
+
+  // 1. Color controls (contrast / saturation / brightness)
+  const colorCtrl = $.CIFilter.filterWithName("CIColorControls");
+  colorCtrl.setValueForKey(img, "inputImage");
+  colorCtrl.setValueForKey(cg.contrast !== undefined ? Number(cg.contrast) : 1.0, "inputContrast");
+  colorCtrl.setValueForKey(cg.saturation !== undefined ? Number(cg.saturation) : 1.0, "inputSaturation");
+  colorCtrl.setValueForKey(cg.brightness !== undefined ? Number(cg.brightness) : 0.0, "inputBrightness");
+  img = colorCtrl.outputImage;
+
+  // 2. Exposure adjust
+  if (cg.exposure_ev && Math.abs(Number(cg.exposure_ev)) > 0.005) {
+    const exp = $.CIFilter.filterWithName("CIExposureAdjust");
+    exp.setValueForKey(img, "inputImage");
+    exp.setValueForKey(Number(cg.exposure_ev), "inputEV");
+    img = exp.outputImage;
+  }
+
+  // 3. Temperature & Tint
+  if (cg.temperature_target || cg.tint_target) {
+    const temp = $.CIFilter.filterWithName("CITemperatureAndTint");
+    temp.setValueForKey(img, "inputImage");
+    temp.setValueForKey($.CIVector.vectorWithXY(6500, 0), "inputNeutral");
+    temp.setValueForKey(
+      $.CIVector.vectorWithXY(
+        cg.temperature_target !== undefined ? Number(cg.temperature_target) : 6500,
+        cg.tint_target !== undefined ? Number(cg.tint_target) : 0
+      ),
+      "inputTargetNeutral"
+    );
+    img = temp.outputImage;
+  }
+
+  // 4. Sepia warmth
+  if (cg.sepia_intensity && Number(cg.sepia_intensity) > 0.005) {
+    const sep = $.CIFilter.filterWithName("CISepiaTone");
+    sep.setValueForKey(img, "inputImage");
+    sep.setValueForKey(Number(cg.sepia_intensity), "inputIntensity");
+    img = sep.outputImage;
+  }
+
+  // 5. Faded / lifted film blacks
+  if (cg.fade_blacks && Number(cg.fade_blacks) > 0.005) {
+    const f = Math.min(0.25, Number(cg.fade_blacks));
+    const scale = 1.0 - f;
+    const mat = $.CIFilter.filterWithName("CIColorMatrix");
+    mat.setValueForKey(img, "inputImage");
+    mat.setValueForKey($.CIVector.vectorWithXYZW(scale, 0, 0, 0), "inputRVector");
+    mat.setValueForKey($.CIVector.vectorWithXYZW(0, scale, 0, 0), "inputGVector");
+    mat.setValueForKey($.CIVector.vectorWithXYZW(0, 0, scale, 0), "inputBVector");
+    mat.setValueForKey($.CIVector.vectorWithXYZW(0, 0, 0, 1), "inputAVector");
+    mat.setValueForKey($.CIVector.vectorWithXYZW(f, f * 0.96, f * 0.9, 0), "inputBiasVector");
+    img = mat.outputImage;
+  }
+
+  // 6. Warm halation bloom
+  if (tex.halation_amount && Number(tex.halation_amount) > 0.05) {
+    const bloom = $.CIFilter.filterWithName("CIBloom");
+    bloom.setValueForKey(img, "inputImage");
+    bloom.setValueForKey(12.0, "inputRadius");
+    bloom.setValueForKey(Math.min(0.6, Number(tex.halation_amount) * 1.4), "inputIntensity");
+    img = bloom.outputImage.imageByCroppingToRect(rect);
+  }
+
+  // 7. Procedural film grain
+  if (tex.grain_amount && Number(tex.grain_amount) > 0.03) {
+    const noise = $.CIFilter.filterWithName("CIRandomGenerator").outputImage.imageByCroppingToRect(rect);
+    const mono = $.CIFilter.filterWithName("CIColorMonochrome");
+    mono.setValueForKey(noise, "inputImage");
+    mono.setValueForKey($.CIColor.colorWithRedGreenBlueAlpha(0.55, 0.53, 0.50, 1.0), "inputColor");
+    mono.setValueForKey(1.0, "inputIntensity");
+
+    const alphaScale = Math.min(0.18, Number(tex.grain_amount) * 0.36);
+    const gMat = $.CIFilter.filterWithName("CIColorMatrix");
+    gMat.setValueForKey(mono.outputImage, "inputImage");
+    gMat.setValueForKey($.CIVector.vectorWithXYZW(0, 0, 0, alphaScale), "inputAVector");
+
+    const blend = $.CIFilter.filterWithName("CISoftLightBlendMode");
+    blend.setValueForKey(gMat.outputImage, "inputImage");
+    blend.setValueForKey(img, "inputBackgroundImage");
+    img = blend.outputImage.imageByCroppingToRect(rect);
+  }
+
+  // 8. Aspect-safe corner vignette (scales to diagonal so narrow portrait tiles never get black portholes)
+  if (tex.vignette_intensity && Number(tex.vignette_intensity) > 0.02) {
+    const vig = $.CIFilter.filterWithName("CIVignetteEffect");
+    if (vig && !vig.isNil()) {
+      const diag = Math.sqrt(width * width + height * height);
+      const rScale = tex.vignette_radius !== undefined ? Math.max(1.1, Number(tex.vignette_radius)) / 1.7 : 1.0;
+      vig.setValueForKey(img, "inputImage");
+      vig.setValueForKey($.CIVector.vectorWithXY(width / 2.0, height / 2.0), "inputCenter");
+      vig.setValueForKey(diag * 0.48 * rScale, "inputRadius");
+      vig.setValueForKey(Math.min(0.55, Number(tex.vignette_intensity) * 0.55), "inputIntensity");
+      vig.setValueForKey(0.65, "inputFalloff");
+      img = vig.outputImage.imageByCroppingToRect(rect);
+    }
+  }
+
+  return img.imageByCroppingToRect(rect);
+}
+
+function ciImageToNSImage(ciCtx, ciImg, width, height) {
+  const cgImg = ciCtx.createCGImageFromRect(ciImg, $.CGRectMake(0, 0, width, height));
+  if (!cgImg) return null;
+  return $.NSImage.alloc.initWithCGImageSize(cgImg, $.NSMakeSize(width, height));
+}
+
+function drawClippedNSImage(nsImg, x, y, w, h, cornerRadius) {
+  if (!nsImg) return;
+  $.NSGraphicsContext.saveGraphicsState;
+  const rect = $.NSMakeRect(x, y, w, h);
+  if (cornerRadius && cornerRadius > 0) {
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(rect, cornerRadius, cornerRadius).addClip;
+  } else {
+    $.NSBezierPath.bezierPathWithRect(rect).addClip;
+  }
+  nsImg.drawInRectFromRectOperationFraction(rect, $.NSZeroRect, $.NSCompositingOperationSourceOver, 1.0);
+  $.NSGraphicsContext.restoreGraphicsState;
+}
+
+function drawCenteredText(text, centerX, y, attrs) {
+  const sz = $(text).sizeWithAttributes(attrs);
+  $(text).drawAtPointWithAttributes($.NSMakePoint(centerX - sz.width / 2.0, y), attrs);
+  return sz;
+}
+
+function fitFontToWidth(fontName, maxSize, minSize, text, maxWidth, kern) {
+  for (let s = maxSize; s >= minSize; s -= 2) {
+    const font = resolveFont(fontName, s, $.NSFontWeightBold);
+    const attrs = makeTextAttrs(font, $.NSColor.whiteColor, kern);
+    const sz = $(text).sizeWithAttributes(attrs);
+    if (sz.width <= maxWidth) return font;
+  }
+  return resolveFont(fontName, minSize, $.NSFontWeightBold);
+}
+
+function drawMaskingTape(cx, cy, w, h, angleDeg) {
+  $.NSGraphicsContext.saveGraphicsState;
+  const tf = $.NSAffineTransform.transform;
+  tf.translateXByYBy(cx, cy);
+  tf.rotateByDegrees(angleDeg);
+  tf.concat;
+
+  const tapeRect = $.NSMakeRect(-w / 2.0, -h / 2.0, w, h);
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.937, 0.902, 0.784, 0.80).setFill;
+  $.NSBezierPath.fillRect(tapeRect);
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.76, 0.71, 0.58, 0.45).setStroke;
+  const outline = $.NSBezierPath.bezierPathWithRect(tapeRect);
+  outline.lineWidth = 0.8;
+  outline.stroke;
+  $.NSGraphicsContext.restoreGraphicsState;
+}
+
+function drawTiltedPolaroid(nsImg, cx, cy, photoW, photoH, angleDeg, caption, metaFontName) {
+  const padSide = 12;
+  const padTop = 12;
+  const padBottom = 40;
+  const cardW = photoW + padSide * 2;
+  const cardH = photoH + padTop + padBottom;
+
+  $.NSGraphicsContext.saveGraphicsState;
+  const tf = $.NSAffineTransform.transform;
+  tf.translateXByYBy(cx, cy);
+  tf.rotateByDegrees(angleDeg);
+  tf.concat;
+
+  // Polaroid card with drop shadow
+  $.NSGraphicsContext.saveGraphicsState;
+  makeDropShadow(16.0, 3, -7, 0.32).set;
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.99, 0.985, 0.965, 1.0).setFill;
+  $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+    $.NSMakeRect(-cardW / 2.0, -cardH / 2.0, cardW, cardH),
+    3,
+    3
+  ).fill;
+  $.NSGraphicsContext.restoreGraphicsState;
+
+  // Subtle card border
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.84, 0.80, 0.74, 0.85).setStroke;
+  const b = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+    $.NSMakeRect(-cardW / 2.0, -cardH / 2.0, cardW, cardH),
+    3,
+    3
+  );
+  b.lineWidth = 1.0;
+  b.stroke;
+
+  // Photo inside Polaroid
+  const imgX = -photoW / 2.0;
+  const imgY = -cardH / 2.0 + padBottom;
+  drawClippedNSImage(nsImg, imgX, imgY, photoW, photoH, 1);
+
+  // Caption in bottom Polaroid chin
+  if (caption) {
+    const capFont = resolveFont(metaFontName || "Menlo-Regular", 11, $.NSFontWeightMedium);
+    const capAttrs = makeTextAttrs(
+      capFont,
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.24, 0.21, 0.19, 1.0),
+      1.2
+    );
+    drawCenteredText(caption, 0, -cardH / 2.0 + 13, capAttrs);
+  }
+  $.NSGraphicsContext.restoreGraphicsState;
+
+  // Masking tape strip near top edge of Polaroid
+  const rad = (angleDeg * Math.PI) / 180.0;
+  const topDist = cardH / 2.0 - 4;
+  const tx = cx - Math.sin(rad) * topDist;
+  const ty = cy + Math.cos(rad) * topDist;
+  drawMaskingTape(tx, ty, 64, 18, angleDeg + (angleDeg < 0 ? 14 : -14));
+}
+
+function drawHeroSection(ciCtx, heroCI, style, tripTitle, stageY, heroW, stageH) {
+  const sid = style.style_id;
+  const pal = style.palette || {};
+  const typo = style.typography || {};
+  const tex = style.textures || {};
+  const cards = style.cards || {};
+
+  const displayTitle = typo.display_uppercase ? tripTitle.toUpperCase() : tripTitle;
+  const eyebrowText = cards.use_roman_numerals
+    ? "CHAPTER I  ·  ARRIVAL"
+    : sid === "sitcom_cast"
+    ? "EPISODE 01  ·  THE CREW"
+    : sid === "editorial_bento"
+    ? "ISSUE 01  ·  FIELD NOTES"
+    : sid === "super8_nostalgia"
+    ? "REEL 01  ·  SUPER 8MM"
+    : "CHAPTER 01  ·  OPENING";
+
+  // Paint hero canvas backing
+  nsColorFromHex(pal.bg || "#0F1115", 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, stageY, heroW, stageH));
+
+  if (sid === "analog_scrapbook") {
+    // Kraft canvas with inset white-framed hero + masking tape corners + typewriter title
+    const padX = 28;
+    const padY = 30;
+    const frameX = padX;
+    const frameY = stageY + padY;
+    const frameW = heroW - padX * 2;
+    const frameH = stageH - padY * 2;
+
+    $.NSGraphicsContext.saveGraphicsState;
+    makeDropShadow(18.0, 2, -6, 0.25).set;
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.99, 0.985, 0.97, 1.0).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(frameX, frameY, frameW, frameH), 4, 4).fill;
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    const inPad = 14;
+    const imgW = frameW - inPad * 2;
+    const imgH = frameH - inPad * 2;
+    const graded = applyStyleGradeAndTexture(heroCI, style, imgW, imgH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, imgW, imgH);
+    drawClippedNSImage(nsHero, frameX + inPad, frameY + inPad, imgW, imgH, 2);
+
+    // Subtle bottom warm scrim for legible chapter stamp
+    const scrimGrad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.11, 0.09, 0.08, 0.72),
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.11, 0.09, 0.08, 0.0)
+    );
+    scrimGrad.drawInRectAngle($.NSMakeRect(frameX + inPad, frameY + inPad, imgW, 210), 90);
+
+    // Translucent masking tape at top corners
+    drawMaskingTape(frameX + 44, frameY + frameH - 8, 86, 22, -26);
+    drawMaskingTape(frameX + frameW - 44, frameY + frameH - 8, 86, 22, 24);
+
+    // Terracotta rubber-stamp eyebrow pill
+    const eyeFont = resolveFont(typo.meta_font, 12, $.NSFontWeightBold);
+    const eyeAttrs = makeTextAttrs(eyeFont, $.NSColor.whiteColor, 1.8);
+    const eyeSz = $(eyebrowText).sizeWithAttributes(eyeAttrs);
+    nsColorFromHex(pal.accent || "#C84B31", 0.94).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(frameX + 34, frameY + 114, eyeSz.width + 22, 26),
+      3,
+      3
+    ).fill;
+    $(eyebrowText).drawAtPointWithAttributes($.NSMakePoint(frameX + 45, frameY + 119), eyeAttrs);
+
+    // Typewriter title
+    const titleFont = fitFontToWidth(typo.display_font, 38, 22, displayTitle, imgW - 48, 1.5);
+    const titleAttrs = makeTextAttrs(titleFont, $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.99, 0.97, 0.94, 1.0), 1.5);
+    $(displayTitle).drawAtPointWithAttributes($.NSMakePoint(frameX + 34, frameY + 56), titleAttrs);
+    return;
+  }
+
+  if (sid === "wes_postcard") {
+    // Symmetrical cream postcard matte with inner hairline + centered Futura Roman title
+    const matte = 24;
+    const imgX = matte;
+    const imgY = stageY + matte;
+    const imgW = heroW - matte * 2;
+    const imgH = stageH - matte * 2;
+
+    const graded = applyStyleGradeAndTexture(heroCI, style, imgW, imgH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, imgW, imgH);
+    drawClippedNSImage(nsHero, imgX, imgY, imgW, imgH, 0);
+
+    // Soft symmetrical center tint band for museum postcard readability
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.15, 0.12, 0.13, 0.34).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(imgX, stageY + stageH / 2 - 74, imgW, 148));
+
+    // Inner vintage hairline border
+    nsColorFromHex(pal.bg || "#FAF6EE", 0.85).setStroke;
+    const inner = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(imgX + 10, imgY + 10, imgW - 20, imgH - 20));
+    inner.lineWidth = 1.5;
+    inner.stroke;
+
+    const cx = heroW / 2.0;
+    const cy = stageY + stageH / 2.0;
+    const eyeFont = resolveFont(typo.meta_font, 14, $.NSFontWeightSemibold);
+    const eyeAttrs = makeTextAttrs(eyeFont, nsColorFromHex("#FAF6EE", 0.96), 2.8);
+    drawCenteredText(eyebrowText, cx, cy + 32, eyeAttrs);
+
+    // Butter-yellow Futura Bold centered title
+    const titleFont = fitFontToWidth(typo.display_font, 40, 24, displayTitle, imgW - 60, 3.0);
+    const titleAttrs = makeTextAttrs(titleFont, nsColorFromHex(pal.accent || "#F4D35E", 1.0), 3.0);
+    $.NSGraphicsContext.saveGraphicsState;
+    makeDropShadow(8.0, 0, -2, 0.45).set;
+    drawCenteredText(displayTitle, cx, cy - 22, titleAttrs);
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    // Symmetrical pastel divider rule
+    nsColorFromHex(pal.accent_secondary || "#A8D5BA", 0.95).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(cx - 72, cy - 38, 144, 2.5));
+    return;
+  }
+
+  if (sid === "kinetic_montage") {
+    // Full-bleed high-contrast hero + 2.39:1 cinemascope black bars + bold condensed typography
+    const graded = applyStyleGradeAndTexture(heroCI, style, heroW, stageH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, heroW, stageH);
+    drawClippedNSImage(nsHero, 0, stageY, heroW, stageH, 0);
+
+    // Subtle dark vignette scrim bottom-left
+    const grad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.05, 0.07, 0.78),
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.05, 0.07, 0.0)
+    );
+    grad.drawInRectAngle($.NSMakeRect(0, stageY, heroW, 290), 90);
+
+    // 2.39:1 cinemascope letterbox bars
+    const barH = 52;
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.045, 0.055, 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(0, stageY, heroW, barH));
+    $.NSBezierPath.fillRect($.NSMakeRect(0, stageY + stageH - barH, heroW, barH));
+
+    // Vermilion vertical kinetic accent bar
+    nsColorFromHex(pal.accent || "#FF5A36", 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(34, stageY + barH + 26, 7, 96));
+
+    // Cyan eyebrow + giant condensed black title
+    const eyeFont = resolveFont(typo.meta_font, 13, $.NSFontWeightBold);
+    const eyeAttrs = makeTextAttrs(eyeFont, nsColorFromHex(pal.accent_secondary || "#32D2E8", 1.0), 2.4);
+    $(eyebrowText).drawAtPointWithAttributes($.NSMakePoint(54, stageY + barH + 98), eyeAttrs);
+
+    const titleFont = fitFontToWidth(typo.display_font, 54, 28, displayTitle, heroW - 88, 1.2);
+    const titleAttrs = makeTextAttrs(titleFont, $.NSColor.whiteColor, 1.2);
+    $.NSGraphicsContext.saveGraphicsState;
+    makeDropShadow(12.0, 0, -3, 0.6).set;
+    $(displayTitle).drawAtPointWithAttributes($.NSMakePoint(54, stageY + barH + 28), titleAttrs);
+    $.NSGraphicsContext.restoreGraphicsState;
+    return;
+  }
+
+  if (sid === "editorial_bento") {
+    // Quiet-luxury warm linen canvas with rounded 16px hairline editorial hero card
+    const pad = 20;
+    const cardX = pad;
+    const cardY = stageY + pad;
+    const cardW = heroW - pad * 2;
+    const cardH = stageH - pad * 2;
+    const rad = 16;
+
+    const graded = applyStyleGradeAndTexture(heroCI, style, cardW, cardH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, cardW, cardH);
+    drawClippedNSImage(nsHero, cardX, cardY, cardW, cardH, rad);
+
+    // Soft editorial bottom gradient inside rounded clip
+    $.NSGraphicsContext.saveGraphicsState;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(cardX, cardY, cardW, cardH), rad, rad).addClip;
+    const grad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.11, 0.11, 0.10, 0.72),
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.11, 0.11, 0.10, 0.0)
+    );
+    grad.drawInRectAngle($.NSMakeRect(cardX, cardY, cardW, 210), 90);
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    // 1px editorial hairline border
+    nsColorFromHex(pal.border || "#D2CBBF", 1.0).setStroke;
+    const outline = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(cardX, cardY, cardW, cardH), rad, rad);
+    outline.lineWidth = 1.5;
+    outline.stroke;
+
+    // Top-left micro EXIF pill
+    const exifText = "24MM  ·  EDITORIAL BENTO";
+    const exifFont = resolveFont(typo.accent_font || "Menlo-Regular", 11, $.NSFontWeightRegular);
+    const exifAttrs = makeTextAttrs(exifFont, nsColorFromHex("#1C1C1B", 0.92), 1.4);
+    const exifSz = $(exifText).sizeWithAttributes(exifAttrs);
+    nsColorFromHex(pal.bg || "#F4F1EA", 0.92).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(cardX + 22, cardY + cardH - 46, exifSz.width + 20, 24),
+      6,
+      6
+    ).fill;
+    $(exifText).drawAtPointWithAttributes($.NSMakePoint(cardX + 32, cardY + cardH - 41), exifAttrs);
+
+    // Bottom-left Georgia serif title + tracked Swiss eyebrow
+    const eyeFont = resolveFont(typo.meta_font, 12, $.NSFontWeightMedium);
+    const eyeAttrs = makeTextAttrs(eyeFont, nsColorFromHex("#F4F1EA", 0.85), 2.4);
+    $(eyebrowText).drawAtPointWithAttributes($.NSMakePoint(cardX + 28, cardY + 92), eyeAttrs);
+
+    const titleFont = fitFontToWidth(typo.display_font, 42, 24, displayTitle, cardW - 60, 0.6);
+    const titleAttrs = makeTextAttrs(titleFont, nsColorFromHex("#F4F1EA", 1.0), 0.6);
+    $(displayTitle).drawAtPointWithAttributes($.NSMakePoint(cardX + 28, cardY + 34), titleAttrs);
+    return;
+  }
+
+  if (sid === "super8_nostalgia") {
+    // Deep film gate with Super 8 rounded aperture + left sprocket notch + orange retro date stamp
+    const padX = 36;
+    const padY = 26;
+    const frameX = padX;
+    const frameY = stageY + padY;
+    const frameW = heroW - padX * 2;
+    const frameH = stageH - padY * 2;
+
+    const graded = applyStyleGradeAndTexture(heroCI, style, frameW, frameH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, frameW, frameH);
+    drawClippedNSImage(nsHero, frameX, frameY, frameW, frameH, 26);
+
+    // Warm dark bottom scrim inside Super 8 aperture
+    $.NSGraphicsContext.saveGraphicsState;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(frameX, frameY, frameW, frameH), 26, 26).addClip;
+    const grad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.08, 0.06, 0.04, 0.72),
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.08, 0.06, 0.04, 0.0)
+    );
+    grad.drawInRectAngle($.NSMakeRect(frameX, frameY, frameW, 200), 90);
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    // Classic Super 8 sprocket notch on left film margin
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.95, 0.90, 0.80, 0.85).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(8, stageY + stageH / 2 - 44, 18, 88),
+      5,
+      5
+    ).fill;
+
+    // Retro LED amber date stamp in bottom-right of aperture
+    const dateStamp = "'26  07  04";
+    const stampFont = resolveFont(typo.meta_font || "Menlo-Bold", 15, $.NSFontWeightBold);
+    const stampAttrs = makeTextAttrs(stampFont, nsColorFromHex(pal.accent || "#E88D48", 0.96), 2.0);
+    const stSz = $(dateStamp).sizeWithAttributes(stampAttrs);
+    $.NSGraphicsContext.saveGraphicsState;
+    makeDropShadow(6.0, 0, 0, 0.85).set;
+    $(dateStamp).drawAtPointWithAttributes(
+      $.NSMakePoint(frameX + frameW - stSz.width - 28, frameY + 24),
+      stampAttrs
+    );
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    // Nostalgic warm serif title bottom-left
+    const eyeFont = resolveFont(typo.meta_font, 11, $.NSFontWeightBold);
+    const eyeAttrs = makeTextAttrs(eyeFont, nsColorFromHex(pal.accent || "#E88D48", 0.92), 2.2);
+    $(eyebrowText).drawAtPointWithAttributes($.NSMakePoint(frameX + 28, frameY + 86), eyeAttrs);
+
+    const titleFont = fitFontToWidth(typo.display_font, 40, 24, displayTitle, frameW - 190, 1.0);
+    const titleAttrs = makeTextAttrs(titleFont, nsColorFromHex(pal.text_primary || "#F7ECD8", 1.0), 1.0);
+    $(displayTitle).drawAtPointWithAttributes($.NSMakePoint(frameX + 28, frameY + 32), titleAttrs);
+    return;
+  }
+
+  if (sid === "sitcom_cast") {
+    // Cheerful bright cream canvas with vibrant yellow-bordered rounded card + coral pill + punchy heavy title
+    const pad = 22;
+    const cardX = pad;
+    const cardY = stageY + pad;
+    const cardW = heroW - pad * 2;
+    const cardH = stageH - pad * 2;
+    const rad = 16;
+
+    // Offset playful pop shadow block
+    nsColorFromHex(pal.accent || "#FF6B6B", 0.88).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(cardX + 7, cardY - 7, cardW, cardH),
+      rad,
+      rad
+    ).fill;
+
+    const graded = applyStyleGradeAndTexture(heroCI, style, cardW, cardH);
+    const nsHero = ciImageToNSImage(ciCtx, graded, cardW, cardH);
+    drawClippedNSImage(nsHero, cardX, cardY, cardW, cardH, rad);
+
+    // Bottom scrim for crisp white sitcom typography
+    $.NSGraphicsContext.saveGraphicsState;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(cardX, cardY, cardW, cardH), rad, rad).addClip;
+    const grad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.08, 0.10, 0.16, 0.72),
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.08, 0.10, 0.16, 0.0)
+    );
+    grad.drawInRectAngle($.NSMakeRect(cardX, cardY, cardW, 220), 90);
+    $.NSGraphicsContext.restoreGraphicsState;
+
+    // Vibrant sunny yellow frame border
+    nsColorFromHex(pal.border || "#FFD166", 1.0).setStroke;
+    const border = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(cardX, cardY, cardW, cardH), rad, rad);
+    border.lineWidth = 5.0;
+    border.stroke;
+
+    // Coral pill badge
+    const eyeFont = resolveFont(typo.meta_font, 12, $.NSFontWeightBold);
+    const eyeAttrs = makeTextAttrs(eyeFont, $.NSColor.whiteColor, 1.6);
+    const eyeSz = $(eyebrowText).sizeWithAttributes(eyeAttrs);
+    nsColorFromHex(pal.accent || "#FF6B6B", 1.0).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(cardX + 26, cardY + 104, eyeSz.width + 24, 28),
+      14,
+      14
+    ).fill;
+    $(eyebrowText).drawAtPointWithAttributes($.NSMakePoint(cardX + 38, cardY + 110), eyeAttrs);
+
+    // Punchy AvenirNext-Heavy uppercase title
+    const titleFont = fitFontToWidth(typo.display_font, 44, 24, displayTitle, cardW - 56, 1.4);
+    const titleAttrs = makeTextAttrs(titleFont, $.NSColor.whiteColor, 1.4);
+    $.NSGraphicsContext.saveGraphicsState;
+    makeDropShadow(10.0, 2, -3, 0.55).set;
+    $(displayTitle).drawAtPointWithAttributes($.NSMakePoint(cardX + 26, cardY + 38), titleAttrs);
+    $.NSGraphicsContext.restoreGraphicsState;
+    return;
+  }
+
+  // Default / cinema_doc: Edge-to-edge wide cinema hero + Baskerville gold-accent editorial overlay
+  const graded = applyStyleGradeAndTexture(heroCI, style, heroW, stageH);
+  const nsHero = ciImageToNSImage(ciCtx, graded, heroW, stageH);
+  drawClippedNSImage(nsHero, 0, stageY, heroW, stageH, 0);
+
+  const grad = $.NSGradient.alloc.initWithStartingColorEndingColor(
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.06, 0.08, 0.80),
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.06, 0.08, 0.0)
+  );
+  grad.drawInRectAngle($.NSMakeRect(0, stageY, heroW, 260), 90);
+
+  const cx = heroW / 2.0;
+  const eyeFont = resolveFont(typo.meta_font, 12, $.NSFontWeightMedium);
+  const eyeAttrs = makeTextAttrs(eyeFont, nsColorFromHex(pal.accent || "#D4AF37", 0.96), 2.8);
+  drawCenteredText(eyebrowText, cx, stageY + 120, eyeAttrs);
+
+  const titleFont = fitFontToWidth(typo.display_font, 46, 26, displayTitle, heroW - 80, 1.2);
+  const titleAttrs = makeTextAttrs(titleFont, nsColorFromHex(pal.text_primary || "#F5F2EB", 1.0), 1.2);
+  $.NSGraphicsContext.saveGraphicsState;
+  makeDropShadow(12.0, 0, -2, 0.65).set;
+  drawCenteredText(displayTitle, cx, stageY + 54, titleAttrs);
+  $.NSGraphicsContext.restoreGraphicsState;
+
+  // Classic thin gold divider rule
+  nsColorFromHex(pal.accent || "#D4AF37", 0.92).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(cx - 86, stageY + 42, 172, 2.0));
+}
+
+function drawPortraitSection(ciCtx, pACI, pBCI, style, rightX, stageY, rightW, stageH) {
+  const sid = style.style_id;
+  const pal = style.palette || {};
+  const typo = style.typography || {};
+
+  // Panel background
+  nsColorFromHex(pal.bg || "#0F1115", 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(rightX, stageY, rightW, stageH));
+
+  // Subtle vertical seam between hero (60%) and portraits (40%)
+  nsColorFromHex(pal.border || "#2A2E38", 0.7).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(rightX, stageY, 1.5, stageH));
+
+  if (sid === "analog_scrapbook") {
+    // Two tilted Polaroids with drop shadows + masking tape + typewriter captions
+    const pW = 216;
+    const pH = 264;
+    const imgA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, pW, pH), pW, pH);
+    const imgB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, pW, pH), pW, pH);
+
+    drawTiltedPolaroid(imgB, rightX + rightW * 0.62, stageY + stageH * 0.31, pW, pH, 5.2, "CANDID · #02", typo.meta_font);
+    drawTiltedPolaroid(imgA, rightX + rightW * 0.38, stageY + stageH * 0.69, pW, pH, -5.8, "MEMORIES · #01", typo.meta_font);
+    return;
+  }
+
+  if (sid === "editorial_bento") {
+    // Crisp 3-tile asymmetric Bento grid with 14px gutters, 16px corner radii, 1px hairlines
+    const pad = 20;
+    const gap = 14;
+    const rad = 16;
+    const innerW = rightW - pad * 2;
+    const innerH = stageH - pad * 2;
+    const leftColW = Math.round(innerW * 0.54);
+    const rightColW = innerW - leftColW - gap;
+    const topRightH = Math.round(innerH * 0.62);
+    const botRightH = innerH - topRightH - gap;
+
+    const x1 = rightX + pad;
+    const x2 = x1 + leftColW + gap;
+    const yBot = stageY + pad;
+    const yTopRight = yBot + botRightH + gap;
+
+    // Tile 1: Tall left portrait
+    const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, leftColW, innerH), leftColW, innerH);
+    drawClippedNSImage(nsA, x1, yBot, leftColW, innerH, rad);
+    nsColorFromHex(pal.border || "#D2CBBF", 1.0).setStroke;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(x1, yBot, leftColW, innerH), rad, rad).stroke;
+
+    // Tile 2: Top-right portrait tile
+    const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, rightColW, topRightH), rightColW, topRightH);
+    drawClippedNSImage(nsB, x2, yTopRight, rightColW, topRightH, rad);
+    nsColorFromHex(pal.border || "#D2CBBF", 1.0).setStroke;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(x2, yTopRight, rightColW, topRightH), rad, rad).stroke;
+
+    // Tile 3: Bottom-right linen typography Bento tile
+    nsColorFromHex(pal.surface || "#EAE4D7", 1.0).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(x2, yBot, rightColW, botRightH), rad, rad).fill;
+    nsColorFromHex(pal.border || "#D2CBBF", 1.0).setStroke;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(x2, yBot, rightColW, botRightH), rad, rad).stroke;
+
+    // Accent bar + minimal metadata typography inside Tile 3
+    nsColorFromHex(pal.accent || "#8C6D46", 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(x2 + 18, yBot + botRightH - 36, 32, 3));
+
+    const bTitleFont = resolveFont(typo.display_font, 20, $.NSFontWeightBold);
+    const bTitleAttrs = makeTextAttrs(bTitleFont, nsColorFromHex(pal.text_primary || "#1C1C1B", 1.0), 0.3);
+    $("Living").drawAtPointWithAttributes($.NSMakePoint(x2 + 18, yBot + botRightH - 72), bTitleAttrs);
+    $("Bento").drawAtPointWithAttributes($.NSMakePoint(x2 + 18, yBot + botRightH - 96), bTitleAttrs);
+
+    const bMetaFont = resolveFont(typo.accent_font || "Menlo-Regular", 10, $.NSFontWeightRegular);
+    const bMetaAttrs = makeTextAttrs(bMetaFont, nsColorFromHex(pal.text_secondary || "#66635C", 1.0), 1.2);
+    $("2/3-UP MOSAIC").drawAtPointWithAttributes($.NSMakePoint(x2 + 18, yBot + 42), bMetaAttrs);
+    $("QUIET LUXURY").drawAtPointWithAttributes($.NSMakePoint(x2 + 18, yBot + 24), bMetaAttrs);
+    return;
+  }
+
+  if (sid === "super8_nostalgia") {
+    // Dark film bay with two stacked Super 8 rounded apertures + right-side sprocket holes + date stamp
+    const padL = 22;
+    const padR = 46;
+    const padY = 26;
+    const gap = 18;
+    const frameW = rightW - padL - padR;
+    const frameH = Math.floor((stageH - padY * 2 - gap) / 2);
+
+    const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, frameW, frameH), frameW, frameH);
+    const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, frameW, frameH), frameW, frameH);
+
+    const yBot = stageY + padY;
+    const yTop = yBot + frameH + gap;
+    drawClippedNSImage(nsA, rightX + padL, yTop, frameW, frameH, 22);
+    drawClippedNSImage(nsB, rightX + padL, yBot, frameW, frameH, 22);
+
+    // Subtle film gate rims
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.24, 0.19, 0.14, 0.8).setStroke;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(rightX + padL, yTop, frameW, frameH), 22, 22).stroke;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(rightX + padL, yBot, frameW, frameH), 22, 22).stroke;
+
+    // Vertical Super 8 sprocket holes along right margin
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.93, 0.87, 0.76, 0.78).setFill;
+    const holeX = rightX + rightW - 30;
+    for (let hy = stageY + 34; hy < stageY + stageH - 44; hy += 64) {
+      $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(holeX, hy, 16, 28), 4, 4).fill;
+    }
+
+    // Retro orange frame-counter stamps
+    const stFont = resolveFont(typo.meta_font || "Menlo-Bold", 11, $.NSFontWeightBold);
+    const stAttrs = makeTextAttrs(stFont, nsColorFromHex(pal.accent || "#E88D48", 0.95), 1.5);
+    $("8MM · 18FPS").drawAtPointWithAttributes($.NSMakePoint(rightX + padL + 16, yTop + 14), stAttrs);
+    $("KODAK · PORTRA").drawAtPointWithAttributes($.NSMakePoint(rightX + padL + 16, yBot + 14), stAttrs);
+    return;
+  }
+
+  if (sid === "kinetic_montage") {
+    // Bold high-contrast tight vertical 2-up live split + vermilion accent tag
+    const pad = 10;
+    const gap = 8;
+    const tileW = Math.floor((rightW - pad * 2 - gap) / 2);
+    const tileH = stageH - pad * 2;
+
+    const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, tileW, tileH), tileW, tileH);
+    const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, tileW, tileH), tileW, tileH);
+
+    drawClippedNSImage(nsA, rightX + pad, stageY + pad, tileW, tileH, 0);
+    drawClippedNSImage(nsB, rightX + pad + tileW + gap, stageY + pad, tileW, tileH, 0);
+
+    // High-contrast top & bottom energy bars + badge
+    const badgeFont = resolveFont(typo.meta_font, 11, $.NSFontWeightBold);
+    const badgeAttrs = makeTextAttrs(badgeFont, $.NSColor.whiteColor, 1.6);
+    const badgeTxt = "LIVE 2-UP / 3-UP SPLIT";
+    const bSz = $(badgeTxt).sizeWithAttributes(badgeAttrs);
+    nsColorFromHex(pal.accent || "#FF5A36", 0.95).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(rightX + 20, stageY + stageH - 46, bSz.width + 20, 26));
+    $(badgeTxt).drawAtPointWithAttributes($.NSMakePoint(rightX + 30, stageY + stageH - 40), badgeAttrs);
+
+    // Cyan bottom kinetic accent strip
+    nsColorFromHex(pal.accent_secondary || "#32D2E8", 0.92).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(rightX + pad, stageY + pad, rightW - pad * 2, 4));
+    return;
+  }
+
+  if (sid === "wes_postcard") {
+    // Dusty-rose surface panel holding two symmetrically framed museum postcards with centered captions
+    nsColorFromHex(pal.surface || "#E8B4B8", 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(rightX + 1.5, stageY, rightW - 1.5, stageH));
+
+    const padX = 24;
+    const padY = 26;
+    const gap = 20;
+    const cardW = rightW - padX * 2;
+    const cardH = Math.floor((stageH - padY * 2 - gap) / 2);
+    const innerPad = 12;
+    const imgW = cardW - innerPad * 2;
+    const imgH = cardH - innerPad * 2 - 24;
+
+    const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, imgW, imgH), imgW, imgH);
+    const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, imgW, imgH), imgW, imgH);
+
+    const capFont = resolveFont(typo.display_font, 11, $.NSFontWeightBold);
+    const capAttrs = makeTextAttrs(capFont, nsColorFromHex(pal.text_primary || "#262322", 1.0), 2.2);
+
+    const pairs = [
+      { img: nsA, y: stageY + padY + cardH + gap, cap: "FIG. I  —  PORTRAIT" },
+      { img: nsB, y: stageY + padY, cap: "FIG. II  —  DETAIL" },
+    ];
+    for (let i = 0; i < pairs.length; i++) {
+      const p = pairs[i];
+      nsColorFromHex(pal.bg || "#FAF6EE", 1.0).setFill;
+      $.NSBezierPath.fillRect($.NSMakeRect(rightX + padX, p.y, cardW, cardH));
+      drawClippedNSImage(p.img, rightX + padX + innerPad, p.y + 30, imgW, imgH, 0);
+      drawCenteredText(p.cap, rightX + rightW / 2.0, p.y + 9, capAttrs);
+    }
+    return;
+  }
+
+  if (sid === "sitcom_cast") {
+    // Warm cheerful butter canvas + two playful slightly tilted pop cards with coral/mint borders & cast nickname pills
+    nsColorFromHex(pal.surface || "#FFF3D1", 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(rightX + 1.5, stageY, rightW - 1.5, stageH));
+
+    const cardW = 330;
+    const cardH = 264;
+    const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, cardW, cardH), cardW, cardH);
+    const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, cardW, cardH), cardW, cardH);
+
+    const drawPopCard = (nsImg, cx, cy, angle, borderHex, pillHex, tagText) => {
+      $.NSGraphicsContext.saveGraphicsState;
+      const tf = $.NSAffineTransform.transform;
+      tf.translateXByYBy(cx, cy);
+      tf.rotateByDegrees(angle);
+      tf.concat;
+
+      $.NSGraphicsContext.saveGraphicsState;
+      makeDropShadow(14.0, 4, -6, 0.24).set;
+      $.NSColor.whiteColor.setFill;
+      $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+        $.NSMakeRect(-cardW / 2 - 6, -cardH / 2 - 6, cardW + 12, cardH + 12),
+        16,
+        16
+      ).fill;
+      $.NSGraphicsContext.restoreGraphicsState;
+
+      drawClippedNSImage(nsImg, -cardW / 2, -cardH / 2, cardW, cardH, 12);
+
+      nsColorFromHex(borderHex, 1.0).setStroke;
+      const b = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+        $.NSMakeRect(-cardW / 2 - 3, -cardH / 2 - 3, cardW + 6, cardH + 6),
+        14,
+        14
+      );
+      b.lineWidth = 4.0;
+      b.stroke;
+
+      // Cast nickname badge pill
+      const f = resolveFont(typo.display_font, 13, $.NSFontWeightHeavy);
+      const attrs = makeTextAttrs(f, $.NSColor.whiteColor, 1.2);
+      const sz = $(tagText).sizeWithAttributes(attrs);
+      const pw = sz.width + 26;
+      nsColorFromHex(pillHex, 1.0).setFill;
+      $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+        $.NSMakeRect(-pw / 2, -cardH / 2 - 14, pw, 28),
+        14,
+        14
+      ).fill;
+      drawCenteredText(tagText, 0, -cardH / 2 - 8, attrs);
+
+      $.NSGraphicsContext.restoreGraphicsState;
+    };
+
+    drawPopCard(nsA, rightX + rightW * 0.49, stageY + stageH * 0.72, -2.5, pal.accent || "#FF6B6B", pal.accent || "#FF6B6B", "THE NAVIGATOR");
+    drawPopCard(nsB, rightX + rightW * 0.51, stageY + stageH * 0.28, 2.5, pal.accent_secondary || "#06D6A0", "#118AB2", "CHIEF SNACK OFFICER");
+    return;
+  }
+
+  // Default / cinema_doc: Clean side-by-side Editorial Diptych with subtle gold accents
+  const pad = 20;
+  const gap = 12;
+  const topLabelH = 26;
+  const tileW = Math.floor((rightW - pad * 2 - gap) / 2);
+  const tileH = stageH - pad * 2 - topLabelH;
+
+  const nsA = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pACI, style, tileW, tileH), tileW, tileH);
+  const nsB = ciImageToNSImage(ciCtx, applyStyleGradeAndTexture(pBCI, style, tileW, tileH), tileW, tileH);
+
+  drawClippedNSImage(nsA, rightX + pad, stageY + pad, tileW, tileH, 0);
+  drawClippedNSImage(nsB, rightX + pad + tileW + gap, stageY + pad, tileW, tileH, 0);
+
+  // Thin editorial gold border around diptych pair
+  nsColorFromHex(pal.accent || "#D4AF37", 0.45).setStroke;
+  const frameA = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(rightX + pad, stageY + pad, tileW, tileH));
+  frameA.lineWidth = 1.0;
+  frameA.stroke;
+  const frameB = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(rightX + pad + tileW + gap, stageY + pad, tileW, tileH));
+  frameB.lineWidth = 1.0;
+  frameB.stroke;
+
+  const lblFont = resolveFont(typo.meta_font, 11, $.NSFontWeightMedium);
+  const lblAttrs = makeTextAttrs(lblFont, nsColorFromHex(pal.text_secondary || "#B9B2A3", 0.9), 2.2);
+  $("EDITORIAL DIPTYCH").drawAtPointWithAttributes(
+    $.NSMakePoint(rightX + pad, stageY + stageH - pad - 16),
+    lblAttrs
+  );
+}
+
+function drawFooterStrip(style, width, footerH) {
+  const pal = style.palette || {};
+  const typo = style.typography || {};
+  const pacing = style.pacing_rules || {};
+  const trans = style.transitions || {};
+
+  const lightTheme = isLightHex(pal.bg || "#0F1115");
+  const footerBg = lightTheme ? (pal.surface || pal.bg || "#F4F1EA") : (pal.surface || "#161920");
+  const primaryTextHex = pal.text_primary || (lightTheme ? "#1C1C1B" : "#F5F2EB");
+  const secondaryTextHex = pal.text_secondary || (lightTheme ? "#5A554E" : "#AEB5C2");
+
+  nsColorFromHex(footerBg, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, 0, width, footerH));
+
+  // Crisp top hairline divider
+  nsColorFromHex(pal.border || (lightTheme ? "#CFC7BA" : "#2C323E"), 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, footerH - 1.5, width, 1.5));
+
+  // 1. Palette color swatches (left)
+  const swatches = (pal.swatches && pal.swatches.length ? pal.swatches : [pal.bg, pal.accent, pal.text_primary]).slice(0, 5);
+  let curX = 20;
+  const swSize = 22;
+  const swY = Math.round((footerH - swSize) / 2);
+  for (let i = 0; i < swatches.length; i++) {
+    nsColorFromHex(swatches[i], 1.0).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(curX, swY, swSize, swSize), 5, 5).fill;
+    $.NSColor.colorWithCalibratedWhiteAlpha(lightTheme ? 0.15 : 0.85, 0.28).setStroke;
+    const b = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(curX, swY, swSize, swSize), 5, 5);
+    b.lineWidth = 1.0;
+    b.stroke;
+    curX += swSize + 7;
+  }
+
+  curX += 14;
+
+  // 2. Style display name
+  const nameText = style.display_name || style.style_id;
+  const nameFont = resolveFont(typo.display_font, 19, $.NSFontWeightBold);
+  const nameAttrs = makeTextAttrs(nameFont, nsColorFromHex(primaryTextHex, 1.0), 0.4);
+  const nameSz = $(nameText).sizeWithAttributes(nameAttrs);
+  $(nameText).drawAtPointWithAttributes($.NSMakePoint(curX, Math.round((footerH - nameSz.height) / 2) + 1), nameAttrs);
+  curX += nameSz.width + 18;
+
+  // Style ID tag pill
+  const idLabel = style.style_id;
+  const idFont = resolveFont("Menlo-Regular", 11, $.NSFontWeightRegular);
+  const idAttrs = makeTextAttrs(idFont, nsColorFromHex(secondaryTextHex, 0.95), 0.5);
+  const idSz = $(idLabel).sizeWithAttributes(idAttrs);
+  $(idLabel).drawAtPointWithAttributes($.NSMakePoint(curX, Math.round((footerH - idSz.height) / 2) + 1), idAttrs);
+
+  // 3. Right side: Transition signature + Target BPM pill
+  const sigText = trans.signature_label || (trans.default_between_chapters || "dissolve");
+  const sigFont = resolveFont(typo.meta_font || "HelveticaNeue-Medium", 13, $.NSFontWeightMedium);
+  const sigAttrs = makeTextAttrs(sigFont, nsColorFromHex(secondaryTextHex, 1.0), 0.6);
+  const sigSz = $(sigText).sizeWithAttributes(sigAttrs);
+  const sigX = width - sigSz.width - 22;
+  $(sigText).drawAtPointWithAttributes($.NSMakePoint(sigX, Math.round((footerH - sigSz.height) / 2) + 1), sigAttrs);
+
+  const bpmText = pacing.target_bpm_label || (pacing.target_bpm_min + "-" + pacing.target_bpm_max + " BPM");
+  const bpmFont = resolveFont("Menlo-Bold", 12, $.NSFontWeightBold);
+  const accentHex = pal.accent || "#D4AF37";
+  const bpmTextColor = isLightHex(accentHex)
+    ? $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.11, 0.11, 0.12, 1.0)
+    : $.NSColor.whiteColor;
+  const bpmAttrs = makeTextAttrs(bpmFont, bpmTextColor, 0.6);
+  const bpmSz = $(bpmText).sizeWithAttributes(bpmAttrs);
+  const pillW = Math.ceil(bpmSz.width) + 22;
+  const pillH = 26;
+  const pillX = sigX - pillW - 18;
+  const pillY = Math.round((footerH - pillH) / 2);
+
+  nsColorFromHex(accentHex, 1.0).setFill;
+  $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(pillX, pillY, pillW, pillH), 13, 13).fill;
+  $(bpmText).drawAtPointWithAttributes(
+    $.NSMakePoint(pillX + (pillW - bpmSz.width) / 2.0, pillY + Math.round((pillH - bpmSz.height) / 2)),
+    bpmAttrs
+  );
+}
+
+function renderStyleCard(ciCtx, style, heroCI, pACI, pBCI, tripTitle, outPath) {
+  const W = 1280;
+  const H = 720;
+  const FOOTER_H = 56;
+  const STAGE_H = H - FOOTER_H; // 664
+  const HERO_W = 768; // 60% of 1280
+  const RIGHT_W = W - HERO_W; // 512 (40%)
+
+  const rep = $.NSBitmapImageRep.alloc
+    .initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+      null,
+      W,
+      H,
+      8,
+      4,
+      true,
+      false,
+      $.NSCalibratedRGBColorSpace,
+      0,
+      0
+    );
+  const ctx = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext(ctx);
+
+  drawHeroSection(ciCtx, heroCI, style, tripTitle, FOOTER_H, HERO_W, STAGE_H);
+  drawPortraitSection(ciCtx, pACI, pBCI, style, HERO_W, FOOTER_H, RIGHT_W, STAGE_H);
+  drawFooterStrip(style, W, FOOTER_H);
+
+  $.NSGraphicsContext.restoreGraphicsState;
+
+  const parent = ObjC.unwrap($(outPath).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  const props = $.NSMutableDictionary.dictionary;
+  props.setObjectForKey($.NSNumber.numberWithDouble(0.89), $.NSImageCompressionFactor);
+  const jpg = rep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG, props);
+  jpg.writeToFileAtomically(outPath, true);
+}
+
+function resolveDefaultStylesDir() {
+  const fm = $.NSFileManager.defaultManager;
+  const candidates = [
+    "./styles",
+    "../../styles",
+    "./skills/trip-cinema/styles",
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    if (fm.fileExistsAtPath(candidates[i] + "/cinema_doc.json")) return candidates[i];
+  }
+  return "./styles";
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify(
+      {
+        script: "macos_style_previews.jxa",
+        usage:
+          "osascript -l JavaScript macos_style_previews.jxa --styles-dir <styles_dir> --style-ids <comma_list> --hero <img_or_video> --portrait-a <img_or_video> --portrait-b <img_or_video> --trip-title <str> --out-dir <out_dir> [--artifact-dir <dir>] [--manifest <manifest_v2.json>]",
+        card_dimensions: "1280x720",
+        supported_styles: [
+          "cinema_doc",
+          "analog_scrapbook",
+          "wes_postcard",
+          "kinetic_montage",
+          "editorial_bento",
+          "super8_nostalgia",
+          "sitcom_cast",
+        ],
+      },
+      null,
+      2
+    );
+  }
+
+  let hero = args.hero;
+  let pa = args.portraitA;
+  let pb = args.portraitB;
+
+  if (args.manifest && (!hero || !pa || !pb)) {
+    const manifest = readJsonFile(args.manifest);
+    const assets = manifest.assets || [];
+    const landscapes = assets.filter((a) => a.orientation === "landscape");
+    const portraits = assets.filter((a) => a.orientation === "portrait");
+    if (!hero) hero = landscapes.length ? landscapes[0].source_path : assets[0] ? assets[0].source_path : null;
+    if (!pa) pa = portraits.length ? portraits[0].source_path : hero;
+    if (!pb) pb = portraits.length > 1 ? portraits[1].source_path : pa;
+  }
+
+  if (!hero) throw new Error("Provide --hero <img_or_video> (or --manifest with assets).");
+  if (!pa) pa = hero;
+  if (!pb) pb = pa;
+
+  const stylesDir = args.stylesDir || resolveDefaultStylesDir();
+  const styleIds = args.styleIds && args.styleIds.length ? args.styleIds : DEFAULT_STYLE_IDS;
+
+  ensureDir(args.outDir);
+  if (args.artifactDir) ensureDir(args.artifactDir);
+
+  const ciOpts = $.NSMutableDictionary.dictionary;
+  ciOpts.setObjectForKey($.NSNumber.numberWithBool(false), $.kCIContextCacheIntermediates);
+  const ciCtx = $.CIContext.contextWithOptions(ciOpts);
+
+  const heroCI = loadMediaAsCIImage(ciCtx, hero, 1400);
+  const pACI = loadMediaAsCIImage(ciCtx, pa, 1200);
+  const pBCI = loadMediaAsCIImage(ciCtx, pb, 1200);
+
+  const cards = [];
+  for (let i = 0; i < styleIds.length; i++) {
+    const sid = styleIds[i];
+    const presetPath = stylesDir + "/" + sid + ".json";
+    const style = readJsonFile(presetPath);
+    const cardName = "style_card_" + sid + ".jpg";
+    const cardPath = args.outDir + "/" + cardName;
+    const artifactPath = args.artifactDir ? args.artifactDir + "/" + cardName : null;
+
+    renderStyleCard(ciCtx, style, heroCI, pACI, pBCI, args.tripTitle, cardPath);
+    if (artifactPath) copyFileOverwrite(cardPath, artifactPath);
+
+    cards.push({
+      style_id: sid,
+      display_name: style.display_name || sid,
+      tagline: style.tagline || "",
+      target_bpm: style.pacing_rules ? style.pacing_rules.target_bpm_label : null,
+      transition_signature: style.transitions ? style.transitions.signature_label : null,
+      swatches: style.palette ? style.palette.swatches : [],
+      card_path: cardPath,
+      artifact_path: artifactPath,
+      dimensions: "1280x720",
+      status: "ok",
+    });
+
+    ciCtx.clearCaches;
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.002));
+  }
+
+  const report = {
+    schema_version: "2.0",
+    renderer: "macos-native-coreimage-appkit-jxa",
+    trip_title: args.tripTitle,
+    hero_source: hero,
+    portrait_a_source: pa,
+    portrait_b_source: pb,
+    styles_dir: stylesDir,
+    card_count: cards.length,
+    cards: cards,
+  };
+  const reportPath = args.outDir + "/style_previews.json";
+  writeTextFile(reportPath, JSON.stringify(report, null, 2) + "\n");
+  return JSON.stringify(report, null, 2);
+}

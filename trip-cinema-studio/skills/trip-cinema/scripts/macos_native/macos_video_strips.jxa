@@ -1,0 +1,2263 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Video-First Stage 0 Timeline Strip Ingestor & Photo Contact Sheet Generator.
+ * 100% Apple-signed macOS Native JXA (AVFoundation + CoreImage + ImageIO + AppKit + /usr/bin/afconvert).
+ * Zero third-party binaries.
+ *
+ * Modes:
+ *   1. Index-Only (fast metadata scan + 7-tier creation date waterfall -> manifest_v2.json):
+ *      osascript -l JavaScript macos_video_strips.jxa \
+ *        --input-dir <raw_dir> --work-dir <work_dir> --index-only
+ *
+ *   2. Batched 1800x360 Video Timeline Strips (12-15 clips per exiting process):
+ *      nice -n 15 osascript -l JavaScript macos_video_strips.jxa \
+ *        --manifest <work_dir>/manifest_v2.json \
+ *        --out-dir <work_dir>/clip_strips \
+ *        [--artifact-dir <artifact_strips_dir>] \
+ *        --batch-start 0 --batch-end 15
+ *
+ *   3. Photo 3x3 Upright Contact Sheets (~20% photos):
+ *      osascript -l JavaScript macos_video_strips.jxa \
+ *        --photos-only \
+ *        --manifest <work_dir>/manifest_v2.json \
+ *        --out-dir <work_dir>/photo_sheets \
+ *        [--artifact-dir <artifact_sheets_dir>]
+ */
+
+ObjC.import("Foundation");
+ObjC.import("CoreFoundation");
+ObjC.import("AVFoundation");
+ObjC.import("CoreMedia");
+ObjC.import("CoreImage");
+ObjC.import("ImageIO");
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+const IMAGE_EXTS = new Set([
+  ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp",
+  ".tif", ".tiff", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".raf",
+]);
+
+const VIDEO_EXTS = new Set([
+  ".mov", ".mp4", ".m4v", ".mkv", ".avi", ".mts", ".m2ts", ".webm",
+]);
+
+const B64_LUT = (function () {
+  const lut = new Uint8Array(128);
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let i = 0; i < chars.length; i++) lut[chars.charCodeAt(i)] = i;
+  return lut;
+})();
+
+function avClass(name) {
+  const cls = $.NSClassFromString(name);
+  if (!cls) throw new Error("Required Objective-C class not found: " + name);
+  return cls;
+}
+
+function parseArgs(argv) {
+  const args = {
+    inputDir: null,
+    fileList: null,
+    workDir: "./work",
+    manifest: null,
+    manifestOut: null,
+    outDir: null,
+    artifactDir: null,
+    indexOnly: false,
+    photosOnly: false,
+    batchStart: null,
+    batchEnd: null,
+    skipExisting: false,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--input-dir") args.inputDir = argv[++i];
+    else if (a === "--file-list") args.fileList = argv[++i];
+    else if (a === "--work-dir") args.workDir = argv[++i];
+    else if (a === "--manifest") args.manifest = argv[++i];
+    else if (a === "--manifest-out") args.manifestOut = argv[++i];
+    else if (a === "--out-dir") args.outDir = argv[++i];
+    else if (a === "--artifact-dir") args.artifactDir = argv[++i];
+    else if (a === "--index-only") args.indexOnly = true;
+    else if (a === "--photos-only") args.photosOnly = true;
+    else if (a === "--batch-start") args.batchStart = parseInt(argv[++i], 10);
+    else if (a === "--batch-end") args.batchEnd = parseInt(argv[++i], 10);
+    else if (a === "--skip-existing") args.skipExisting = true;
+  }
+  return args;
+}
+
+function ensureDir(dirPath) {
+  if (!dirPath) return;
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON file: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function writeTextFile(path, text) {
+  const parent = ObjC.unwrap($(path).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  $(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+}
+
+function copyFileOverwrite(srcPath, dstPath) {
+  const fm = $.NSFileManager.defaultManager;
+  const parent = ObjC.unwrap($(dstPath).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  if (fm.fileExistsAtPath(dstPath)) fm.removeItemAtPathError(dstPath, null);
+  fm.copyItemAtPathToPathError(srcPath, dstPath, null);
+}
+
+function drainRunLoop() {
+  $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.002));
+}
+
+function makeTextAttrs(font, color) {
+  const dict = $.NSMutableDictionary.dictionary;
+  dict.setObjectForKey(font, $.NSFontAttributeName);
+  dict.setObjectForKey(color, $.NSForegroundColorAttributeName);
+  return dict;
+}
+
+function createBitmapCanvas(width, height) {
+  const rep = $.NSBitmapImageRep.alloc
+    .initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+      null,
+      width,
+      height,
+      8,
+      4,
+      true,
+      false,
+      $.NSCalibratedRGBColorSpace,
+      0,
+      0
+    );
+  const ctx = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext(ctx);
+  return rep;
+}
+
+function finishAndSaveBitmapJPEG(rep, outPath, quality) {
+  $.NSGraphicsContext.restoreGraphicsState;
+  const parent = ObjC.unwrap($(outPath).stringByDeletingLastPathComponent);
+  if (parent) ensureDir(parent);
+  const props = $.NSMutableDictionary.dictionary;
+  props.setObjectForKey($.NSNumber.numberWithDouble(quality || 0.86), $.NSImageCompressionFactor);
+  const jpg = rep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG, props);
+  jpg.writeToFileAtomically(outPath, true);
+}
+
+function runSubprocess(launchPath, argList) {
+  try {
+    const task = $.NSTask.alloc.init;
+    task.launchPath = launchPath;
+    task.arguments = $(argList);
+    const outPipe = $.NSPipe.pipe;
+    const errPipe = $.NSPipe.pipe;
+    task.standardOutput = outPipe;
+    task.standardError = errPipe;
+    task.launch;
+    const outData = outPipe.fileHandleForReading.readDataToEndOfFile;
+    const errData = errPipe.fileHandleForReading.readDataToEndOfFile;
+    task.waitUntilExit;
+    const stdout = outData
+      ? ObjC.unwrap($.NSString.alloc.initWithDataEncoding(outData, $.NSUTF8StringEncoding)) || ""
+      : "";
+    const stderr = errData
+      ? ObjC.unwrap($.NSString.alloc.initWithDataEncoding(errData, $.NSUTF8StringEncoding)) || ""
+      : "";
+    return { status: Number(task.terminationStatus), stdout: stdout, stderr: stderr };
+  } catch (e) {
+    return { status: -1, stdout: "", stderr: String(e) };
+  }
+}
+
+function pathExtLower(filePath) {
+  const ext = ObjC.unwrap($(filePath).pathExtension) || "";
+  return ext ? "." + ext.toLowerCase() : "";
+}
+
+function pathBasename(filePath) {
+  return ObjC.unwrap($(filePath).lastPathComponent) || "";
+}
+
+function pathStem(filename) {
+  const idx = filename.lastIndexOf(".");
+  return idx > 0 ? filename.slice(0, idx) : filename;
+}
+
+function pad2(n) {
+  return String(Math.floor(Math.abs(n))).padStart(2, "0");
+}
+
+function formatOffsetMin(offsetMin) {
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(Math.round(offsetMin));
+  const hh = Math.floor(abs / 60);
+  const mm = abs % 60;
+  return sign + pad2(hh) + ":" + pad2(mm);
+}
+
+function formatLocalIsoFromEpoch(epochSec, offsetMin) {
+  const shifted = new Date((epochSec + offsetMin * 60) * 1000);
+  const y = shifted.getUTCFullYear();
+  const m = pad2(shifted.getUTCMonth() + 1);
+  const d = pad2(shifted.getUTCDate());
+  const hh = pad2(shifted.getUTCHours());
+  const mm = pad2(shifted.getUTCMinutes());
+  const ss = pad2(shifted.getUTCSeconds());
+  return y + "-" + m + "-" + d + "T" + hh + ":" + mm + ":" + ss + formatOffsetMin(offsetMin);
+}
+
+function formatUtcIsoFromEpoch(epochSec) {
+  const dt = new Date(epochSec * 1000);
+  return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function isValidYear(y) {
+  return y >= 2000 && y <= 2100 && y !== 1904 && y !== 1970;
+}
+
+/**
+ * Parse ISO-8601, EXIF ("YYYY:MM:DD HH:MM:SS"), or mdls ("YYYY-MM-DD HH:MM:SS +0000")
+ * timestamp strings. Preserves explicit timezone offset if present.
+ */
+function parseTimestampString(raw, explicitOffsetStr) {
+  if (!raw || typeof raw !== "string") return null;
+  let text = raw.trim();
+  if (!text || text.indexOf("0000:00:00") === 0 || text === "(null)") return null;
+
+  // Normalize EXIF colons in date portion
+  if (/^\d{4}:\d{2}:\d{2}[\sT]/.test(text)) {
+    text = text.slice(0, 10).replace(/:/g, "-") + text.slice(10);
+  }
+
+  const m = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?$/i
+  );
+  if (!m) return null;
+
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const da = parseInt(m[3], 10);
+  const hh = parseInt(m[4], 10);
+  const mm = parseInt(m[5], 10);
+  const ss = parseInt(m[6], 10);
+  if (!isValidYear(y) || mo < 1 || mo > 12 || da < 1 || da > 31) return null;
+
+  let tzStr = m[7] || (explicitOffsetStr ? String(explicitOffsetStr).trim() : null);
+  let hasExplicitTz = false;
+  let offsetMin = null;
+
+  if (tzStr) {
+    if (tzStr.toUpperCase() === "Z") {
+      hasExplicitTz = true;
+      offsetMin = 0;
+    } else {
+      const tm = tzStr.match(/^([+-])(\d{2}):?(\d{2})$/);
+      if (tm) {
+        hasExplicitTz = true;
+        const sign = tm[1] === "-" ? -1 : 1;
+        offsetMin = sign * (parseInt(tm[2], 10) * 60 + parseInt(tm[3], 10));
+      }
+    }
+  }
+
+  // Wall clock treated as UTC milliseconds before offset subtraction
+  const wallUtcSec = Date.UTC(y, mo - 1, da, hh, mm, ss) / 1000.0;
+  const epochSec = hasExplicitTz ? wallUtcSec - offsetMin * 60 : null;
+  return {
+    year: y,
+    month: mo,
+    day: da,
+    hour: hh,
+    minute: mm,
+    second: ss,
+    wallUtcSec: wallUtcSec,
+    hasExplicitTz: hasExplicitTz,
+    offsetMin: offsetMin,
+    epochSec: epochSec,
+  };
+}
+
+function parseIso6709(locStr) {
+  if (!locStr || typeof locStr !== "string") return null;
+  const trimmed = locStr.trim();
+  const m = trimmed.match(/^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?\/?$/);
+  if (!m) return null;
+  const lat = parseFloat(m[1]);
+  const lon = parseFloat(m[2]);
+  const alt = m[3] !== undefined ? parseFloat(m[3]) : null;
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  if (Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001) return null;
+  return {
+    lat: Math.round(lat * 1e6) / 1e6,
+    lon: Math.round(lon * 1e6) / 1e6,
+    altitude_m: alt !== null && isFinite(alt) ? Math.round(alt * 10) / 10 : null,
+  };
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = Math.PI / 180.0;
+  const dLat = (lat2 - lat1) * toRad;
+  const dLon = (lon2 - lon1) * toRad;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return 6371.0 * 2.0 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function collectMediaPaths(inputDir, fileList) {
+  const fm = $.NSFileManager.defaultManager;
+  const found = [];
+  const seen = new Set();
+
+  if (inputDir) {
+    const absRoot = ObjC.unwrap($(inputDir).stringByStandardizingPath);
+    const enumerator = fm.enumeratorAtPath(absRoot);
+    if (!enumerator || enumerator.isNil()) {
+      throw new Error("Input directory not found or unreadable: " + absRoot);
+    }
+    while (true) {
+      const rel = enumerator.nextObject;
+      if (!rel || rel.isNil()) break;
+      const relStr = ObjC.unwrap(rel);
+      if (!relStr) break;
+      const parts = relStr.split("/");
+      let hidden = false;
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i].startsWith(".")) {
+          hidden = true;
+          break;
+        }
+      }
+      if (hidden) continue;
+      const fullPath = absRoot.endsWith("/") ? absRoot + relStr : absRoot + "/" + relStr;
+      const ext = pathExtLower(fullPath);
+      if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext)) continue;
+      if (!seen.has(fullPath)) {
+        seen.add(fullPath);
+        found.push(fullPath);
+      }
+    }
+  }
+
+  if (fileList) {
+    const raw = ObjC.unwrap(
+      $.NSString.stringWithContentsOfFileEncodingError(fileList, $.NSUTF8StringEncoding, null)
+    );
+    if (!raw) throw new Error("Failed to read --file-list: " + fileList);
+    const lines = raw.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line || line.startsWith("#")) continue;
+      const absPath = ObjC.unwrap($(line).stringByStandardizingPath);
+      const ext = pathExtLower(absPath);
+      if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext)) continue;
+      if (fm.fileExistsAtPath(absPath) && !seen.has(absPath)) {
+        seen.add(absPath);
+        found.push(absPath);
+      }
+    }
+  }
+
+  found.sort();
+  return found;
+}
+
+function readFileStat(filePath) {
+  const attrs = $.NSFileManager.defaultManager.attributesOfItemAtPathError(filePath, null);
+  let size = 0;
+  let mtimeEpoch = Math.floor(Date.now() / 1000);
+  if (attrs) {
+    const u = ObjC.deepUnwrap(attrs);
+    if (u && u.NSFileSize !== undefined) size = Number(u.NSFileSize);
+    if (u && u.NSFileModificationDate) {
+      const d = u.NSFileModificationDate;
+      if (d instanceof Date) mtimeEpoch = d.getTime() / 1000.0;
+    }
+  }
+  return { size: size, mtimeEpoch: mtimeEpoch };
+}
+
+function classifyVideoColorProfile(vTrack) {
+  let colorProfile = "sdr_rec709";
+  try {
+    const fds = vTrack.formatDescriptions;
+    if (fds && Number(fds.count) > 0) {
+      const fd = fds.objectAtIndex(0);
+      let extObj = null;
+      try {
+        const extRef = $.CMFormatDescriptionGetExtensions(fd);
+        if (extRef) extObj = ObjC.deepUnwrap(ObjC.castRefToObject(extRef));
+      } catch (e) {
+        extObj = null;
+      }
+      const descStr = fd && fd.description ? String(ObjC.unwrap(fd.description) || "") : "";
+      const primaries = extObj && extObj.CVImageBufferColorPrimaries ? String(extObj.CVImageBufferColorPrimaries) : "";
+      const transfer = extObj && extObj.CVImageBufferTransferFunction ? String(extObj.CVImageBufferTransferFunction) : "";
+      const atoms = extObj && extObj.SampleDescriptionExtensionAtoms ? extObj.SampleDescriptionExtensionAtoms : {};
+      const atomKeys = Object.keys(atoms || {}).join(",");
+      const fmtName = extObj && extObj.FormatName ? String(extObj.FormatName) : "";
+
+      const hasDoVi =
+        /dvcC|dvvC|dvhe|dvh1|DolbyVision/i.test(atomKeys) ||
+        /dvcC|dvvC|DolbyVision/i.test(descStr);
+      const hasHLG = /HLG|2100_HLG|ARIB/i.test(transfer) || /HLG|2100_HLG/i.test(descStr);
+      const hasPQ = /2084|PQ/i.test(transfer) || /2084_PQ/i.test(descStr);
+      const has2020 = /2020/i.test(primaries) || /ITU_R_2020/i.test(descStr);
+      const hasAppleLog = /Apple\s*Log/i.test(fmtName) || /Apple\s*Log/i.test(descStr);
+
+      if (hasAppleLog) colorProfile = "apple_log";
+      else if (hasDoVi || hasHLG) colorProfile = "hdr_hlg_dovi";
+      else if (hasPQ) colorProfile = "hdr_pq";
+      else if (has2020) colorProfile = "hdr_wide";
+    }
+  } catch (e) {
+    // Keep default sdr_rec709
+  }
+  return colorProfile;
+}
+
+function extractVideoCodecFourCC(vTrack) {
+  try {
+    const fds = vTrack.formatDescriptions;
+    if (fds && Number(fds.count) > 0) {
+      const fd = fds.objectAtIndex(0);
+      const desc = fd && fd.description ? String(ObjC.unwrap(fd.description) || "") : "";
+      const m = desc.match(/mediaSubType:'([^']+)'/);
+      if (m && m[1]) return m[1].trim().toLowerCase();
+    }
+  } catch (e) {}
+  return null;
+}
+
+function probeVideoCodecFourCC(filePath) {
+  try {
+    const AVURLAsset = avClass("AVURLAsset");
+    const asset = AVURLAsset.URLAssetWithURLOptions($.NSURL.fileURLWithPath(filePath), $({}));
+    const vTracks = asset.tracksWithMediaType($.AVMediaTypeVideo);
+    if (vTracks && Number(vTracks.count) > 0) {
+      return extractVideoCodecFourCC(vTracks.objectAtIndex(0));
+    }
+  } catch (e) {}
+  return null;
+}
+
+function resolveChromeVp9HelperPath() {
+  const fm = $.NSFileManager.defaultManager;
+  try {
+    const procArgs = ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments) || [];
+    for (let i = 0; i < procArgs.length; i++) {
+      const a = String(procArgs[i] || "");
+      if (a.endsWith(".jxa")) {
+        const dir = ObjC.unwrap($(a).stringByDeletingLastPathComponent);
+        const sibling = dir + "/macos_chrome_vp9.rb";
+        if (fm.fileExistsAtPath(sibling)) return sibling;
+      }
+    }
+  } catch (e) {}
+  const fallbacks = [
+    "./macos_chrome_vp9.rb",
+    "./scripts/macos_native/macos_chrome_vp9.rb",
+    "./skills/trip-cinema/scripts/macos_native/macos_chrome_vp9.rb",
+  ];
+  for (let i = 0; i < fallbacks.length; i++) {
+    if (fm.fileExistsAtPath(fallbacks[i])) return fallbacks[i];
+  }
+  return null;
+}
+
+function inspectVideoFile(filePath, filename, stat) {
+  const AVURLAsset = avClass("AVURLAsset");
+  const url = $.NSURL.fileURLWithPath(filePath);
+  const asset = AVURLAsset.URLAssetWithURLOptions(url, $({}));
+
+  const durRaw = $.CMTimeGetSeconds(asset.duration);
+  const durationSec = isFinite(durRaw) && durRaw > 0 ? Math.round(durRaw * 1000) / 1000 : 0;
+
+  let natW = 0;
+  let natH = 0;
+  let dispW = 0;
+  let dispH = 0;
+  let rotDeg = 0;
+  let fps = 0;
+  let colorProfile = "sdr_rec709";
+  let videoCodec = null;
+
+  const vTracks = asset.tracksWithMediaType($.AVMediaTypeVideo);
+  if (vTracks && Number(vTracks.count) > 0) {
+    const vt = vTracks.objectAtIndex(0);
+    const ns = vt.naturalSize;
+    natW = Math.round(Number(ns.width) || 0);
+    natH = Math.round(Number(ns.height) || 0);
+    const pt = vt.preferredTransform;
+    const rawAngle = Math.round((Math.atan2(Number(pt.b), Number(pt.a)) * 180.0) / Math.PI);
+    rotDeg = ((rawAngle % 360) + 360) % 360;
+    const txW = Math.round(Math.abs(natW * Number(pt.a) + natH * Number(pt.c)));
+    const txH = Math.round(Math.abs(natW * Number(pt.b) + natH * Number(pt.d)));
+    if (txW > 0 && txH > 0) {
+      dispW = txW;
+      dispH = txH;
+    } else if (rotDeg === 90 || rotDeg === 270) {
+      dispW = natH;
+      dispH = natW;
+    } else {
+      dispW = natW;
+      dispH = natH;
+    }
+    const rawFps = Number(vt.nominalFrameRate) || 0;
+    fps = Math.round(rawFps * 100) / 100;
+    colorProfile = classifyVideoColorProfile(vt);
+    videoCodec = extractVideoCodecFourCC(vt);
+  }
+
+  const aTracks = asset.tracksWithMediaType($.AVMediaTypeAudio);
+  const hasAudio = !!(aTracks && Number(aTracks.count) > 0);
+
+  let keysCreationDateRaw = null;
+  let mvhdDateRaw = null;
+  let mvhdEpochRaw = null;
+  let gps = null;
+  let cameraMake = null;
+  let cameraModel = null;
+  let isGoPro = /^(GX|GH|GOPR|GP)\d+/i.test(filename);
+
+  // Check track media types for GoPro GPMF timed metadata
+  try {
+    const allTracks = asset.tracks;
+    if (allTracks) {
+      for (let i = 0; i < Number(allTracks.count); i++) {
+        const tr = allTracks.objectAtIndex(i);
+        const fds = tr.formatDescriptions;
+        if (fds && Number(fds.count) > 0) {
+          const d = ObjC.unwrap(fds.objectAtIndex(0).description) || "";
+          if (/gpmd|GPMF|GoPro/i.test(d)) isGoPro = true;
+        }
+      }
+    }
+  } catch (e) {}
+
+  // Tier 1: QuickTime Metadata (`com.apple.quicktime.creationdate`, `ISO6709`, make/model)
+  try {
+    const qtMeta = asset.metadataForFormat($.AVMetadataFormatQuickTimeMetadata);
+    if (qtMeta) {
+      for (let i = 0; i < Number(qtMeta.count); i++) {
+        const item = qtMeta.objectAtIndex(i);
+        const idStr = String(ObjC.unwrap(item.identifier) || "").toLowerCase();
+        const keyStr = String(ObjC.unwrap(item.key) || "").toLowerCase();
+        const valStr = item.stringValue ? String(ObjC.unwrap(item.stringValue) || "") : "";
+        if (!valStr) continue;
+        if (idStr.indexOf("creationdate") !== -1 || keyStr === "com.apple.quicktime.creationdate") {
+          if (!keysCreationDateRaw) keysCreationDateRaw = valStr;
+        } else if (idStr.indexOf("iso6709") !== -1 || idStr.indexOf("location") !== -1 || keyStr.indexOf("iso6709") !== -1) {
+          if (!gps) gps = parseIso6709(valStr);
+        } else if (keyStr === "com.apple.quicktime.make" || idStr.indexOf(".make") !== -1) {
+          if (!cameraMake) cameraMake = valStr;
+        } else if (keyStr === "com.apple.quicktime.model" || idStr.indexOf(".model") !== -1) {
+          if (!cameraModel) cameraModel = valStr;
+        }
+        if (/gopro|gpmf/i.test(valStr)) isGoPro = true;
+      }
+    }
+  } catch (e) {}
+
+  // Also check QuickTime UserData & CommonMetadata for GPS, make/model, and creation date
+  const extraFormats = [$.AVMetadataFormatQuickTimeUserData, $.AVMetadataFormatISOUserData];
+  for (let fIdx = 0; fIdx < extraFormats.length; fIdx++) {
+    try {
+      const items = asset.metadataForFormat(extraFormats[fIdx]);
+      if (!items) continue;
+      for (let i = 0; i < Number(items.count); i++) {
+        const item = items.objectAtIndex(i);
+        const commonKey = String(ObjC.unwrap(item.commonKey) || "").toLowerCase();
+        const idStr = String(ObjC.unwrap(item.identifier) || "").toLowerCase();
+        const valStr = item.stringValue ? String(ObjC.unwrap(item.stringValue) || "") : "";
+        if (!valStr) continue;
+        if ((commonKey === "location" || idStr.indexOf("xyz") !== -1) && !gps) {
+          gps = parseIso6709(valStr);
+        } else if (commonKey === "make" && !cameraMake) {
+          cameraMake = valStr;
+        } else if (commonKey === "model" && !cameraModel) {
+          cameraModel = valStr;
+        } else if (commonKey === "creationdate" && !mvhdDateRaw) {
+          mvhdDateRaw = valStr;
+        }
+        if (/gopro|gpmf/i.test(valStr)) isGoPro = true;
+      }
+    } catch (e) {}
+  }
+
+  try {
+    const common = asset.commonMetadata;
+    if (common) {
+      for (let i = 0; i < Number(common.count); i++) {
+        const item = common.objectAtIndex(i);
+        const ck = String(ObjC.unwrap(item.commonKey) || "").toLowerCase();
+        const valStr = item.stringValue ? String(ObjC.unwrap(item.stringValue) || "") : "";
+        if (!valStr) continue;
+        if (ck === "location" && !gps) gps = parseIso6709(valStr);
+        else if (ck === "make" && !cameraMake) cameraMake = valStr;
+        else if (ck === "model" && !cameraModel) cameraModel = valStr;
+        if (/gopro|gpmf/i.test(valStr)) isGoPro = true;
+      }
+    }
+  } catch (e) {}
+
+  // Tier 3: QuickTime `mvhd` creationDate
+  try {
+    const cd = asset.creationDate;
+    if (cd) {
+      if (cd.stringValue) {
+        const s = String(ObjC.unwrap(cd.stringValue) || "");
+        if (s && !mvhdDateRaw) mvhdDateRaw = s;
+      }
+      if (cd.dateValue) {
+        const dObj = ObjC.unwrap(cd.dateValue);
+        if (dObj instanceof Date && isFinite(dObj.getTime())) {
+          const y = dObj.getUTCFullYear();
+          if (isValidYear(y)) mvhdEpochRaw = dObj.getTime() / 1000.0;
+        }
+      }
+    }
+  } catch (e) {}
+
+  if (cameraMake && /gopro/i.test(cameraMake)) isGoPro = true;
+  if (cameraModel && /gopro|hero/i.test(cameraModel)) isGoPro = true;
+
+  const orientation =
+    dispW > 0 && dispH > 0
+      ? dispH > dispW
+        ? "portrait"
+        : dispW > dispH
+        ? "landscape"
+        : "square"
+      : "unknown";
+
+  const slowMoEligible = fps >= 50.0;
+  const slowMoRates = fps >= 100 ? [0.25, 0.5] : slowMoEligible ? [0.4, 0.5] : [];
+
+  return {
+    source_path: filePath,
+    filename: filename,
+    media_type: "video",
+    file_size_bytes: stat.size,
+    mtime_epoch: stat.mtimeEpoch,
+    duration_sec: durationSec,
+    fps: fps,
+    slow_mo_eligible: slowMoEligible,
+    recommended_slow_mo_rates: slowMoRates,
+    color_profile: colorProfile,
+    video_codec: videoCodec,
+    is_hdr: colorProfile !== "sdr_rec709",
+    requires_tonemap: colorProfile !== "sdr_rec709",
+    natural_width: natW,
+    natural_height: natH,
+    display_width: dispW,
+    display_height: dispH,
+    width: dispW,
+    height: dispH,
+    rotation_deg: rotDeg,
+    orientation: orientation,
+    has_audio: hasAudio,
+    camera_make: cameraMake,
+    camera_model: cameraModel,
+    gps_lat: gps ? gps.lat : null,
+    gps_lon: gps ? gps.lon : null,
+    gps_altitude_m: gps ? gps.altitude_m : null,
+    lat: gps ? gps.lat : null,
+    lon: gps ? gps.lon : null,
+    altitude_m: gps ? gps.altitude_m : null,
+    _raw: {
+      keysCreationDateRaw: keysCreationDateRaw,
+      mvhdDateRaw: mvhdDateRaw,
+      mvhdEpochRaw: mvhdEpochRaw,
+      isGoPro: isGoPro,
+    },
+  };
+}
+
+function inspectPhotoFile(filePath, filename, stat) {
+  let natW = 0;
+  let natH = 0;
+  let dispW = 0;
+  let dispH = 0;
+  let orientNum = 1;
+  let exifDateRaw = null;
+  let exifOffsetRaw = null;
+  let cameraMake = null;
+  let cameraModel = null;
+  let gpsLat = null;
+  let gpsLon = null;
+  let gpsAlt = null;
+  let colorProfile = "sdr_rec709";
+
+  try {
+    const url = $.NSURL.fileURLWithPath(filePath);
+    const src = $.CGImageSourceCreateWithURL(url, null);
+    if (src) {
+      const cfProps = $.CGImageSourceCopyPropertiesAtIndex(src, 0, null);
+      if (cfProps) {
+        const props = ObjC.deepUnwrap(ObjC.castRefToObject(cfProps)) || {};
+        natW = Number(props.PixelWidth) || 0;
+        natH = Number(props.PixelHeight) || 0;
+        orientNum = Number(props.Orientation) || 1;
+        const tiff = props["{TIFF}"] || {};
+        const exif = props["{Exif}"] || {};
+        const gpsDict = props["{GPS}"] || {};
+
+        if (!orientNum && tiff.Orientation) orientNum = Number(tiff.Orientation) || 1;
+        cameraMake = tiff.Make ? String(tiff.Make).trim() : null;
+        cameraModel = tiff.Model ? String(tiff.Model).trim() : null;
+        exifDateRaw = exif.DateTimeOriginal || exif.DateTimeDigitized || tiff.DateTime || null;
+        if (exifDateRaw) exifDateRaw = String(exifDateRaw).trim();
+        exifOffsetRaw = exif.OffsetTimeOriginal || exif.OffsetTimeDigitized || exif.OffsetTime || null;
+        if (exifOffsetRaw) exifOffsetRaw = String(exifOffsetRaw).trim();
+
+        if (gpsDict.Latitude !== undefined && gpsDict.Longitude !== undefined) {
+          let lat = Number(gpsDict.Latitude);
+          let lon = Number(gpsDict.Longitude);
+          if (String(gpsDict.LatitudeRef || "").toUpperCase() === "S") lat = -Math.abs(lat);
+          if (String(gpsDict.LongitudeRef || "").toUpperCase() === "W") lon = -Math.abs(lon);
+          if (isFinite(lat) && isFinite(lon) && !(Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001)) {
+            gpsLat = Math.round(lat * 1e6) / 1e6;
+            gpsLon = Math.round(lon * 1e6) / 1e6;
+          }
+        }
+        if (gpsDict.Altitude !== undefined) {
+          let alt = Number(gpsDict.Altitude);
+          if (Number(gpsDict.AltitudeRef) === 1) alt = -Math.abs(alt);
+          if (isFinite(alt)) gpsAlt = Math.round(alt * 10) / 10;
+        }
+        const profileName = String(props.ProfileName || "");
+        if (/2020|HLG|PQ|HDR/i.test(profileName)) colorProfile = "hdr_wide";
+      }
+    }
+  } catch (e) {}
+
+  if (orientNum >= 5 && orientNum <= 8) {
+    dispW = natH;
+    dispH = natW;
+  } else {
+    dispW = natW;
+    dispH = natH;
+  }
+
+  const rotMap = { 1: 0, 2: 0, 3: 180, 4: 180, 5: 90, 6: 90, 7: 270, 8: 270 };
+  const rotDeg = rotMap[orientNum] || 0;
+  const orientation =
+    dispW > 0 && dispH > 0
+      ? dispH > dispW
+        ? "portrait"
+        : dispW > dispH
+        ? "landscape"
+        : "square"
+      : "unknown";
+
+  return {
+    source_path: filePath,
+    filename: filename,
+    media_type: "photo",
+    file_size_bytes: stat.size,
+    mtime_epoch: stat.mtimeEpoch,
+    duration_sec: null,
+    fps: null,
+    slow_mo_eligible: false,
+    recommended_slow_mo_rates: [],
+    color_profile: colorProfile,
+    video_codec: null,
+    is_hdr: colorProfile !== "sdr_rec709",
+    requires_tonemap: false,
+    natural_width: natW,
+    natural_height: natH,
+    display_width: dispW,
+    display_height: dispH,
+    width: dispW,
+    height: dispH,
+    rotation_deg: rotDeg,
+    exif_orientation: orientNum,
+    orientation: orientation,
+    has_audio: false,
+    camera_make: cameraMake,
+    camera_model: cameraModel,
+    gps_lat: gpsLat,
+    gps_lon: gpsLon,
+    gps_altitude_m: gpsAlt,
+    lat: gpsLat,
+    lon: gpsLon,
+    altitude_m: gpsAlt,
+    _raw: {
+      exifDateRaw: exifDateRaw,
+      exifOffsetRaw: exifOffsetRaw,
+    },
+  };
+}
+
+function parseFilenameTimestamp(filename) {
+  const stem = pathStem(filename);
+
+  // 1. Google Pixel: PXL_YYYYMMDD_HHMMSS... (ALWAYS UTC)
+  let m = stem.match(/PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/i);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    if (isValidYear(y)) {
+      return {
+        wallUtcSec: Date.UTC(y, parseInt(m[2], 10) - 1, parseInt(m[3], 10), parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6], 10)) / 1000.0,
+        isUtc: true,
+        confidence: "medium",
+        pattern: "pixel_utc",
+      };
+    }
+  }
+
+  // 2. DJI: DJI_YYYYMMDDHHMMSS_xxxx (camera local TZ)
+  m = stem.match(/DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_\d+/i);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    if (isValidYear(y)) {
+      return {
+        wallUtcSec: Date.UTC(y, parseInt(m[2], 10) - 1, parseInt(m[3], 10), parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6], 10)) / 1000.0,
+        isUtc: false,
+        confidence: "medium",
+        pattern: "dji_local",
+      };
+    }
+  }
+
+  // 3. Android / Samsung / Vivo / Generic: VID_ / IMG_ / MVIMG_ / WIN_ YYYYMMDD_HHMMSS
+  m = stem.match(/(?:VID|IMG|MVIMG|WIN|PANO|LRM_EXPORT)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/i);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    if (isValidYear(y)) {
+      return {
+        wallUtcSec: Date.UTC(y, parseInt(m[2], 10) - 1, parseInt(m[3], 10), parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6], 10)) / 1000.0,
+        isUtc: false,
+        confidence: "medium",
+        pattern: "android_local",
+      };
+    }
+  }
+
+  // 4. Generic YYYYMMDD_HHMMSS or YYYY-MM-DD_HH-MM-SS
+  m = stem.match(/(\d{4})[-_]?(\d{2})[-_]?(\d{2})[T_\s-](\d{2})[-_.]?(\d{2})[-_.]?(\d{2})/);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const da = parseInt(m[3], 10);
+    const hh = parseInt(m[4], 10);
+    const mm = parseInt(m[5], 10);
+    const ss = parseInt(m[6], 10);
+    if (isValidYear(y) && mo >= 1 && mo <= 12 && da >= 1 && da <= 31 && hh <= 23 && mm <= 59 && ss <= 59) {
+      return {
+        wallUtcSec: Date.UTC(y, mo - 1, da, hh, mm, ss) / 1000.0,
+        isUtc: false,
+        confidence: "medium",
+        pattern: "generic_local",
+      };
+    }
+  }
+
+  // 5. WhatsApp: VID-YYYYMMDD-WAxxxx / IMG-YYYYMMDD-WAxxxx (date-only anchor)
+  m = stem.match(/(?:VID|IMG)-(\d{4})(\d{2})(\d{2})-WA\d+/i);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    if (isValidYear(y)) {
+      return {
+        wallUtcSec: Date.UTC(y, parseInt(m[2], 10) - 1, parseInt(m[3], 10), 12, 0, 0) / 1000.0,
+        isUtc: false,
+        confidence: "date_only",
+        pattern: "whatsapp_date",
+      };
+    }
+  }
+
+  return null;
+}
+
+function parseCameraSequenceKey(filename) {
+  const stem = pathStem(filename);
+  const m = stem.match(/^([A-Za-z][A-Za-z0-9_-]*?[_-]?)(\d{3,6})$/);
+  if (!m) return null;
+  return { prefix: m[1].toUpperCase(), num: parseInt(m[2], 10) };
+}
+
+function queryMdlsCreationDate(filePath) {
+  const res = runSubprocess("/usr/bin/mdls", ["-name", "kMDItemContentCreationDate", "-raw", filePath]);
+  if (res.status !== 0) return null;
+  const txt = (res.stdout || "").trim();
+  if (!txt || txt === "(null)") return null;
+  return parseTimestampString(txt, null);
+}
+
+/**
+ * Resolve all 7 tiers of the Creation Date Waterfall across the entire media list.
+ */
+function resolveSevenTierDates(items) {
+  // Detect batch-download mtime clusters (>=3 files within +/-120s of same mtime)
+  const batchMtimeFlags = items.map((item, idx) => {
+    let near = 0;
+    for (let j = 0; j < items.length; j++) {
+      if (Math.abs(items[j].mtime_epoch - item.mtime_epoch) <= 120.0) near++;
+    }
+    return near >= 3;
+  });
+
+  // Pass 1: Extract Tier 1 (Keys:CreationDate) & Tier 2 (EXIF DateTimeOriginal) to infer modal trip TZ
+  const tzVotes = {};
+  const gpsLons = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.gps_lon !== null && it.gps_lon !== undefined) gpsLons.push(it.gps_lon);
+
+    if (it.media_type === "video" && it._raw.keysCreationDateRaw) {
+      const parsed = parseTimestampString(it._raw.keysCreationDateRaw, null);
+      if (parsed) {
+        it._tier1 = parsed;
+        if (parsed.hasExplicitTz && parsed.offsetMin !== null) {
+          tzVotes[parsed.offsetMin] = (tzVotes[parsed.offsetMin] || 0) + 2;
+        }
+      }
+    }
+    if (it.media_type === "photo" && it._raw.exifDateRaw) {
+      const parsed = parseTimestampString(it._raw.exifDateRaw, it._raw.exifOffsetRaw);
+      if (parsed) {
+        it._tier2 = parsed;
+        if (parsed.hasExplicitTz && parsed.offsetMin !== null) {
+          tzVotes[parsed.offsetMin] = (tzVotes[parsed.offsetMin] || 0) + 1;
+        }
+      }
+    }
+  }
+
+  let tripTzOffsetMin = -new Date().getTimezoneOffset();
+  let bestVotes = 0;
+  for (const k of Object.keys(tzVotes)) {
+    if (tzVotes[k] > bestVotes) {
+      bestVotes = tzVotes[k];
+      tripTzOffsetMin = parseInt(k, 10);
+    }
+  }
+  if (bestVotes === 0 && gpsLons.length > 0) {
+    const avgLon = gpsLons.reduce((a, b) => a + b, 0) / gpsLons.length;
+    tripTzOffsetMin = Math.round(avgLon / 15.0) * 60;
+  }
+
+  // Pass 2: Apply Tiers 1 through 5
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const inBatchMtime = batchMtimeFlags[i];
+
+    // Tier 1: QuickTime Keys:CreationDate (exact_tz)
+    if (it._tier1) {
+      const off = it._tier1.hasExplicitTz ? it._tier1.offsetMin : tripTzOffsetMin;
+      const epoch = it._tier1.hasExplicitTz ? it._tier1.epochSec : it._tier1.wallUtcSec - off * 60;
+      it.timestamp_epoch = Math.round(epoch * 1000) / 1000;
+      it.tz_offset_min = off;
+      it.date_source = "keys_creation_date";
+      it.date_confidence = it._tier1.hasExplicitTz ? "exact_tz" : "high";
+      it.needs_date_confirmation = false;
+      continue;
+    }
+
+    // Tier 2: EXIF DateTimeOriginal + OffsetTimeOriginal
+    if (it._tier2) {
+      const off = it._tier2.hasExplicitTz ? it._tier2.offsetMin : tripTzOffsetMin;
+      const epoch = it._tier2.hasExplicitTz ? it._tier2.epochSec : it._tier2.wallUtcSec - off * 60;
+      it.timestamp_epoch = Math.round(epoch * 1000) / 1000;
+      it.tz_offset_min = off;
+      it.date_source = "exif_datetime_original";
+      it.date_confidence = it._tier2.hasExplicitTz ? "exact_tz" : "local_camera";
+      it.needs_date_confirmation = false;
+      continue;
+    }
+
+    // Tier 3: QuickTime mvhd CreateDate (with GoPro quirk guard + batch-download mtime guard)
+    if (it.media_type === "video" && (it._raw.mvhdDateRaw || it._raw.mvhdEpochRaw !== null)) {
+      let mvhdEpoch = null;
+      let parsedMvhd = it._raw.mvhdDateRaw ? parseTimestampString(it._raw.mvhdDateRaw, null) : null;
+      if (parsedMvhd) {
+        if (it._raw.isGoPro) {
+          // GoPro writes local wall-clock time into UTC mvhd -> do NOT re-shift
+          mvhdEpoch = parsedMvhd.wallUtcSec - tripTzOffsetMin * 60;
+        } else if (parsedMvhd.hasExplicitTz) {
+          mvhdEpoch = parsedMvhd.epochSec;
+        } else {
+          mvhdEpoch = parsedMvhd.wallUtcSec; // standard QuickTime mvhd is UTC
+        }
+      } else if (it._raw.mvhdEpochRaw !== null) {
+        mvhdEpoch = it._raw.isGoPro
+          ? it._raw.mvhdEpochRaw - tripTzOffsetMin * 60
+          : it._raw.mvhdEpochRaw;
+      }
+
+      const looksLikeBatchMtime =
+        inBatchMtime && mvhdEpoch !== null && Math.abs(mvhdEpoch - it.mtime_epoch) <= 120.0;
+
+      if (mvhdEpoch !== null && !looksLikeBatchMtime) {
+        const dtCheck = new Date(mvhdEpoch * 1000);
+        if (isValidYear(dtCheck.getUTCFullYear())) {
+          it.timestamp_epoch = Math.round(mvhdEpoch * 1000) / 1000;
+          it.tz_offset_min = tripTzOffsetMin;
+          it.date_source = it._raw.isGoPro ? "gopro_local_mvhd" : "mvhd_create_date";
+          it.date_confidence = it._raw.isGoPro ? "medium" : "high";
+          it.needs_date_confirmation = false;
+          continue;
+        }
+      }
+    }
+
+    // Tier 4: Filename timestamp parser (PXL_ = UTC, VID_/DJI_ = local)
+    const fnParsed = parseFilenameTimestamp(it.filename);
+    if (fnParsed) {
+      const epoch = fnParsed.isUtc
+        ? fnParsed.wallUtcSec
+        : fnParsed.wallUtcSec - tripTzOffsetMin * 60;
+      it.timestamp_epoch = Math.round(epoch * 1000) / 1000;
+      it.tz_offset_min = tripTzOffsetMin;
+      it.date_source = "filename_parsed:" + fnParsed.pattern;
+      it.date_confidence = fnParsed.confidence;
+      it.needs_date_confirmation = false;
+      continue;
+    }
+
+    // Tier 5: mdls kMDItemContentCreationDate (only if |mdls - mtime| > 60s and not batch mtime)
+    const mdlsParsed = queryMdlsCreationDate(it.source_path);
+    if (mdlsParsed && mdlsParsed.epochSec !== null) {
+      const diffMtime = Math.abs(mdlsParsed.epochSec - it.mtime_epoch);
+      if (diffMtime > 60.0 && !(inBatchMtime && diffMtime <= 120.0)) {
+        it.timestamp_epoch = Math.round(mdlsParsed.epochSec * 1000) / 1000;
+        it.tz_offset_min = tripTzOffsetMin;
+        it.date_source = "mdls_content_creation";
+        it.date_confidence = "medium";
+        it.needs_date_confirmation = false;
+        continue;
+      }
+    }
+  }
+
+  // Pass 3: Tier 6 — Same-camera sequence interpolation (e.g. IMG_0025.MOV between dated IMG_0024 & IMG_0026)
+  const datedByPrefix = {};
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.timestamp_epoch === undefined) continue;
+    const seq = parseCameraSequenceKey(it.filename);
+    if (!seq) continue;
+    if (!datedByPrefix[seq.prefix]) datedByPrefix[seq.prefix] = [];
+    datedByPrefix[seq.prefix].push({ num: seq.num, item: it });
+  }
+  for (const pfx of Object.keys(datedByPrefix)) {
+    datedByPrefix[pfx].sort((a, b) => a.num - b.num);
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.timestamp_epoch !== undefined) continue;
+    const seq = parseCameraSequenceKey(it.filename);
+    if (seq && datedByPrefix[seq.prefix] && datedByPrefix[seq.prefix].length > 0) {
+      const list = datedByPrefix[seq.prefix];
+      let prev = null;
+      let next = null;
+      for (let k = 0; k < list.length; k++) {
+        if (list[k].num < seq.num) prev = list[k];
+        else if (list[k].num > seq.num && !next) next = list[k];
+      }
+      const prevOk = prev && seq.num - prev.num <= 50;
+      const nextOk = next && next.num - seq.num <= 50;
+      if (prevOk && nextOk) {
+        const frac = (seq.num - prev.num) / (next.num - prev.num);
+        it.timestamp_epoch = Math.round((prev.item.timestamp_epoch + frac * (next.item.timestamp_epoch - prev.item.timestamp_epoch)) * 1000) / 1000;
+        it.tz_offset_min = tripTzOffsetMin;
+        it.date_source = "sequence_interpolated";
+        it.date_confidence = "interpolated";
+        it.needs_date_confirmation = true;
+        // Interpolate GPS if missing and neighbors are within 50km
+        if (it.gps_lat === null && prev.item.gps_lat !== null && next.item.gps_lat !== null) {
+          const dist = haversineKm(prev.item.gps_lat, prev.item.gps_lon, next.item.gps_lat, next.item.gps_lon);
+          if (dist <= 50.0) {
+            it.gps_lat = Math.round((prev.item.gps_lat + frac * (next.item.gps_lat - prev.item.gps_lat)) * 1e6) / 1e6;
+            it.gps_lon = Math.round((prev.item.gps_lon + frac * (next.item.gps_lon - prev.item.gps_lon)) * 1e6) / 1e6;
+            it.lat = it.gps_lat;
+            it.lon = it.gps_lon;
+          }
+        }
+        continue;
+      } else if (prevOk || nextOk) {
+        const anchor = prevOk ? prev : next;
+        const delta = seq.num - anchor.num;
+        it.timestamp_epoch = Math.round((anchor.item.timestamp_epoch + delta * 30.0) * 1000) / 1000;
+        it.tz_offset_min = tripTzOffsetMin;
+        it.date_source = "sequence_interpolated";
+        it.date_confidence = "interpolated";
+        it.needs_date_confirmation = true;
+        continue;
+      }
+    }
+
+    // Tier 7: Unverified mtime fallback -> explicit "needs_date_confirmation"
+    it.timestamp_epoch = Math.round(it.mtime_epoch * 1000) / 1000;
+    it.tz_offset_min = tripTzOffsetMin;
+    it.date_source = "unverified_mtime";
+    it.date_confidence = "low";
+    it.needs_date_confirmation = true;
+  }
+
+  // Finalize ISO strings & local day labels; clean private scratch keys
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const off = it.tz_offset_min !== undefined ? it.tz_offset_min : tripTzOffsetMin;
+    it.timestamp_iso = formatUtcIsoFromEpoch(it.timestamp_epoch);
+    it.timestamp_local = formatLocalIsoFromEpoch(it.timestamp_epoch, off);
+    it.date_day = it.timestamp_local.slice(0, 10);
+    delete it._raw;
+    delete it._tier1;
+    delete it._tier2;
+  }
+
+  return tripTzOffsetMin;
+}
+
+function runIndexOnly(args) {
+  if (!args.inputDir && !args.fileList) {
+    throw new Error("--index-only requires --input-dir <raw_dir> or --file-list <list.txt>.");
+  }
+  ensureDir(args.workDir);
+  const paths = collectMediaPaths(args.inputDir, args.fileList);
+  const items = [];
+
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
+    const ext = pathExtLower(p);
+    const fname = pathBasename(p);
+    const stat = readFileStat(p);
+    if (VIDEO_EXTS.has(ext)) {
+      items.push(inspectVideoFile(p, fname, stat));
+    } else if (IMAGE_EXTS.has(ext)) {
+      items.push(inspectPhotoFile(p, fname, stat));
+    }
+    if (i % 25 === 24) drainRunLoop();
+  }
+
+  const tripTzOffsetMin = resolveSevenTierDates(items);
+
+  // Sort chronologically (verified dates first, unverified mtime at end)
+  items.sort((a, b) => {
+    const au = a.date_source === "unverified_mtime" ? 1 : 0;
+    const bu = b.date_source === "unverified_mtime" ? 1 : 0;
+    if (au !== bu) return au - bu;
+    if (a.timestamp_epoch !== b.timestamp_epoch) return a.timestamp_epoch - b.timestamp_epoch;
+    return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
+  });
+
+  // Assign chapter IDs by chronological local day (keeping unverified_mtime isolated)
+  const daySet = [];
+  const dayMap = {};
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.date_source === "unverified_mtime") {
+      it.chapter = "needs_date_confirmation";
+      continue;
+    }
+    if (!dayMap[it.date_day]) {
+      daySet.push(it.date_day);
+      dayMap[it.date_day] = "day" + daySet.length + "_" + it.date_day;
+    }
+    it.chapter = dayMap[it.date_day];
+  }
+
+  // Assign clean V001 / P001 IDs + global index
+  let vNum = 0;
+  let pNum = 0;
+  const videos = [];
+  const photos = [];
+  const chaptersById = {};
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    it.index = i + 1;
+    if (it.media_type === "video") {
+      vNum++;
+      it.id = "V" + String(vNum).padStart(3, "0");
+      videos.push(it);
+    } else {
+      pNum++;
+      it.id = "P" + String(pNum).padStart(3, "0");
+      photos.push(it);
+    }
+
+    if (!chaptersById[it.chapter]) {
+      chaptersById[it.chapter] = {
+        chapter_id: it.chapter,
+        date_day: it.chapter === "needs_date_confirmation" ? null : it.date_day,
+        asset_ids: [],
+        video_ids: [],
+        photo_ids: [],
+        _lats: [],
+        _lons: [],
+        _alts: [],
+      };
+    }
+    const ch = chaptersById[it.chapter];
+    ch.asset_ids.push(it.id);
+    if (it.media_type === "video") ch.video_ids.push(it.id);
+    else ch.photo_ids.push(it.id);
+    if (it.gps_lat !== null && it.gps_lon !== null) {
+      ch._lats.push(it.gps_lat);
+      ch._lons.push(it.gps_lon);
+    }
+    if (it.gps_altitude_m !== null) ch._alts.push(it.gps_altitude_m);
+  }
+
+  const chapterKeys = Object.keys(chaptersById).sort((a, b) => {
+    if (a === "needs_date_confirmation") return 1;
+    if (b === "needs_date_confirmation") return -1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+
+  const chapters = chapterKeys.map((k, idx) => {
+    const c = chaptersById[k];
+    const hasGps = c._lats.length > 0;
+    const avgLat = hasGps ? Math.round((c._lats.reduce((a, b) => a + b, 0) / c._lats.length) * 1e6) / 1e6 : null;
+    const avgLon = hasGps ? Math.round((c._lons.reduce((a, b) => a + b, 0) / c._lons.length) * 1e6) / 1e6 : null;
+    const maxAlt = c._alts.length > 0 ? Math.max.apply(null, c._alts) : null;
+    return {
+      chapter_id: c.chapter_id,
+      order: idx + 1,
+      date_day: c.date_day,
+      asset_count: c.asset_ids.length,
+      video_count: c.video_ids.length,
+      photo_count: c.photo_ids.length,
+      gps_centroid: hasGps ? { lat: avgLat, lon: avgLon } : null,
+      peak_altitude_m: maxAlt,
+      asset_ids: c.asset_ids,
+      video_ids: c.video_ids,
+      photo_ids: c.photo_ids,
+    };
+  });
+
+  const totalVideoDur = Math.round(videos.reduce((acc, v) => acc + (v.duration_sec || 0), 0) * 100) / 100;
+  const slowMoCount = videos.filter((v) => v.slow_mo_eligible).length;
+  const hdrCount = items.filter((x) => x.is_hdr).length;
+  const gpsCount = items.filter((x) => x.gps_lat !== null && x.gps_lon !== null).length;
+  const needsConfirmCount = items.filter((x) => x.needs_date_confirmation).length;
+
+  const manifest = {
+    schema_version: "2.0",
+    extractor: "macos-native-jxa-avfoundation",
+    source_folder: args.inputDir ? ObjC.unwrap($(args.inputDir).stringByStandardizingPath) : null,
+    trip_tz_offset: formatOffsetMin(tripTzOffsetMin),
+    trip_tz_offset_min: tripTzOffsetMin,
+    summary: {
+      total_assets: items.length,
+      videos: videos.length,
+      photos: photos.length,
+      video_ratio_pct: items.length > 0 ? Math.round((videos.length / items.length) * 1000) / 10 : 0,
+      total_video_duration_sec: totalVideoDur,
+      slow_mo_eligible_count: slowMoCount,
+      hdr_count: hdrCount,
+      portrait_count: items.filter((x) => x.orientation === "portrait").length,
+      landscape_count: items.filter((x) => x.orientation === "landscape").length,
+      gps_tagged_count: gpsCount,
+      gps_coverage_pct: items.length > 0 ? Math.round((gpsCount / items.length) * 1000) / 10 : 0,
+      needs_date_confirmation_count: needsConfirmCount,
+      chapter_count: chapters.length,
+    },
+    chapters: chapters,
+    assets: items,
+  };
+
+  const manifestPath = args.manifestOut || args.workDir + "/manifest_v2.json";
+  writeTextFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+  return JSON.stringify(
+    {
+      status: "ok",
+      mode: "index-only",
+      manifest_path: manifestPath,
+      summary: manifest.summary,
+    },
+    null,
+    2
+  );
+}
+
+/**
+ * Decode an NSData containing a WAV file into a Uint8Array via a single ObjC base64 call
+ * and pure-JS decoding (~25ms for 30s of 8kHz 16-bit mono PCM).
+ */
+function decodeBase64ToBytes(b64Str) {
+  const len = b64Str.length;
+  if (len === 0) return new Uint8Array(0);
+  let pad = 0;
+  if (b64Str.charCodeAt(len - 1) === 61) pad++;
+  if (len > 1 && b64Str.charCodeAt(len - 2) === 61) pad++;
+  const outLen = (len * 3) / 4 - pad;
+  const out = new Uint8Array(outLen);
+  let j = 0;
+  for (let i = 0; i < len; i += 4) {
+    const a = B64_LUT[b64Str.charCodeAt(i)];
+    const b = B64_LUT[b64Str.charCodeAt(i + 1)];
+    const c = B64_LUT[b64Str.charCodeAt(i + 2)];
+    const d = B64_LUT[b64Str.charCodeAt(i + 3)];
+    const triple = (a << 18) | (b << 12) | (c << 6) | d;
+    if (j < outLen) out[j++] = (triple >> 16) & 255;
+    if (j < outLen) out[j++] = (triple >> 8) & 255;
+    if (j < outLen) out[j++] = triple & 255;
+  }
+  return out;
+}
+
+function readU32LE(bytes, off) {
+  return (
+    (bytes[off] |
+      (bytes[off + 1] << 8) |
+      (bytes[off + 2] << 16) |
+      (bytes[off + 3] << 24)) >>>
+    0
+  );
+}
+
+function readFourCC(bytes, off) {
+  return String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
+}
+
+function findWavDataChunk(bytes) {
+  if (bytes.length < 44) return null;
+  if (readFourCC(bytes, 0) !== "RIFF" || readFourCC(bytes, 8) !== "WAVE") return null;
+  let off = 12;
+  while (off + 8 <= bytes.length) {
+    const id = readFourCC(bytes, off);
+    const size = readU32LE(bytes, off + 4);
+    const dataStart = off + 8;
+    if (id === "data") {
+      const dataEnd = Math.min(bytes.length, dataStart + size);
+      return { start: dataStart, length: Math.max(0, dataEnd - dataStart) };
+    }
+    off = dataStart + size + (size % 2);
+  }
+  return null;
+}
+
+/**
+ * Extract 8 kHz 16-bit mono PCM via Apple built-in `/usr/bin/afconvert`, bin into 120 RMS
+ * windows, classify `silent | ambient_music | speech_laughter | wind_hazard`, and emit top 2 peaks.
+ * Always deletes the temporary WAV file immediately.
+ */
+function analyzeClipAudio(sourcePath, clipId, durationSec, outDir) {
+  const NUM_BINS = 120;
+  const emptyBins = [];
+  for (let i = 0; i < NUM_BINS; i++) {
+    emptyBins.push({ rms_db: -60.0, peak_db: -60.0, low_ratio: 0, speech_ratio: 0, kind: "silent" });
+  }
+  const fallback = {
+    audio_profile: "silent",
+    sonic_postcard_eligible: false,
+    mean_rms_db: -60.0,
+    peak_rms_db: -60.0,
+    crest_factor_db: 0.0,
+    low_band_ratio: 0.0,
+    speech_band_ratio: 0.0,
+    audio_peaks_sec: [],
+    audio_peak_windows: [],
+    bins: emptyBins,
+  };
+
+  const pid = $.NSProcessInfo.processInfo.processIdentifier;
+  const tmpWav = outDir + "/.tmp_pcm_" + clipId + "_" + pid + ".wav";
+  const fm = $.NSFileManager.defaultManager;
+
+  try {
+    if (fm.fileExistsAtPath(tmpWav)) fm.removeItemAtPathError(tmpWav, null);
+    const proc = runSubprocess("/usr/bin/afconvert", [
+      "-f", "WAVE",
+      "-d", "LEI16@8000",
+      "-c", "1",
+      sourcePath,
+      tmpWav,
+    ]);
+    if (proc.status !== 0 || !fm.fileExistsAtPath(tmpWav)) return fallback;
+
+    const nsData = $.NSData.dataWithContentsOfFile(tmpWav);
+    if (!nsData || Number(nsData.length) < 44) return fallback;
+
+    const b64 = ObjC.unwrap(nsData.base64EncodedStringWithOptions(0)) || "";
+    const bytes = decodeBase64ToBytes(b64);
+    const chunk = findWavDataChunk(bytes);
+    if (!chunk || chunk.length < 32) return fallback;
+
+    const totalSamples = Math.floor(chunk.length / 2);
+    if (totalSamples < 16) return fallback;
+
+    const audioDur = durationSec && durationSec > 0 ? durationSec : totalSamples / 8000.0;
+    const samplesPerBin = Math.max(1, totalSamples / NUM_BINS);
+
+    // 1-pole IIR coefficients at Fs = 8000 Hz:
+    // Low-pass @ 200 Hz (wind rumble detector)
+    const alphaLP200 = 0.1357;
+    // High-pass @ 300 Hz + Low-pass @ 3400 Hz (speech/laughter band)
+    const alphaHP300 = 0.8093;
+    const alphaLP3400 = 0.7276;
+
+    let lp200 = 0.0;
+    let hp300 = 0.0;
+    let prevX = 0.0;
+    let bpSpeech = 0.0;
+
+    const bins = [];
+    let globalSumSq = 0.0;
+    let globalLowSq = 0.0;
+    let globalSpeechSq = 0.0;
+    let globalPeak = 0.0;
+    let windBins = 0;
+    let speechBins = 0;
+    let audibleBins = 0;
+
+    for (let b = 0; b < NUM_BINS; b++) {
+      const sStart = Math.floor(b * samplesPerBin);
+      const sEnd = Math.min(totalSamples, Math.floor((b + 1) * samplesPerBin));
+      const count = Math.max(1, sEnd - sStart);
+      let sumSq = 0.0;
+      let lowSq = 0.0;
+      let speechSq = 0.0;
+      let peak = 0.0;
+
+      for (let s = sStart; s < sEnd; s++) {
+        const idx = chunk.start + s * 2;
+        let v = bytes[idx] | (bytes[idx + 1] << 8);
+        if (v >= 32768) v -= 65536;
+        const x = v / 32768.0;
+        const ax = Math.abs(x);
+        if (ax > peak) peak = ax;
+        sumSq += x * x;
+
+        lp200 += alphaLP200 * (x - lp200);
+        lowSq += lp200 * lp200;
+
+        hp300 = alphaHP300 * (hp300 + x - prevX);
+        prevX = x;
+        bpSpeech += alphaLP3400 * (hp300 - bpSpeech);
+        speechSq += bpSpeech * bpSpeech;
+      }
+
+      globalSumSq += sumSq;
+      globalLowSq += lowSq;
+      globalSpeechSq += speechSq;
+      if (peak > globalPeak) globalPeak = peak;
+
+      const rms = Math.sqrt(sumSq / count);
+      const rmsDb = rms > 1e-6 ? Math.max(-60.0, 20.0 * Math.log10(rms)) : -60.0;
+      const peakDb = peak > 1e-6 ? Math.max(-60.0, 20.0 * Math.log10(peak)) : -60.0;
+      const crestDb = Math.max(0.0, peakDb - rmsDb);
+      const lowRatio = sumSq > 1e-9 ? Math.min(1.0, lowSq / sumSq) : 0.0;
+      const speechRatio = sumSq > 1e-9 ? Math.min(1.0, speechSq / sumSq) : 0.0;
+
+      bins.push({
+        rms_db: Math.round(rmsDb * 10) / 10,
+        peak_db: Math.round(peakDb * 10) / 10,
+        crest_db: Math.round(crestDb * 10) / 10,
+        low_ratio: Math.round(lowRatio * 1000) / 1000,
+        speech_ratio: Math.round(speechRatio * 1000) / 1000,
+        kind: "silent",
+      });
+    }
+
+    const sortedRms = bins.map((b) => b.rms_db).sort((a, b) => a - b);
+    const medianRmsDb = sortedRms[Math.floor(sortedRms.length / 2)];
+
+    for (let b = 0; b < NUM_BINS; b++) {
+      const bin = bins[b];
+      if (bin.rms_db >= -38.0 || bin.peak_db >= -34.0) {
+        audibleBins++;
+        if ((bin.low_ratio > 0.65 && bin.rms_db > -18.0) || bin.rms_db > -3.5) {
+          bin.kind = "wind_hazard";
+          windBins++;
+        } else if (
+          bin.speech_ratio > 0.42 &&
+          bin.peak_db > -18.0 &&
+          (bin.crest_db > 8.0 || bin.rms_db - medianRmsDb > 4.5)
+        ) {
+          bin.kind = "speech_laughter";
+          speechBins++;
+        } else {
+          bin.kind = "ambient_music";
+        }
+      }
+    }
+
+    const meanRms = Math.sqrt(globalSumSq / totalSamples);
+    const meanRmsDb = meanRms > 1e-6 ? Math.max(-60.0, 20.0 * Math.log10(meanRms)) : -60.0;
+    const peakRmsDb = bins.reduce((mx, b) => Math.max(mx, b.rms_db), -60.0);
+    const globalPeakDb = globalPeak > 1e-6 ? Math.max(-60.0, 20.0 * Math.log10(globalPeak)) : -60.0;
+    const crestFactorDb = Math.max(0.0, globalPeakDb - meanRmsDb);
+    const peakToMedianDb = Math.max(0.0, peakRmsDb - medianRmsDb);
+    const lowBandRatio = globalSumSq > 1e-9 ? Math.min(1.0, globalLowSq / globalSumSq) : 0.0;
+    const speechBandRatio = globalSumSq > 1e-9 ? Math.min(1.0, globalSpeechSq / globalSumSq) : 0.0;
+
+    // Overall clip audio profile classification
+    let audioProfile = "silent";
+    if (peakRmsDb < -38.0 && globalPeakDb < -34.0) {
+      audioProfile = "silent";
+    } else if (
+      (lowBandRatio > 0.65 && meanRmsDb > -18.0) ||
+      windBins >= Math.max(8, Math.floor(NUM_BINS * 0.22))
+    ) {
+      audioProfile = "wind_hazard";
+    } else if (
+      (speechBandRatio > 0.40 && peakRmsDb > -20.0 && (crestFactorDb > 8.5 || peakToMedianDb > 6.0)) ||
+      (speechBins >= 5 && speechBandRatio > 0.35 && (crestFactorDb > 8.0 || peakToMedianDb > 5.0))
+    ) {
+      audioProfile = "speech_laughter";
+    } else {
+      audioProfile = "ambient_music";
+    }
+
+    // Extract top 2 peak timestamps via 1D NMS (favoring speech_laughter bins if present)
+    const minSepBins = Math.max(4, Math.floor(NUM_BINS * Math.max(0.12, Math.min(0.25, 2.0 / Math.max(1.0, audioDur)))));
+    const scored = [];
+    for (let b = 0; b < NUM_BINS; b++) {
+      const bin = bins[b];
+      if (bin.kind === "silent" || bin.kind === "wind_hazard") continue;
+      let score = bin.rms_db + 60.0;
+      if (bin.kind === "speech_laughter") score += 20.0 + bin.speech_ratio * 15.0;
+      scored.push({ binIdx: b, score: score, rms_db: bin.rms_db, kind: bin.kind });
+    }
+    scored.sort((a, b) => b.score - a.score);
+
+    const picked = [];
+    for (let i = 0; i < scored.length && picked.length < 2; i++) {
+      const cand = scored[i];
+      let tooClose = false;
+      for (let j = 0; j < picked.length; j++) {
+        if (Math.abs(cand.binIdx - picked[j].binIdx) < minSepBins) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (!tooClose) picked.push(cand);
+    }
+    picked.sort((a, b) => a.binIdx - b.binIdx);
+
+    const peaksSec = [];
+    const peakWindows = [];
+    for (let i = 0; i < picked.length; i++) {
+      const p = picked[i];
+      const tSec = Math.round(((p.binIdx + 0.5) / NUM_BINS) * audioDur * 10) / 10;
+      const winHalf = Math.min(2.0, audioDur * 0.2);
+      const startSec = Math.round(Math.max(0.0, tSec - winHalf) * 10) / 10;
+      const endSec = Math.round(Math.min(audioDur, tSec + winHalf) * 10) / 10;
+      peaksSec.push(tSec);
+      peakWindows.push({
+        peak_sec: tSec,
+        start_sec: startSec,
+        end_sec: endSec,
+        peak_rms_db: p.rms_db,
+        kind: p.kind,
+      });
+    }
+
+    return {
+      audio_profile: audioProfile,
+      sonic_postcard_eligible:
+        audioProfile === "speech_laughter" || (audioProfile === "ambient_music" && meanRmsDb > -28.0),
+      mean_rms_db: Math.round(meanRmsDb * 10) / 10,
+      peak_rms_db: Math.round(peakRmsDb * 10) / 10,
+      crest_factor_db: Math.round(crestFactorDb * 10) / 10,
+      low_band_ratio: Math.round(lowBandRatio * 1000) / 1000,
+      speech_band_ratio: Math.round(speechBandRatio * 1000) / 1000,
+      audio_peaks_sec: peaksSec,
+      audio_peak_windows: peakWindows,
+      bins: bins,
+    };
+  } catch (e) {
+    return fallback;
+  } finally {
+    try {
+      if (fm.fileExistsAtPath(tmpWav)) fm.removeItemAtPathError(tmpWav, null);
+    } catch (e) {}
+  }
+}
+
+function drawAspectFitNSImage(nsImg, x, y, boxW, boxH) {
+  const sz = nsImg.size;
+  if (!sz || sz.width <= 0 || sz.height <= 0) return;
+  const scale = Math.min(boxW / sz.width, boxH / sz.height);
+  const drawW = sz.width * scale;
+  const drawH = sz.height * scale;
+  const dx = x + (boxW - drawW) / 2.0;
+  const dy = y + (boxH - drawH) / 2.0;
+  nsImg.drawInRectFromRectOperationFraction(
+    $.NSMakeRect(dx, dy, drawW, drawH),
+    $.NSZeroRect,
+    $.NSCompositingOperationSourceOver,
+    1.0
+  );
+}
+
+function formatTimePill(sec) {
+  if (sec < 10.0) return sec.toFixed(1) + "s";
+  const rounded = Math.round(sec);
+  if (rounded >= 60) {
+    const m = Math.floor(rounded / 60);
+    const s = rounded % 60;
+    return m + ":" + pad2(s);
+  }
+  return rounded + "s";
+}
+
+function computeSampleTimestamps(durationSec) {
+  const dur = Math.max(0.1, durationSec || 0.1);
+  const count = dur <= 6.0 ? 4 : dur <= 20.0 ? 6 : 8;
+  const startFrac = dur >= 1.0 ? 0.05 : 0.0;
+  const endFrac = dur >= 1.0 ? 0.95 : 0.9;
+  const times = [];
+  for (let i = 0; i < count; i++) {
+    const frac = count === 1 ? 0.5 : startFrac + ((endFrac - startFrac) * i) / (count - 1);
+    times.push(Math.round(dur * frac * 100) / 100);
+  }
+  return times;
+}
+
+function extractStripFrames(filePath, durationSec, timestamps) {
+  const AVURLAsset = avClass("AVURLAsset");
+  const AVAssetImageGenerator = avClass("AVAssetImageGenerator");
+  const url = $.NSURL.fileURLWithPath(filePath);
+  const asset = AVURLAsset.URLAssetWithURLOptions(url, $({}));
+  const gen = AVAssetImageGenerator.assetImageGeneratorWithAsset(asset);
+  gen.appliesPreferredTrackTransform = true;
+  gen.maximumSize = $.CGSizeMake(450, 450);
+
+  const tolSec = durationSec > 10.0 ? 0.25 : 0.05;
+  const tolTime = $.CMTimeMakeWithSeconds(tolSec, 600);
+  gen.requestedTimeToleranceBefore = tolTime;
+  gen.requestedTimeToleranceAfter = tolTime;
+
+  const frames = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const t = timestamps[i];
+    let cgImg = null;
+    try {
+      cgImg = gen.copyCGImageAtTimeActualTimeError($.CMTimeMakeWithSeconds(t, 600), null, null);
+    } catch (e) {
+      cgImg = null;
+    }
+    if (!cgImg) {
+      try {
+        gen.requestedTimeToleranceBefore = $.kCMTimePositiveInfinity;
+        gen.requestedTimeToleranceAfter = $.kCMTimePositiveInfinity;
+        cgImg = gen.copyCGImageAtTimeActualTimeError($.CMTimeMakeWithSeconds(t, 600), null, null);
+        if (!cgImg) {
+          cgImg = gen.copyCGImageAtTimeActualTimeError($.kCMTimeZero, null, null);
+        }
+        gen.requestedTimeToleranceBefore = tolTime;
+        gen.requestedTimeToleranceAfter = tolTime;
+      } catch (e) {
+        cgImg = null;
+      }
+    }
+    let validCG = false;
+    if (cgImg) {
+      try {
+        validCG = Number($.CGImageGetWidth(cgImg)) > 0 && Number($.CGImageGetHeight(cgImg)) > 0;
+      } catch (e) {
+        validCG = false;
+      }
+    }
+    if (validCG) {
+      frames.push($.NSImage.alloc.initWithCGImageSize(cgImg, $.NSZeroSize));
+    } else {
+      frames.push(null);
+    }
+  }
+  return frames;
+}
+
+function colorForAudioKind(kind) {
+  if (kind === "speech_laughter") return $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.957, 0.769, 0.306, 1.0); // Gold
+  if (kind === "wind_hazard") return $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.878, 0.322, 0.322, 1.0); // Red
+  if (kind === "ambient_music") return $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.169, 0.722, 0.659, 1.0); // Teal
+  return $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.32, 0.35, 0.41, 1.0); // Slate gray
+}
+
+function renderVideoStrip(clip, audioInfo, outPath, preTimestamps, preFrames) {
+  const W = 1800;
+  const H = 360;
+  const HEADER_H = 36;
+  const RAIL_H = 240;
+  const WAVE_H = 84;
+  const RIBBON_H = 8;
+
+  const timestamps = preTimestamps || computeSampleTimestamps(clip.duration_sec || 1.0);
+  const frames = preFrames || extractStripFrames(clip.source_path, clip.duration_sec || 1.0, timestamps);
+
+  const rep = createBitmapCanvas(W, H);
+
+  // Full background (#121418)
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.071, 0.078, 0.094, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, 0, W, H));
+
+  // === 1. TOP 36px DARK HEADER (y: 324..360) ===
+  const headerY = WAVE_H + RAIL_H;
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.055, 0.063, 0.082, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, headerY, W, HEADER_H));
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.18, 0.21, 0.26, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, headerY, W, 1));
+
+  const durStr = (clip.duration_sec !== null && clip.duration_sec !== undefined ? Number(clip.duration_sec).toFixed(1) : "?") + "s";
+  const dimsStr = (clip.display_width || "?") + "x" + (clip.display_height || "?");
+  const orientShort = clip.orientation === "portrait" ? "Portrait" : clip.orientation === "landscape" ? "Landscape" : clip.orientation || "?";
+  const fpsVal = clip.fps ? Math.round(clip.fps) + "fps" : "?fps";
+  const slowTag = clip.slow_mo_eligible ? " [SLOW-MO]" : "";
+  const hdrTag = clip.is_hdr ? " | " + String(clip.color_profile || "HDR").toUpperCase() : "";
+  const dateTag = clip.timestamp_local ? clip.timestamp_local.slice(0, 16).replace("T", " ") : "undated";
+  const dateWarn = clip.needs_date_confirmation ? " [DATE?]" : "";
+  const fnameShort = clip.filename.length > 30 ? clip.filename.slice(0, 27) + "..." : clip.filename;
+
+  const headerText =
+    "#" + clip.id +
+    " | " + fnameShort +
+    " | " + durStr +
+    " | " + dimsStr + " " + orientShort +
+    " | " + fpsVal + slowTag +
+    hdrTag +
+    " | " + dateTag + dateWarn +
+    " | " + audioInfo.audio_profile;
+
+  const headerAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(14, $.NSFontWeightSemibold),
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.95, 0.96, 0.98, 1.0)
+  );
+  $(headerText).drawAtPointWithAttributes($.NSMakePoint(14, headerY + 9), headerAttrs);
+
+  // Right-side audio profile badge pill
+  const badgeLabel = audioInfo.audio_profile.toUpperCase().replace("_", " ");
+  const badgeColor = colorForAudioKind(audioInfo.audio_profile);
+  const badgeTextAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(12, $.NSFontWeightBold),
+    audioInfo.audio_profile === "speech_laughter"
+      ? $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.08, 0.08, 0.09, 1.0)
+      : $.NSColor.whiteColor
+  );
+  const badgeSz = $(badgeLabel).sizeWithAttributes(badgeTextAttrs);
+  const badgeW = Math.max(108, Math.ceil(badgeSz.width) + 20);
+  const badgeRect = $.NSMakeRect(W - badgeW - 12, headerY + 6, badgeW, 24);
+  badgeColor.setFill;
+  $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(badgeRect, 5, 5).fill;
+  $(badgeLabel).drawAtPointWithAttributes(
+    $.NSMakePoint(W - badgeW - 12 + (badgeW - badgeSz.width) / 2.0, headerY + 10),
+    badgeTextAttrs
+  );
+
+  // === 2. MIDDLE 240px UPRIGHT FRAME RAIL (y: 84..324) ===
+  const numFrames = timestamps.length;
+  const cellW = W / numFrames;
+  const pillAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(12, $.NSFontWeightBold),
+    $.NSColor.whiteColor
+  );
+  const missAttrs = makeTextAttrs(
+    $.NSFont.systemFontOfSizeWeight(13, $.NSFontWeightMedium),
+    $.NSColor.colorWithCalibratedWhiteAlpha(0.6, 1.0)
+  );
+
+  for (let i = 0; i < numFrames; i++) {
+    const cx = Math.floor(i * cellW);
+    const cw = Math.floor((i + 1) * cellW) - cx;
+    const cy = WAVE_H;
+
+    // Subtle cell background & divider
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.078, 0.086, 0.106, 1.0).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(cx, cy, cw, RAIL_H));
+
+    if (frames[i]) {
+      drawAspectFitNSImage(frames[i], cx + 3, cy + 3, cw - 6, RAIL_H - 6);
+    } else {
+      $("[Frame Unavailable]").drawAtPointWithAttributes($.NSMakePoint(cx + 24, cy + RAIL_H / 2 - 8), missAttrs);
+    }
+
+    if (i > 0) {
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.20, 0.23, 0.28, 1.0).setFill;
+      $.NSBezierPath.fillRect($.NSMakeRect(cx, cy, 1, RAIL_H));
+    }
+
+    // Crisp bottom-left timestamp pill
+    const pillStr = formatTimePill(timestamps[i]);
+    const pSz = $(pillStr).sizeWithAttributes(pillAttrs);
+    const pw = Math.ceil(pSz.width) + 14;
+    const ph = 22;
+    const px = cx + 8;
+    const py = cy + 8;
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.05, 0.07, 0.86).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(px, py, pw, ph), 4, 4).fill;
+    $(pillStr).drawAtPointWithAttributes($.NSMakePoint(px + 7, py + 3), pillAttrs);
+  }
+
+  // === 3. BOTTOM 84px AUDIO RMS WAVEFORM BAR (y: 0..84) ===
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.043, 0.051, 0.067, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, 0, W, WAVE_H));
+
+  // Subtle horizontal reference gridlines at -18 dBFS and -36 dBFS
+  const barAreaH = WAVE_H - RIBBON_H - 12; // 64px bar height from y=10..74
+  const barBaseY = 8;
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.14, 0.16, 0.21, 1.0).setFill;
+  $.NSBezierPath.fillRect($.NSMakeRect(0, barBaseY + Math.round(barAreaH * 0.33), W, 1));
+  $.NSBezierPath.fillRect($.NSMakeRect(0, barBaseY + Math.round(barAreaH * 0.67), W, 1));
+
+  const bins = audioInfo.bins || [];
+  const nBins = bins.length || 120;
+  const binW = W / nBins;
+  const ribbonY = WAVE_H - RIBBON_H;
+
+  for (let b = 0; b < nBins; b++) {
+    const bin = bins[b] || { rms_db: -60, kind: "silent" };
+    const bx = b * binW;
+    const bw = Math.max(2, binW - 2);
+    const col = colorForAudioKind(bin.kind);
+
+    // Top 8px status ribbon (y: 76..84)
+    col.colorWithAlphaComponent(bin.kind === "silent" ? 0.35 : 0.85).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(bx, ribbonY, binW + 0.5, RIBBON_H));
+
+    // RMS bar mapped from -54 dBFS -> 0 dBFS
+    const norm = Math.max(0.04, Math.min(1.0, (bin.rms_db + 54.0) / 54.0));
+    const bh = Math.max(3, Math.round(norm * barAreaH));
+    col.setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(bx + 1, barBaseY, bw, bh));
+
+    // Red diagonal hatch overlay for wind_hazard bins
+    if (bin.kind === "wind_hazard") {
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.98, 0.78, 0.78, 0.75).setStroke;
+      const hatch = $.NSBezierPath.bezierPath;
+      hatch.lineWidth = 1.2;
+      for (let hy = barBaseY; hy < barBaseY + bh; hy += 8) {
+        hatch.moveToPoint($.NSMakePoint(bx + 1, hy));
+        hatch.lineToPoint($.NSMakePoint(bx + 1 + bw, Math.min(barBaseY + bh, hy + 6)));
+      }
+      hatch.stroke;
+    }
+  }
+
+  // Draw gold peak vertical ticks & labels for top 2 peak timestamps
+  const dur = Math.max(0.1, clip.duration_sec || 1.0);
+  const peakAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(11, $.NSFontWeightBold),
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.99, 0.86, 0.38, 1.0)
+  );
+  const peaks = audioInfo.audio_peaks_sec || [];
+  for (let i = 0; i < peaks.length; i++) {
+    const tSec = peaks[i];
+    const px = Math.max(8, Math.min(W - 88, Math.round((tSec / dur) * W)));
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.99, 0.84, 0.32, 0.95).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(px, barBaseY, 2, barAreaH + 2));
+
+    const pkText = "*" + formatTimePill(tSec);
+    const pkSz = $(pkText).sizeWithAttributes(peakAttrs);
+    const lx = Math.min(W - pkSz.width - 14, px + 4);
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.06, 0.08, 0.88).setFill;
+    $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius(
+      $.NSMakeRect(lx - 3, WAVE_H - RIBBON_H - 20, pkSz.width + 8, 17),
+      3,
+      3
+    ).fill;
+    $(pkText).drawAtPointWithAttributes($.NSMakePoint(lx + 1, WAVE_H - RIBBON_H - 19), peakAttrs);
+  }
+
+  // Bottom axis caption
+  const axisAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(10, $.NSFontWeightMedium),
+    $.NSColor.colorWithCalibratedWhiteAlpha(0.68, 1.0)
+  );
+  const audioSummary =
+    "AUDIO RMS (" + audioInfo.audio_profile + " | mean " + audioInfo.mean_rms_db + "dB | peak " + audioInfo.peak_rms_db + "dB)";
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.05, 0.07, 0.78).setFill;
+  const axSz = $(audioSummary).sizeWithAttributes(axisAttrs);
+  $.NSBezierPath.fillRect($.NSMakeRect(8, 2, axSz.width + 10, 14));
+  $(audioSummary).drawAtPointWithAttributes($.NSMakePoint(12, 2), axisAttrs);
+
+  finishAndSaveBitmapJPEG(rep, outPath, 0.86);
+  return timestamps;
+}
+
+function runVideoStripBatch(args) {
+  if (!args.manifest) throw new Error("Missing --manifest <manifest_v2.json>.");
+  const manifest = readJsonFile(args.manifest);
+  const outDir = args.outDir || "./work/clip_strips";
+  ensureDir(outDir);
+  if (args.artifactDir) ensureDir(args.artifactDir);
+
+  const videos = (manifest.assets || []).filter((a) => a.media_type === "video");
+  const start = args.batchStart !== null && !isNaN(args.batchStart) ? Math.max(0, args.batchStart) : 0;
+  const end =
+    args.batchEnd !== null && !isNaN(args.batchEnd)
+      ? Math.min(videos.length, args.batchEnd)
+      : videos.length;
+
+  const ciOpts = $.NSMutableDictionary.dictionary;
+  ciOpts.setObjectForKey($.NSNumber.numberWithBool(false), $.kCIContextCacheIntermediates);
+  const ciCtx = $.CIContext.contextWithOptions(ciOpts);
+  const fm = $.NSFileManager.defaultManager;
+
+  const CHROME_PREFERRED_CODECS = new Set(["vp09", "av01", "vp08"]);
+  const pid = $.NSProcessInfo.processInfo.processIdentifier;
+  const tmpChromeDir = outDir + "/.tmp_chrome_frames_" + pid;
+  const batchEntries = [];
+  const chromeJobs = [];
+
+  // Phase 1: Plan timestamps, decode native VideoToolbox clips, and collect VP9/AV1/failed clips for 1 batched Chrome call
+  for (let i = start; i < end; i++) {
+    const clip = videos[i];
+    const stripName = "strip_" + clip.id + ".jpg";
+    const stripPath = outDir + "/" + stripName;
+    const artifactPath = args.artifactDir ? args.artifactDir + "/" + stripName : null;
+
+    if (args.skipExisting && fm.fileExistsAtPath(stripPath)) {
+      batchEntries.push({
+        cached: true,
+        clip: clip,
+        stripPath: stripPath,
+        artifactPath: artifactPath,
+      });
+      continue;
+    }
+
+    const timestamps = computeSampleTimestamps(clip.duration_sec || 1.0);
+    const codec = (clip.video_codec || probeVideoCodecFourCC(clip.source_path) || "").toLowerCase();
+    let frames = null;
+    let frameDecoder = "avfoundation";
+
+    if (!CHROME_PREFERRED_CODECS.has(codec)) {
+      const candidateFrames = extractStripFrames(clip.source_path, clip.duration_sec || 1.0, timestamps);
+      const anyDecoded = candidateFrames.some((f) => f !== null);
+      if (anyDecoded) {
+        frames = candidateFrames;
+      }
+    }
+
+    const entry = {
+      cached: false,
+      clip: clip,
+      stripPath: stripPath,
+      artifactPath: artifactPath,
+      timestamps: timestamps,
+      frames: frames,
+      frameDecoder: frameDecoder,
+      chromeOutPaths: null,
+    };
+
+    if (!frames) {
+      const outPaths = timestamps.map((_t, ti) => tmpChromeDir + "/" + clip.id + "_f" + ti + ".jpg");
+      entry.chromeOutPaths = outPaths;
+      entry.frameDecoder = "chrome_webcodecs";
+      chromeJobs.push({
+        id: clip.id,
+        input: clip.source_path,
+        times: timestamps,
+        out_paths: outPaths,
+        max_dim: 450,
+      });
+    }
+
+    batchEntries.push(entry);
+  }
+
+  // Phase 2: Invoke macos_chrome_vp9.rb ONCE for all fallback clips in this batch
+  const batchItems = [];
+  try {
+    if (chromeJobs.length > 0) {
+      const helperPath = resolveChromeVp9HelperPath();
+      if (helperPath) {
+        ensureDir(tmpChromeDir);
+        const specPath = tmpChromeDir + "/spec.json";
+        writeTextFile(specPath, JSON.stringify({ max_dim: 450, quality: 0.88, jobs: chromeJobs }, null, 2) + "\n");
+        runSubprocess("/usr/bin/ruby", [helperPath, "--mode", "frames", "--batch-json", specPath]);
+      }
+      for (let k = 0; k < batchEntries.length; k++) {
+        const entry = batchEntries[k];
+        if (!entry.cached && entry.chromeOutPaths) {
+          entry.frames = entry.chromeOutPaths.map((fp) => {
+            if (!fm.fileExistsAtPath(fp)) return null;
+            const ns = $.NSImage.alloc.initWithContentsOfFile(fp);
+            return ns && (!ns.isNil || !ns.isNil()) ? ns : null;
+          });
+        }
+      }
+    }
+
+    // Phase 3: Analyze audio RMS (/usr/bin/afconvert) & render 1800x360 strips
+    for (let k = 0; k < batchEntries.length; k++) {
+      const entry = batchEntries[k];
+      const clip = entry.clip;
+      if (entry.cached) {
+        batchItems.push({
+          id: clip.id,
+          filename: clip.filename,
+          strip_path: entry.stripPath,
+          artifact_path: entry.artifactPath,
+          skipped: true,
+          status: "cached",
+        });
+        continue;
+      }
+
+      const audioInfo = clip.has_audio === false
+        ? {
+            audio_profile: "silent",
+            sonic_postcard_eligible: false,
+            mean_rms_db: -60.0,
+            peak_rms_db: -60.0,
+            crest_factor_db: 0.0,
+            low_band_ratio: 0.0,
+            speech_band_ratio: 0.0,
+            audio_peaks_sec: [],
+            audio_peak_windows: [],
+            bins: Array.from({ length: 120 }, () => ({ rms_db: -60.0, peak_db: -60.0, kind: "silent" })),
+          }
+        : analyzeClipAudio(clip.source_path, clip.id, clip.duration_sec, outDir);
+
+      const frameTimes = renderVideoStrip(clip, audioInfo, entry.stripPath, entry.timestamps, entry.frames);
+      if (entry.artifactPath) copyFileOverwrite(entry.stripPath, entry.artifactPath);
+
+      batchItems.push({
+        id: clip.id,
+        filename: clip.filename,
+        source_path: clip.source_path,
+        chapter: clip.chapter,
+        duration_sec: clip.duration_sec,
+        fps: clip.fps,
+        slow_mo_eligible: clip.slow_mo_eligible,
+        video_codec: clip.video_codec || null,
+        frame_decoder: entry.frameDecoder,
+        color_profile: clip.color_profile,
+        is_hdr: clip.is_hdr,
+        orientation: clip.orientation,
+        display_width: clip.display_width,
+        display_height: clip.display_height,
+        strip_path: entry.stripPath,
+        artifact_path: entry.artifactPath,
+        frame_timestamps_sec: frameTimes,
+        audio_profile: audioInfo.audio_profile,
+        sonic_postcard_eligible: audioInfo.sonic_postcard_eligible,
+        mean_rms_db: audioInfo.mean_rms_db,
+        peak_rms_db: audioInfo.peak_rms_db,
+        crest_factor_db: audioInfo.crest_factor_db,
+        low_band_ratio: audioInfo.low_band_ratio,
+        speech_band_ratio: audioInfo.speech_band_ratio,
+        audio_peaks_sec: audioInfo.audio_peaks_sec,
+        audio_peak_windows: audioInfo.audio_peak_windows,
+        status: "ok",
+      });
+
+      ciCtx.clearCaches;
+      drainRunLoop();
+    }
+  } finally {
+    try {
+      if (fm.fileExistsAtPath(tmpChromeDir)) fm.removeItemAtPathError(tmpChromeDir, null);
+    } catch (e) {}
+  }
+
+  const batchJsonPath = outDir + "/batch_" + String(start).padStart(4, "0") + "_" + String(end).padStart(4, "0") + ".json";
+  const payload = {
+    schema_version: "2.0",
+    mode: "video-strips",
+    manifest: args.manifest,
+    batch_start: start,
+    batch_end: end,
+    total_videos_in_manifest: videos.length,
+    processed_count: batchItems.length,
+    chrome_fallback_count: chromeJobs.length,
+    speech_laughter_count: batchItems.filter((x) => x.audio_profile === "speech_laughter").length,
+    wind_hazard_count: batchItems.filter((x) => x.audio_profile === "wind_hazard").length,
+    batch_json: batchJsonPath,
+    items: batchItems,
+  };
+  writeTextFile(batchJsonPath, JSON.stringify(payload, null, 2) + "\n");
+  return JSON.stringify(payload, null, 2);
+}
+
+function loadOrientedPhotoThumb(ciCtx, filePath, maxPx) {
+  try {
+    const url = $.NSURL.fileURLWithPath(filePath);
+    const opts = $.NSMutableDictionary.dictionary;
+    opts.setObjectForKey($.NSNumber.numberWithBool(true), $.kCIImageApplyOrientationProperty);
+    let img = $.CIImage.imageWithContentsOfURLOptions(url, opts);
+    if (!img) return null;
+    const ext = img.extent;
+    if (ext.origin.x !== 0 || ext.origin.y !== 0) {
+      img = img.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y));
+    }
+    const w = img.extent.size.width;
+    const h = img.extent.size.height;
+    if (w <= 0 || h <= 0) return null;
+    const scale = Math.min(1.0, maxPx / Math.max(w, h));
+    if (scale < 1.0) {
+      img = img.imageByApplyingTransform($.CGAffineTransformMakeScale(scale, scale));
+    }
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+    const cgImg = ciCtx.createCGImageFromRect(img, $.CGRectMake(0, 0, outW, outH));
+    if (!cgImg) return null;
+    return $.NSImage.alloc.initWithCGImageSize(cgImg, $.NSZeroSize);
+  } catch (e) {
+    return null;
+  }
+}
+
+function runPhotosOnly(args) {
+  if (!args.manifest) throw new Error("--photos-only requires --manifest <manifest_v2.json>.");
+  const manifest = readJsonFile(args.manifest);
+  const outDir = args.outDir || "./work/photo_sheets";
+  ensureDir(outDir);
+  if (args.artifactDir) ensureDir(args.artifactDir);
+
+  const photos = (manifest.assets || []).filter((a) => a.media_type === "photo");
+  const groups = {};
+  const chapterOrder = [];
+
+  for (let i = 0; i < photos.length; i++) {
+    const p = photos[i];
+    const ch = p.chapter || "photos_ungrouped";
+    if (!groups[ch]) {
+      groups[ch] = [];
+      chapterOrder.push(ch);
+    }
+    groups[ch].push(p);
+  }
+
+  const ciOpts = $.NSMutableDictionary.dictionary;
+  ciOpts.setObjectForKey($.NSNumber.numberWithBool(false), $.kCIContextCacheIntermediates);
+  const ciCtx = $.CIContext.contextWithOptions(ciOpts);
+
+  const sheetW = 1800;
+  const sheetH = 1200;
+  const cellW = 600;
+  const cellH = 400;
+  const labelH = 34;
+
+  const sheets = [];
+  const indexed = [];
+
+  const labelAttrs = makeTextAttrs(
+    $.NSFont.monospacedSystemFontOfSizeWeight(13, $.NSFontWeightSemibold),
+    $.NSColor.whiteColor
+  );
+  const missingAttrs = makeTextAttrs(
+    $.NSFont.systemFontOfSizeWeight(15, $.NSFontWeightMedium),
+    $.NSColor.colorWithCalibratedWhiteAlpha(0.65, 1.0)
+  );
+
+  for (let cIdx = 0; cIdx < chapterOrder.length; cIdx++) {
+    const ch = chapterOrder[cIdx];
+    const list = groups[ch];
+    const totalPages = Math.ceil(list.length / 9);
+
+    for (let page = 0; page < totalPages; page++) {
+      const chunk = list.slice(page * 9, (page + 1) * 9);
+      const sheetName = "photos_" + ch + "_p" + String(page + 1).padStart(2, "0") + ".jpg";
+      const sheetPath = outDir + "/" + sheetName;
+      const artifactPath = args.artifactDir ? args.artifactDir + "/" + sheetName : null;
+
+      const rep = createBitmapCanvas(sheetW, sheetH);
+      $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.075, 0.08, 0.095, 1.0).setFill;
+      $.NSBezierPath.fillRect($.NSMakeRect(0, 0, sheetW, sheetH));
+
+      for (let slot = 0; slot < chunk.length; slot++) {
+        const item = chunk[slot];
+        const col = slot % 3;
+        const row = Math.floor(slot / 3);
+        const cellX = col * cellW;
+        const cellY = sheetH - (row + 1) * cellH;
+
+        $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.18, 0.20, 0.24, 1.0).setStroke;
+        const border = $.NSBezierPath.bezierPathWithRect($.NSMakeRect(cellX + 2, cellY + 2, cellW - 4, cellH - 4));
+        border.lineWidth = 1.0;
+        border.stroke;
+
+        const thumb = loadOrientedPhotoThumb(ciCtx, item.source_path, 600);
+        if (thumb) {
+          drawAspectFitNSImage(thumb, cellX + 6, cellY + labelH + 4, cellW - 12, cellH - labelH - 10);
+        } else {
+          $("[Unreadable Photo]").drawAtPointWithAttributes($.NSMakePoint(cellX + 220, cellY + cellH / 2), missingAttrs);
+        }
+
+        $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.055, 0.07, 0.92).setFill;
+        $.NSBezierPath.fillRect($.NSMakeRect(cellX + 2, cellY + 2, cellW - 4, labelH));
+
+        const dims = (item.display_width || "?") + "x" + (item.display_height || "?");
+        const dateTag = item.timestamp_local ? item.timestamp_local.slice(0, 16).replace("T", " ") : "undated";
+        const shortName = item.filename.length > 24 ? item.filename.slice(0, 21) + "..." : item.filename;
+        const label = "#" + item.id + " | " + shortName + " | " + dims + " | " + dateTag;
+        $(label).drawAtPointWithAttributes($.NSMakePoint(cellX + 10, cellY + 9), labelAttrs);
+
+        indexed.push({
+          id: item.id,
+          filename: item.filename,
+          source_path: item.source_path,
+          chapter: ch,
+          orientation: item.orientation,
+          display_width: item.display_width,
+          display_height: item.display_height,
+          contact_sheet: sheetPath,
+          sheet_slot: slot + 1,
+        });
+      }
+
+      finishAndSaveBitmapJPEG(rep, sheetPath, 0.88);
+      if (artifactPath) copyFileOverwrite(sheetPath, artifactPath);
+      sheets.push(sheetPath);
+      ciCtx.clearCaches;
+      drainRunLoop();
+    }
+  }
+
+  const indexPath = outDir + "/photo_sheets_index.json";
+  const payload = {
+    schema_version: "2.0",
+    mode: "photos-only",
+    photo_count: indexed.length,
+    sheet_count: sheets.length,
+    sheets: sheets,
+    index_out: indexPath,
+    items: indexed,
+  };
+  writeTextFile(indexPath, JSON.stringify(payload, null, 2) + "\n");
+  return JSON.stringify(payload, null, 2);
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify(
+      {
+        script: "macos_video_strips.jxa",
+        modes: {
+          index_only:
+            "osascript -l JavaScript macos_video_strips.jxa --input-dir <raw_dir> --work-dir <work_dir> --index-only",
+          video_strips:
+            "nice -n 15 osascript -l JavaScript macos_video_strips.jxa --manifest <manifest_v2.json> --out-dir <clip_strips_dir> [--artifact-dir <dir>] --batch-start 0 --batch-end 15 [--skip-existing]",
+          photos_only:
+            "osascript -l JavaScript macos_video_strips.jxa --photos-only --manifest <manifest_v2.json> --out-dir <photo_sheets_dir> [--artifact-dir <dir>]",
+        },
+      },
+      null,
+      2
+    );
+  }
+
+  if (args.indexOnly) return runIndexOnly(args);
+  if (args.photosOnly) return runPhotosOnly(args);
+  return runVideoStripBatch(args);
+}

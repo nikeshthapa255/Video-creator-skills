@@ -1,0 +1,121 @@
+{
+  "style_id": "analog_scrapbook",
+  "display_name": "Analog Scrapbook",
+  "tagline": "Tactile travel zine with tilted Polaroids, masking tape, and 12fps stop-motion energy.",
+  "description": "Warm kraft-paper canvas, staggered Polaroid drop-ins with soft drop shadows and translucent tape corners, monospace typewriter EXIF stamps, and paper-wipe transitions.",
+  "best_for": [
+    "City food crawls and cafe hopping",
+    "Friends weekend getaways",
+    "Art and culture trips",
+    "Photo-heavy or mixed media trips"
+  ],
+  "vibe_tags": ["tactile", "scrapbook", "polaroid", "indie"],
+  "palette": {
+    "bg": "#F2E9DC",
+    "surface": "#EFE6C8",
+    "text_primary": "#23201D",
+    "text_secondary": "#5E5448",
+    "accent": "#C84B31",
+    "accent_secondary": "#D8C7B2",
+    "border": "#FFFFFF",
+    "swatches": ["#F2E9DC", "#C84B31", "#23201D", "#EFE6C8", "#D8C7B2"]
+  },
+  "typography": {
+    "display_font": "AmericanTypewriter-Bold",
+    "display_css": "'American Typewriter', 'Courier Prime', Courier, monospace",
+    "meta_font": "Menlo-Regular",
+    "meta_css": "Menlo, 'Courier New', monospace",
+    "accent_font": "MarkerFelt-Wide",
+    "accent_css": "'Marker Felt', 'Noteworthy', cursive",
+    "display_uppercase": true,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.06,
+    "meta_letter_spacing": 0.14
+  },
+  "color_grade": {
+    "look_id": "warm_film",
+    "coreimage": {
+      "contrast": 1.04,
+      "saturation": 0.92,
+      "brightness": 0.02,
+      "temperature_target": 5500,
+      "tint_target": 10,
+      "sepia_intensity": 0.06,
+      "exposure_ev": 0.04,
+      "fade_blacks": 0.05
+    },
+    "ffmpeg_vf": "eq=contrast=1.04:saturation=0.92:brightness=0.02:gamma=1.03,colorbalance=rs=0.07:gs=0.03:bs=-0.06:rm=0.04:bm=-0.04"
+  },
+  "textures": {
+    "grain_amount": 0.24,
+    "vignette_intensity": 0.35,
+    "vignette_radius": 1.8,
+    "gate_weave_px": 1.5,
+    "overlay_fps_step": 12,
+    "letterbox_ratio": 0,
+    "frame_style": "polaroid_scrapbook",
+    "halation_amount": 0.05
+  },
+  "layouts": {
+    "default_portrait_layout": "polaroid_stack",
+    "supported_layouts": [
+      "polaroid_stack",
+      "split_diptych_pair",
+      "split_2up_video",
+      "bento_living_grid",
+      "single",
+      "blurred_bg_pillarbox"
+    ],
+    "gutter_px": 20,
+    "corner_radius_px": 4,
+    "border_px": 24,
+    "polaroid_tilt_deg": 5.5,
+    "pillarbox_dim_alpha": 0.18,
+    "pillarbox_blur_sigma": 22.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "kraft_stamp_typewriter",
+    "backdrop_blur_sigma": 18.0,
+    "backdrop_dim_alpha": 0.22,
+    "backdrop_zoom_pct": 0.03,
+    "use_roman_numerals": false,
+    "show_divider_rule": true,
+    "show_date_stamp": true,
+    "route_map_skin": "parchment_ink",
+    "cast_intro_style": "polaroid_frame"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "paper_wipe",
+    "allowed": ["cut", "paper_wipe", "flash_cut", "dissolve", "light_leak"],
+    "default_duration_sec": 0.42,
+    "signature_label": "Paper Wipes + Shutter Flash"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 95,
+    "target_bpm_max": 115,
+    "target_bpm_label": "95-115 BPM",
+    "avg_shot_sec_min": 1.5,
+    "avg_shot_sec_max": 3.5,
+    "max_consecutive_photos": 6,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": false,
+    "max_speed_ramp_ratio": 0.05,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 5,
+    "enable_blooper_stinger_default": true,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 2
+  },
+  "audio": {
+    "default_bgm_volume": 0.80,
+    "duck_bgm_db": -13.0,
+    "sonic_postcard_nat_gain_db": 0.5,
+    "default_nat_bed_volume": 0.20,
+    "default_j_cut_sec": 0.5,
+    "default_l_cut_sec": 0.4,
+    "sfx_pack": "paper_polaroid",
+    "music_genre_hint": "Lo-fi indie beats, warm acoustic indie folk, subtle vinyl crackle bed."
+  }
+}

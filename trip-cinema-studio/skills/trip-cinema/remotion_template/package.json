@@ -1,12 +1,13 @@
 {
   "name": "trip-cinema-remotion-template",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Zero-API-key Remotion 16:9 route map and EXIF chapter title overlays for trip-cinema-studio.",
+  "description": "Zero-API-key Remotion 16:9 Style-Pack-aware chapter titles, GPS route + elevation maps, and Trip Wrapped EXIF stat cards for trip-cinema-studio.",
   "scripts": {
     "studio": "remotion studio src/index.ts",
     "render:map": "remotion render src/index.ts TripRouteMap out/route_map.mp4",
-    "render:title": "remotion render src/index.ts ChapterTitle out/chapter_title.mp4"
+    "render:title": "remotion render src/index.ts ChapterTitle out/chapter_title.mp4",
+    "render:wrapped": "remotion render src/index.ts TripWrappedCard out/trip_wrapped.mp4"
   },
   "dependencies": {
     "react": "^18.3.1",

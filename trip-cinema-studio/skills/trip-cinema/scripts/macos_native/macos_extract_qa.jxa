@@ -1,13 +1,18 @@
 #!/usr/bin/env osascript -l JavaScript
 /**
- * Zero-dependency macOS Native QA Frame & Contact Sheet Extractor.
+ * Trip Cinema Studio v0.2.0 — Zero-dependency macOS Native QA Frame & Contact Sheet Extractor.
  * Uses AVFoundation AVAssetImageGenerator + AppKit (100% Apple-signed).
+ *
+ * Supports EDL v2.0 overlap transition alignment, multi-video grids (split_2up_video,
+ * triptych_3up_video, bento_living_grid), speed ramps, and all 6 graphic card types
+ * (chapter_title, route_map, trip_wrapped, cast_intro, text_behind_subject, blooper_title).
  *
  * Usage:
  *   osascript -l JavaScript macos_extract_qa.jxa \
  *     --input ./output/trip_cinema.mp4 \
+ *     [--edl ./work/edl.json] \
  *     --out-dir ./work/qa \
- *     --count 9
+ *     --count 9 [--dry-run]
  */
 
 ObjC.import("Foundation");
@@ -22,6 +27,7 @@ function parseArgs(argv) {
     edl: null,
     outDir: "./work/qa",
     count: 9,
+    dryRun: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -31,6 +37,7 @@ function parseArgs(argv) {
     else if (a === "--edl") args.edl = argv[++i];
     else if (a === "--out-dir" || a === "-o") args.outDir = argv[++i];
     else if (a === "--count" || a === "-n") args.count = Math.max(1, parseInt(argv[++i], 10) || 9);
+    else if (a === "--dry-run") args.dryRun = true;
   }
   return args;
 }
@@ -56,6 +63,92 @@ function formatSec(sec) {
   return String(m).padStart(2, "0") + ":" + s + "s";
 }
 
+function estimateShotDuration(shot) {
+  if (shot.duration_sec !== undefined && Number(shot.duration_sec) > 0) {
+    return Number(shot.duration_sec);
+  }
+  const sp = shot.speed_profile;
+  if (sp && sp.mode === "cubic_ramp") {
+    if (Array.isArray(sp.segments) && sp.segments.length > 0) {
+      return Math.max(0.2, sp.segments.reduce((acc, seg) => acc + Number(seg.dur_sec || 0), 0));
+    }
+    const sum = Number(sp.d1 !== undefined ? sp.d1 : 0.30)
+      + Number(sp.d2 !== undefined ? sp.d2 : 0.35)
+      + Number(sp.d3 !== undefined ? sp.d3 : 1.60)
+      + Number(sp.d4 !== undefined ? sp.d4 : 0.35)
+      + Number(sp.d5 !== undefined ? sp.d5 : 0.30);
+    return Math.max(0.2, sum);
+  }
+  const inSec = Number(shot.in_sec || 0);
+  const outSec = Number(shot.out_sec || (inSec + 3));
+  const rawSpan = Math.max(0.2, outSec - inSec);
+  if (sp && sp.mode === "constant" && Number(sp.rate) > 0) {
+    return Math.max(0.2, rawSpan / Number(sp.rate));
+  }
+  return rawSpan;
+}
+
+function resolveTransitionOverlap(shot, nextShot, curDur, nextDur) {
+  let tType = shot.transition_out;
+  let tDur = shot.transition_duration_sec;
+  if (tType && typeof tType === "object") {
+    if (tType.duration_sec !== undefined) tDur = tType.duration_sec;
+    tType = tType.type;
+  }
+  if (!tType && shot.transition) tType = shot.transition;
+  const norm = String(tType || "cut").toLowerCase().trim();
+  if (!nextShot || norm === "cut" || norm === "j_cut" || norm === "l_cut" || norm === "none") {
+    return 0.0;
+  }
+  const requested = Math.max(0.1, Math.min(1.5, Number(tDur || 0.45)));
+  return Math.min(requested, curDur * 0.45, nextDur * 0.45);
+}
+
+function buildEdlQaTargets(edl, totalDurSec) {
+  const shots = edl.shots || [];
+  const durs = shots.map(estimateShotDuration);
+  const videoItems = [];
+  const graphicItems = [];
+  let curSec = 0.0;
+
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i];
+    const shotDur = durs[i];
+    const nextDur = i < shots.length - 1 ? durs[i + 1] : 0;
+    const ov = resolveTransitionOverlap(s, i < shots.length - 1 ? shots[i + 1] : null, shotDur, nextDur);
+    // Sample route_map at 86% so QA confirms ALL stop pills & elevation profile revealed cleanly!
+    const gType = String(s.graphic_type || "card").toLowerCase();
+    const frac = (s.media_type === "graphic" && gType === "route_map") ? 0.86 : 0.50;
+    const sampleSec = Math.min(Math.max(0.0, totalDurSec - 0.05), curSec + shotDur * frac);
+    curSec += Math.max(0.05, shotDur - ov);
+
+    const mtype = s.media_type || "photo";
+    const sid = s.shot_id || ("S" + String(i + 1).padStart(2, "0"));
+    const layout = s.layout || s.aspect_handling || "";
+    const isMultiGrid = Array.isArray(s.tiles) && s.tiles.length >= 2;
+    const isMultiVideo = isMultiGrid && s.tiles.some((t) => t.media_type === "video");
+    const isSpeedRamp = Boolean(s.speed_profile && (s.speed_profile.mode === "cubic_ramp" || (s.speed_profile.rate && Math.abs(Number(s.speed_profile.rate) - 1.0) > 0.05)));
+
+    if (mtype === "video" || isMultiVideo || isMultiGrid) {
+      const tags = [sid];
+      if (layout && layout !== "single") tags.push(layout);
+      else tags.push(s.orientation || "video");
+      if (isSpeedRamp) tags.push("ramp");
+      tags.push(formatSec(sampleSec));
+      videoItems.push({
+        timeSec: sampleSec,
+        label: tags.join(" · "),
+      });
+    } else if (mtype === "graphic") {
+      graphicItems.push({
+        timeSec: sampleSec,
+        label: sid + " · " + gType + " · " + formatSec(sampleSec),
+      });
+    }
+  }
+  return { videoItems: videoItems, graphicItems: graphicItems, estimatedDuration: curSec };
+}
+
 function grabFrameAt(gen, sec) {
   const cmTime = $.CMTimeMakeWithSeconds(sec, 600);
   const cgImg = gen.copyCGImageAtTimeActualTimeError(cmTime, null, null);
@@ -70,14 +163,14 @@ function saveNSImageAsJPEG(nsImg, outPath) {
   jpg.writeToFileAtomically(outPath, true);
 }
 
-function renderLabeledContactSheet(gen, items, outPath, cols) {
+function renderLabeledContactSheet(gen, items, outPath, cols, cellW, cellH) {
   if (!items || items.length === 0) return null;
   const numCols = cols || 3;
   const numRows = Math.max(1, Math.ceil(items.length / numCols));
-  const cellW = 640;
-  const cellH = 360;
-  const sheetW = cellW * numCols;
-  const sheetH = cellH * numRows;
+  const cW = cellW || 640;
+  const cH = cellH || 360;
+  const sheetW = cW * numCols;
+  const sheetH = cH * numRows;
 
   const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(sheetW, sheetH));
   canvas.lockFocus;
@@ -85,19 +178,19 @@ function renderLabeledContactSheet(gen, items, outPath, cols) {
   $.NSBezierPath.fillRect($.NSMakeRect(0, 0, sheetW, sheetH));
 
   const labelAttrs = $.NSMutableDictionary.dictionary;
-  labelAttrs.setObjectForKey($.NSFont.monospacedSystemFontOfSizeWeight(15, $.NSFontWeightMedium), $.NSFontAttributeName);
+  labelAttrs.setObjectForKey($.NSFont.monospacedSystemFontOfSizeWeight(14, $.NSFontWeightMedium), $.NSFontAttributeName);
   labelAttrs.setObjectForKey($.NSColor.whiteColor, $.NSForegroundColorAttributeName);
 
   for (let slot = 0; slot < items.length; slot++) {
     const item = items[slot];
     const col = slot % numCols;
     const row = Math.floor(slot / numCols);
-    const x = col * cellW;
-    const y = sheetH - (row + 1) * cellH; // AppKit origin is bottom-left
+    const x = col * cW;
+    const y = sheetH - (row + 1) * cH;
     const frameImg = grabFrameAt(gen, item.timeSec);
     if (frameImg) {
       frameImg.drawInRectFromRectOperationFraction(
-        $.NSMakeRect(x + 4, y + 4, cellW - 8, cellH - 8),
+        $.NSMakeRect(x + 4, y + 4, cW - 8, cH - 8),
         $.NSZeroRect,
         $.NSCompositingOperationSourceOver,
         1.0
@@ -105,8 +198,8 @@ function renderLabeledContactSheet(gen, items, outPath, cols) {
     }
     const labelStr = item.label;
     const lblSize = $(labelStr).sizeWithAttributes(labelAttrs);
-    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.04, 0.06, 0.84).setFill;
-    $.NSBezierPath.fillRect($.NSMakeRect(x + 12, y + 12, lblSize.width + 18, 28));
+    $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.04, 0.04, 0.06, 0.86).setFill;
+    $.NSBezierPath.fillRect($.NSMakeRect(x + 12, y + 12, Math.min(cW - 24, lblSize.width + 18), 28));
     $(labelStr).drawAtPointWithAttributes($.NSMakePoint(x + 21, y + 17), labelAttrs);
   }
 
@@ -119,9 +212,33 @@ function run(argv) {
   const args = parseArgs(argv);
   if (args.help) {
     return JSON.stringify({
-      usage: "osascript -l JavaScript macos_extract_qa.jxa --input <master.mp4> [--edl ./work/edl.json] [--out-dir ./work/qa] [--count 9]",
+      version: "0.2.0",
+      usage: "osascript -l JavaScript macos_extract_qa.jxa --input <master.mp4> [--edl ./work/edl.json] [--out-dir ./work/qa] [--count 9] [--dry-run]",
     }, null, 2);
   }
+
+  if (args.dryRun) {
+    let edlSummary = null;
+    if (args.edl) {
+      const edl = readJsonFile(args.edl);
+      const plan = buildEdlQaTargets(edl, 9999);
+      edlSummary = {
+        shot_count: (edl.shots || []).length,
+        estimated_duration_sec: Number(plan.estimatedDuration.toFixed(2)),
+        video_alignment_samples: plan.videoItems.length,
+        graphic_card_samples: plan.graphicItems.length,
+      };
+    }
+    return JSON.stringify({
+      status: "dry_run",
+      version: "0.2.0",
+      input: args.input,
+      out_dir: args.outDir,
+      count: args.count,
+      edl_summary: edlSummary,
+    }, null, 2);
+  }
+
   if (!args.input) {
     throw new Error("Missing --input <master.mp4>.");
   }
@@ -134,6 +251,19 @@ function run(argv) {
   const durSec = $.CMTimeGetSeconds(asset.duration);
   if (!durSec || durSec <= 0) {
     throw new Error("Invalid or zero-duration video: " + args.input);
+  }
+
+  // Detect 9:16 vertical vs 16:9 horizontal master so contact sheet tiles match aspect ratio cleanly
+  let cellW = 640;
+  let cellH = 360;
+  const vTracks = asset.tracksWithMediaType($.AVMediaTypeVideo);
+  if (vTracks && Number(vTracks.count) > 0) {
+    const vt = vTracks.objectAtIndex(0);
+    const sz = vt.naturalSize;
+    if (sz.height > sz.width) {
+      cellW = 360;
+      cellH = 640;
+    }
   }
 
   const gen = AVAssetImageGenerator.assetImageGeneratorWithAsset(asset);
@@ -163,47 +293,26 @@ function run(argv) {
       label: "#" + (page + idx + 1) + " · " + formatSec(t),
     }));
     const sheetPath = args.outDir + "/qa_sheet_" + String(Math.floor(page / 9) + 1).padStart(2, "0") + ".jpg";
-    renderLabeledContactSheet(gen, chunk, sheetPath, 3);
+    renderLabeledContactSheet(gen, chunk, sheetPath, 3, cellW, cellH);
     sheets.push(sheetPath);
   }
 
-  // 3. Shot-targeted alignment & card QA sheets when --edl is provided
+  // 3. Shot-targeted alignment & card QA sheets when --edl is provided (overlap-aligned!)
   let qaVideoAlignment = null;
   let qaChapterCards = null;
   if (args.edl) {
     const edl = readJsonFile(args.edl);
-    const shots = edl.shots || [];
-    const videoItems = [];
-    const graphicItems = [];
-    let curSec = 0.0;
-    for (let i = 0; i < shots.length; i++) {
-      const s = shots[i];
-      const shotDur = Math.max(0.2, Number(s.out_sec || 3) - Number(s.in_sec || 0));
-      const midSec = Math.min(Math.max(0.0, durSec - 0.05), curSec + shotDur * 0.5);
-      curSec += shotDur;
-      const mtype = s.media_type || "photo";
-      const sid = s.shot_id || ("S" + String(i + 1).padStart(2, "0"));
-      if (mtype === "video") {
-        videoItems.push({
-          timeSec: midSec,
-          label: sid + " · " + (s.orientation || "video") + " · " + formatSec(midSec),
-        });
-      } else if (mtype === "graphic") {
-        graphicItems.push({
-          timeSec: midSec,
-          label: sid + " · " + (s.graphic_type || "card") + " · " + formatSec(midSec),
-        });
-      }
+    const targets = buildEdlQaTargets(edl, durSec);
+    if (targets.videoItems.length > 0) {
+      qaVideoAlignment = renderLabeledContactSheet(gen, targets.videoItems, args.outDir + "/qa_video_alignment.jpg", 3, cellW, cellH);
     }
-    if (videoItems.length > 0) {
-      qaVideoAlignment = renderLabeledContactSheet(gen, videoItems, args.outDir + "/qa_video_alignment.jpg", 3);
-    }
-    if (graphicItems.length > 0) {
-      qaChapterCards = renderLabeledContactSheet(gen, graphicItems, args.outDir + "/qa_chapter_cards.jpg", 3);
+    if (targets.graphicItems.length > 0) {
+      qaChapterCards = renderLabeledContactSheet(gen, targets.graphicItems, args.outDir + "/qa_chapter_cards.jpg", 3, cellW, cellH);
     }
   }
 
   return JSON.stringify({
+    version: "0.2.0",
     input: args.input,
     duration_sec: Number(durSec.toFixed(2)),
     end_frame_check: endImg ? endFramePath : null,

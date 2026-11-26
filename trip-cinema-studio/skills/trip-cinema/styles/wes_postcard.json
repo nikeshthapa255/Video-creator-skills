@@ -1,0 +1,132 @@
+{
+  "style_id": "wes_postcard",
+  "display_name": "Wes Postcard Symmetry",
+  "tagline": "Whimsical storybook framing, pastel Roman-numeral cards, and crisp 90-degree whip-pans.",
+  "description": "Dead-center symmetrical composition framed in warm vintage postcard mattes, Futura Bold chapter cards, locked-off staccato pacing, and playful whip-pan swipes.",
+  "best_for": [
+    "European and heritage rail journeys",
+    "Historic hill stations and boutique hotels",
+    "Architecture and solo city walks",
+    "Quirky cafe and storefront tours"
+  ],
+  "vibe_tags": ["pastel", "symmetrical", "whimsical", "storybook"],
+  "palette": {
+    "bg": "#FAF6EE",
+    "surface": "#E8B4B8",
+    "text_primary": "#262322",
+    "text_secondary": "#5A534E",
+    "accent": "#F4D35E",
+    "accent_secondary": "#A8D5BA",
+    "border": "#FAF6EE",
+    "swatches": ["#E8B4B8", "#A8D5BA", "#F4D35E", "#90C2E7", "#FAF6EE"],
+    "alt_subpalette": {
+      "name": "Darjeeling 70s",
+      "swatches": ["#D99B26", "#C85A32", "#5A6B47", "#F5EBD6", "#3E2F23"]
+    }
+  },
+  "typography": {
+    "display_font": "Futura-Bold",
+    "display_css": "Futura, 'Century Gothic', 'Avenir Next', sans-serif",
+    "meta_font": "Baskerville-SemiBold",
+    "meta_css": "Baskerville, Didot, Georgia, serif",
+    "accent_font": "Futura-Medium",
+    "accent_css": "Futura, 'Avenir Next', sans-serif",
+    "display_uppercase": true,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.14,
+    "meta_letter_spacing": 0.18
+  },
+  "color_grade": {
+    "look_id": "soft_atmospheric",
+    "coreimage": {
+      "contrast": 0.98,
+      "saturation": 1.10,
+      "brightness": 0.03,
+      "temperature_target": 5700,
+      "tint_target": 12,
+      "sepia_intensity": 0.02,
+      "exposure_ev": 0.08,
+      "fade_blacks": 0.04
+    },
+    "ffmpeg_vf": "eq=contrast=0.98:saturation=1.10:brightness=0.03:gamma=1.04,colorbalance=rs=0.05:gs=0.03:bs=-0.02:rh=0.05:gh=0.02:bh=-0.03"
+  },
+  "textures": {
+    "grain_amount": 0.12,
+    "vignette_intensity": 0.25,
+    "vignette_radius": 2.0,
+    "gate_weave_px": 0.0,
+    "overlay_fps_step": 0,
+    "letterbox_ratio": 0,
+    "frame_style": "postcard_matte",
+    "halation_amount": 0.0
+  },
+  "layouts": {
+    "default_portrait_layout": "split_diptych_pair",
+    "supported_layouts": [
+      "split_diptych_pair",
+      "blurred_bg_pillarbox",
+      "single",
+      "split_2up_video",
+      "triptych_3up_video"
+    ],
+    "gutter_px": 18,
+    "corner_radius_px": 0,
+    "border_px": 22,
+    "polaroid_tilt_deg": 0.0,
+    "pillarbox_dim_alpha": 0.15,
+    "pillarbox_blur_sigma": 20.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "pastel_futura_roman",
+    "backdrop_blur_sigma": 20.0,
+    "backdrop_dim_alpha": 0.25,
+    "backdrop_zoom_pct": 0.02,
+    "use_roman_numerals": true,
+    "show_divider_rule": true,
+    "show_date_stamp": true,
+    "route_map_skin": "pastel_atlas",
+    "cast_intro_style": "postcard_badge"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "whip_pan_right",
+    "allowed": [
+      "cut",
+      "whip_pan_left",
+      "whip_pan_right",
+      "whip_pan_up",
+      "whip_pan_down",
+      "zoom_punch",
+      "dissolve"
+    ],
+    "default_duration_sec": 0.4,
+    "signature_label": "90-Deg Whip-Pans + Snap Cuts"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 110,
+    "target_bpm_max": 130,
+    "target_bpm_label": "110-130 BPM",
+    "avg_shot_sec_min": 1.2,
+    "avg_shot_sec_max": 3.0,
+    "max_consecutive_photos": 4,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": false,
+    "max_speed_ramp_ratio": 0.0,
+    "prefer_static_frames": true,
+    "wave_fast_burst_max": 5,
+    "enable_blooper_stinger_default": false,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 2
+  },
+  "audio": {
+    "default_bgm_volume": 0.82,
+    "duck_bgm_db": -13.0,
+    "sonic_postcard_nat_gain_db": 0.5,
+    "default_nat_bed_volume": 0.18,
+    "default_j_cut_sec": 0.4,
+    "default_l_cut_sec": 0.4,
+    "sfx_pack": "typewriter_bell",
+    "music_genre_hint": "Whimsical baroque-pop, pizzicato chamber strings, harpsichord, glockenspiel, or accordion."
+  }
+}

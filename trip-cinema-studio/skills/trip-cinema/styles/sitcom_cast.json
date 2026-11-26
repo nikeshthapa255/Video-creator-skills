@@ -1,0 +1,130 @@
+{
+  "style_id": "sitcom_cast",
+  "display_name": "Sitcom Cast & Bloopers",
+  "tagline": "Bright cheerful tones, freeze-frame traveler intros, and a post-credits blooper stinger.",
+  "description": "Upbeat family and friend-group film style featuring vibrant daylight color, freeze-frame cast introductions with playful nickname badges, preserved group laughter, and a post-credits outtake reel.",
+  "best_for": [
+    "Big family vacations and multi-gen trips",
+    "Friend-group holidays and reunions",
+    "Kid-heavy road trips",
+    "Funny candid and laughter-filled footage"
+  ],
+  "vibe_tags": ["playful", "family", "bright", "sitcom"],
+  "palette": {
+    "bg": "#FFFDF7",
+    "surface": "#FFF3D1",
+    "text_primary": "#1E2430",
+    "text_secondary": "#535C6E",
+    "accent": "#FF6B6B",
+    "accent_secondary": "#06D6A0",
+    "border": "#FFD166",
+    "swatches": ["#FF6B6B", "#FFD166", "#06D6A0", "#118AB2", "#FFFDF7"]
+  },
+  "typography": {
+    "display_font": "AvenirNext-Heavy",
+    "display_css": "'Avenir Next', 'Helvetica Neue', Arial, sans-serif",
+    "meta_font": "HelveticaNeue-Bold",
+    "meta_css": "'Helvetica Neue', Helvetica, Arial, sans-serif",
+    "accent_font": "MarkerFelt-Wide",
+    "accent_css": "'Marker Felt', 'Noteworthy', cursive",
+    "display_uppercase": true,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.05,
+    "meta_letter_spacing": 0.14
+  },
+  "color_grade": {
+    "look_id": "clean_natural",
+    "coreimage": {
+      "contrast": 1.07,
+      "saturation": 1.12,
+      "brightness": 0.02,
+      "temperature_target": 6100,
+      "tint_target": 4,
+      "sepia_intensity": 0.0,
+      "exposure_ev": 0.06,
+      "fade_blacks": 0.0
+    },
+    "ffmpeg_vf": "eq=contrast=1.07:saturation=1.12:brightness=0.02:gamma=1.01,colorbalance=rs=0.03:gs=0.02:bs=-0.02"
+  },
+  "textures": {
+    "grain_amount": 0.06,
+    "vignette_intensity": 0.22,
+    "vignette_radius": 2.0,
+    "gate_weave_px": 0.0,
+    "overlay_fps_step": 0,
+    "letterbox_ratio": 0,
+    "frame_style": "pop_sticker",
+    "halation_amount": 0.0
+  },
+  "layouts": {
+    "default_portrait_layout": "split_2up_video",
+    "supported_layouts": [
+      "split_2up_video",
+      "triptych_3up_video",
+      "polaroid_stack",
+      "bento_living_grid",
+      "split_diptych_pair",
+      "blurred_bg_pillarbox",
+      "single"
+    ],
+    "gutter_px": 14,
+    "corner_radius_px": 14,
+    "border_px": 6,
+    "polaroid_tilt_deg": 4.0,
+    "pillarbox_dim_alpha": 0.20,
+    "pillarbox_blur_sigma": 22.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "bright_pop_sitcom",
+    "backdrop_blur_sigma": 18.0,
+    "backdrop_dim_alpha": 0.28,
+    "backdrop_zoom_pct": 0.05,
+    "use_roman_numerals": false,
+    "show_divider_rule": false,
+    "show_date_stamp": true,
+    "route_map_skin": "bright_playful",
+    "cast_intro_style": "vision_cutout_outline"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "flash_cut",
+    "allowed": [
+      "cut",
+      "flash_cut",
+      "whip_pan_left",
+      "whip_pan_right",
+      "zoom_punch",
+      "paper_wipe",
+      "dissolve"
+    ],
+    "default_duration_sec": 0.4,
+    "signature_label": "Freeze Cast Intros + Flash Cuts"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 115,
+    "target_bpm_max": 135,
+    "target_bpm_label": "115-135 BPM",
+    "avg_shot_sec_min": 1.1,
+    "avg_shot_sec_max": 2.6,
+    "max_consecutive_photos": 3,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": true,
+    "max_speed_ramp_ratio": 0.10,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 5,
+    "enable_blooper_stinger_default": true,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 3
+  },
+  "audio": {
+    "default_bgm_volume": 0.80,
+    "duck_bgm_db": -15.0,
+    "sonic_postcard_nat_gain_db": 1.5,
+    "default_nat_bed_volume": 0.28,
+    "default_j_cut_sec": 0.5,
+    "default_l_cut_sec": 0.5,
+    "sfx_pack": "sitcom_pop_rewind",
+    "music_genre_hint": "Funky sitcom brass, upbeat feel-good indie pop, or playful acoustic rhythm."
+  }
+}

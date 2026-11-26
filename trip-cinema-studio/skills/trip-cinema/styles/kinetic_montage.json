@@ -1,0 +1,131 @@
+{
+  "style_id": "kinetic_montage",
+  "display_name": "Kinetic Travel Montage",
+  "tagline": "High-energy speed ramps, whip-pans, 3-up vertical triptychs, and bold condensed typography.",
+  "description": "High-contrast modern filmic grade, full-bleed framing, bold condensed uppercase Text-Behind-Subject titles on drops, cubic speed ramps, and directional whip-pans.",
+  "best_for": [
+    "80% video adventure treks and road trips",
+    "Action-heavy mountain and coastal footage",
+    "Festivals and high-energy city montages",
+    "30-second 9:16 vertical teaser reels"
+  ],
+  "vibe_tags": ["kinetic", "high-energy", "speed-ramp", "modern"],
+  "palette": {
+    "bg": "#0B0D10",
+    "surface": "#151921",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A7B2C2",
+    "accent": "#FF5A36",
+    "accent_secondary": "#32D2E8",
+    "border": "#262C38",
+    "swatches": ["#0B0D10", "#FF5A36", "#32D2E8", "#FFFFFF", "#1D2430"]
+  },
+  "typography": {
+    "display_font": "HelveticaNeue-CondensedBlack",
+    "display_css": "'Helvetica Neue', Impact, 'Arial Narrow', sans-serif",
+    "meta_font": "HelveticaNeue-Bold",
+    "meta_css": "'Helvetica Neue', Helvetica, Arial, sans-serif",
+    "accent_font": "Menlo-Bold",
+    "accent_css": "Menlo, monospace",
+    "display_uppercase": true,
+    "meta_uppercase": true,
+    "display_letter_spacing": 0.04,
+    "meta_letter_spacing": 0.16
+  },
+  "color_grade": {
+    "look_id": "moody_teal_orange",
+    "coreimage": {
+      "contrast": 1.14,
+      "saturation": 1.08,
+      "brightness": -0.02,
+      "temperature_target": 6900,
+      "tint_target": -8,
+      "sepia_intensity": 0.0,
+      "exposure_ev": 0.04,
+      "fade_blacks": 0.0
+    },
+    "ffmpeg_vf": "eq=contrast=1.14:saturation=1.08:brightness=-0.02,colorbalance=rs=-0.05:gs=0.01:bs=0.08:rh=0.07:gh=0.02:bh=-0.06"
+  },
+  "textures": {
+    "grain_amount": 0.10,
+    "vignette_intensity": 0.45,
+    "vignette_radius": 1.5,
+    "gate_weave_px": 0.0,
+    "overlay_fps_step": 0,
+    "letterbox_ratio": 2.39,
+    "frame_style": "full_bleed",
+    "halation_amount": 0.04
+  },
+  "layouts": {
+    "default_portrait_layout": "triptych_3up_video",
+    "supported_layouts": [
+      "single",
+      "triptych_3up_video",
+      "split_2up_video",
+      "bento_living_grid",
+      "blurred_bg_pillarbox",
+      "split_diptych_pair"
+    ],
+    "gutter_px": 6,
+    "corner_radius_px": 0,
+    "border_px": 0,
+    "polaroid_tilt_deg": 0.0,
+    "pillarbox_dim_alpha": 0.30,
+    "pillarbox_blur_sigma": 26.0,
+    "allow_multi_video_grids": true
+  },
+  "cards": {
+    "chapter_card_variant": "bold_condensed_kinetic",
+    "backdrop_blur_sigma": 16.0,
+    "backdrop_dim_alpha": 0.42,
+    "backdrop_zoom_pct": 0.08,
+    "use_roman_numerals": false,
+    "show_divider_rule": true,
+    "show_date_stamp": true,
+    "route_map_skin": "high_contrast_kinetic",
+    "cast_intro_style": "vision_cutout_outline"
+  },
+  "transitions": {
+    "default_in_chapter": "cut",
+    "default_between_chapters": "whip_pan_left",
+    "allowed": [
+      "cut",
+      "whip_pan_left",
+      "whip_pan_right",
+      "whip_pan_up",
+      "whip_pan_down",
+      "zoom_punch",
+      "flash_cut",
+      "light_leak",
+      "dissolve"
+    ],
+    "default_duration_sec": 0.4,
+    "signature_label": "Whip-Pans + Speed Ramps + Zoom Punch"
+  },
+  "pacing_rules": {
+    "target_bpm_min": 120,
+    "target_bpm_max": 145,
+    "target_bpm_label": "120-145 BPM",
+    "avg_shot_sec_min": 0.4,
+    "avg_shot_sec_max": 2.4,
+    "max_consecutive_photos": 5,
+    "max_identical_duration_run": 4,
+    "allow_speed_ramps": true,
+    "max_speed_ramp_ratio": 0.20,
+    "prefer_static_frames": false,
+    "wave_fast_burst_max": 6,
+    "enable_blooper_stinger_default": false,
+    "enable_trip_wrapped_default": true,
+    "sonic_postcard_min_count": 2
+  },
+  "audio": {
+    "default_bgm_volume": 0.85,
+    "duck_bgm_db": -13.0,
+    "sonic_postcard_nat_gain_db": 1.0,
+    "default_nat_bed_volume": 0.22,
+    "default_j_cut_sec": 0.5,
+    "default_l_cut_sec": 0.4,
+    "sfx_pack": "whoosh_sub_riser",
+    "music_genre_hint": "Driving electronic, melodic house, or high-energy indie rock with clear build and drop arcs."
+  }
+}

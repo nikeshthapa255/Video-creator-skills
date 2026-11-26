@@ -1,0 +1,313 @@
+#!/usr/bin/env osascript -l JavaScript
+/**
+ * Trip Cinema Studio v0.2.0 — Optional Vision Foreground Mask Pre-Pass (macOS 14+).
+ * Uses Apple Vision.framework (VNGenerateForegroundInstanceMaskRequest + VNImageRequestHandler)
+ * to extract crisp PNG foreground alpha masks (`./work/masks/<shot_id>_mask.png`) for
+ * 2-6 hero `text_behind_subject` or `cast_intro` stills.
+ *
+ * Note: Run outside strict Seatbelt sandboxes (Vision's ANE/IOSurface Mach port requires host
+ * execution). The sandboxed renderer (`macos_render_trip.jxa`) consumes the cached PNG masks
+ * via `CIBlendWithMask` and falls back gracefully when a mask is absent.
+ *
+ * Usage:
+ *   osascript -l JavaScript macos_extract_masks.jxa \
+ *     --edl ./work/edl.json --out-dir ./work/masks [--shots S01,S04] [--feather 1.5] [--dry-run]
+ *
+ *   osascript -l JavaScript macos_extract_masks.jxa \
+ *     --input ./hero.jpg --output ./work/masks/hero_mask.png [--feather 1.5]
+ */
+
+ObjC.import("Foundation");
+ObjC.import("Vision");
+ObjC.import("CoreImage");
+ObjC.import("CoreVideo");
+ObjC.import("CoreGraphics");
+ObjC.import("AppKit");
+ObjC.import("ImageIO");
+
+function parseArgs(argv) {
+  const args = {
+    edl: null,
+    outDir: "./work/masks",
+    shots: null,
+    input: null,
+    output: null,
+    feather: 1.5,
+    dryRun: false,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--edl") args.edl = argv[++i];
+    else if (a === "--out-dir" || a === "-d") args.outDir = argv[++i];
+    else if (a === "--shots") args.shots = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
+    else if (a === "--input" || a === "-i") args.input = argv[++i];
+    else if (a === "--output" || a === "-o") args.output = argv[++i];
+    else if (a === "--feather") args.feather = Math.max(0.0, parseFloat(argv[++i]) || 0.0);
+    else if (a === "--dry-run") args.dryRun = true;
+  }
+  return args;
+}
+
+function ensureDir(dirPath) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dirPath,
+    true,
+    $({}),
+    null
+  );
+}
+
+function ensureParentDir(filePath) {
+  ensureDir(ObjC.unwrap($(filePath).stringByDeletingLastPathComponent));
+}
+
+function readJsonFile(path) {
+  const nsStr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  if (!nsStr) throw new Error("Failed to read JSON: " + path);
+  return JSON.parse(ObjC.unwrap(nsStr));
+}
+
+function sanitizeId(id) {
+  return String(id || "shot").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function loadOrientedCI(filePath) {
+  const url = $.NSURL.fileURLWithPath(filePath);
+  const opts = $.NSMutableDictionary.dictionary;
+  opts.setObjectForKey($.NSNumber.numberWithBool(true), $.kCIImageApplyOrientationProperty);
+  let img = $.CIImage.imageWithContentsOfURLOptions(url, opts);
+  if (!img) throw new Error("Failed to load image: " + filePath);
+  const ext = img.extent;
+  if (ext.origin.x !== 0 || ext.origin.y !== 0) {
+    img = img.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y));
+  }
+  return img;
+}
+
+function saveCIAsPNG(ciImg, outPath, width, height) {
+  ensureParentDir(outPath);
+  const rect = $.CGRectMake(0, 0, width, height);
+  const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(width, height));
+  canvas.lockFocus;
+  const rep = $.NSCIImageRep.imageRepWithCIImage(ciImg.imageByCroppingToRect(rect));
+  rep.drawInRect($.NSMakeRect(0, 0, width, height));
+  canvas.unlockFocus;
+  const bm = $.NSBitmapImageRep.imageRepWithData(canvas.TIFFRepresentation);
+  const pngData = bm.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  if (!pngData || !pngData.writeToFileAtomically(outPath, true)) {
+    throw new Error("Failed to write PNG mask: " + outPath);
+  }
+}
+
+function estimateMaskCoverage(maskCI, width, height) {
+  // Use CIAreaAverage to measure fraction of foreground pixels in O(1) on GPU
+  try {
+    const avg = $.CIFilter.filterWithName("CIAreaAverage");
+    if (!avg) return null;
+    avg.setValueForKey(maskCI, "inputImage");
+    avg.setValueForKey($.CIVector.vectorWithXYZW(0, 0, width, height), "inputExtent");
+    const onePx = avg.outputImage;
+    const canvas = $.NSImage.alloc.initWithSize($.NSMakeSize(1, 1));
+    canvas.lockFocus;
+    $.NSCIImageRep.imageRepWithCIImage(onePx).drawInRect($.NSMakeRect(0, 0, 1, 1));
+    canvas.unlockFocus;
+    const bm = $.NSBitmapImageRep.imageRepWithData(canvas.TIFFRepresentation);
+    const col = bm.colorAtXY(0, 0);
+    if (!col) return null;
+    const rgb = col.colorUsingColorSpace($.NSColorSpace.deviceRGBColorSpace);
+    return rgb ? Number((rgb.redComponent * 100.0).toFixed(1)) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractMaskForImage(inputPath, outputPath, featherRadius) {
+  const fm = $.NSFileManager.defaultManager;
+  if (!fm.fileExistsAtPath(inputPath)) {
+    return { status: "error", input: inputPath, output: outputPath, error: "Input file not found" };
+  }
+
+  const VNReqClass = $.NSClassFromString("VNGenerateForegroundInstanceMaskRequest");
+  const VNHandlerClass = $.NSClassFromString("VNImageRequestHandler");
+  if (!VNReqClass || !VNHandlerClass) {
+    return {
+      status: "error",
+      input: inputPath,
+      output: outputPath,
+      error: "Vision VNGenerateForegroundInstanceMaskRequest requires macOS 14+.",
+    };
+  }
+
+  try {
+    const srcCI = loadOrientedCI(inputPath);
+    const w = Math.max(1, Math.round(srcCI.extent.size.width));
+    const h = Math.max(1, Math.round(srcCI.extent.size.height));
+
+    const handler = VNHandlerClass.alloc.initWithCIImageOptions(srcCI, $({}));
+    const req = VNReqClass.alloc.init;
+    const errRef = Ref();
+    const ok = handler.performRequestsError($([req]), errRef);
+    if (!ok) {
+      const msg = errRef[0] ? ObjC.unwrap(errRef[0].localizedDescription) : "Vision request failed";
+      const sandboxDenied = /IOSurface|Mach|10000003|sandbox|ANE|espresso/i.test(msg);
+      return {
+        status: "error",
+        input: inputPath,
+        output: outputPath,
+        sandbox_vision_denied: sandboxDenied,
+        error: msg,
+        fallback_note: "Run macos_extract_masks.jxa outside Seatbelt sandbox, or render without mask_path (graceful editorial/Polaroid fallback).",
+      };
+    }
+
+    const results = req.results;
+    if (!results || Number(results.count) === 0) {
+      return {
+        status: "no_subject",
+        input: inputPath,
+        output: outputPath,
+        error: "No salient foreground subject detected.",
+      };
+    }
+
+    const obs = results.firstObject;
+    const maskErrRef = Ref();
+    const maskPB = obs.generateScaledMaskForImageForInstancesFromRequestHandlerError(
+      obs.allInstances,
+      handler,
+      maskErrRef
+    );
+    if (!maskPB) {
+      const msg = maskErrRef[0] ? ObjC.unwrap(maskErrRef[0].localizedDescription) : "Mask generation returned nil";
+      return { status: "error", input: inputPath, output: outputPath, error: msg };
+    }
+
+    let maskCI = $.CIImage.imageWithCVImageBuffer(maskPB);
+    const mExt = maskCI.extent;
+    if (mExt.origin.x !== 0 || mExt.origin.y !== 0) {
+      maskCI = maskCI.imageByApplyingTransform($.CGAffineTransformMakeTranslation(-mExt.origin.x, -mExt.origin.y));
+    }
+    if (Math.abs(mExt.size.width - w) > 1 || Math.abs(mExt.size.height - h) > 1) {
+      maskCI = maskCI.imageByApplyingTransform(
+        $.CGAffineTransformMakeScale(w / Math.max(1, mExt.size.width), h / Math.max(1, mExt.size.height))
+      );
+    }
+
+    if (featherRadius > 0.1) {
+      const blur = $.CIFilter.filterWithName("CIGaussianBlur");
+      if (blur) {
+        blur.setValueForKey(maskCI.imageByClampingToExtent, "inputImage");
+        blur.setValueForKey(featherRadius, "inputRadius");
+        maskCI = blur.outputImage.imageByCroppingToRect($.CGRectMake(0, 0, w, h));
+      }
+    }
+
+    const coveragePct = estimateMaskCoverage(maskCI, w, h);
+    saveCIAsPNG(maskCI, outputPath, w, h);
+    try {
+      $.CVPixelBufferRelease(maskPB);
+    } catch (e) {
+      // Ignore if ARC-managed
+    }
+
+    const res = {
+      status: "extracted",
+      input: inputPath,
+      output: outputPath,
+      width: w,
+      height: h,
+      coverage_pct: coveragePct,
+    };
+    if (coveragePct !== null && (coveragePct < 15.0 || coveragePct > 65.0)) {
+      res.coverage_warning = "Subject mask covers " + coveragePct + "% of frame (recommended 15%-65% for text_behind_subject).";
+    }
+    return res;
+  } catch (e) {
+    const msg = String(e.message || e);
+    return {
+      status: "error",
+      input: inputPath,
+      output: outputPath,
+      sandbox_vision_denied: /IOSurface|Mach|10000003|sandbox|ANE/i.test(msg),
+      error: msg,
+    };
+  }
+}
+
+function collectTargetsFromEdl(edlPath, outDir, shotFilter) {
+  const edl = readJsonFile(edlPath);
+  const shots = edl.shots || [];
+  const filterSet = shotFilter ? new Set(shotFilter) : null;
+  const targets = [];
+
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i];
+    const sid = s.shot_id || ("S" + String(i + 1).padStart(2, "0"));
+    const gType = String(s.graphic_type || "").toLowerCase();
+    const isHeroMaskCard = s.media_type === "graphic" && (gType === "text_behind_subject" || gType === "cast_intro");
+    const explicitlyRequested = filterSet && filterSet.has(sid);
+
+    if (!explicitlyRequested && (filterSet || !isHeroMaskCard)) continue;
+    const src = s.source_path || s.backdrop_path;
+    if (!src) continue;
+    const outPath = s.mask_path || (outDir.replace(/\/+$/, "") + "/" + sanitizeId(sid) + "_mask.png");
+    targets.push({
+      shot_id: sid,
+      graphic_type: gType || s.media_type,
+      input: src,
+      output: outPath,
+    });
+  }
+  return targets;
+}
+
+function run(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    return JSON.stringify({
+      usage: "osascript -l JavaScript macos_extract_masks.jxa (--edl ./work/edl.json --out-dir ./work/masks [--shots S01,S04] | --input hero.jpg --output mask.png) [--feather 1.5] [--dry-run]",
+      framework: "Apple Vision.framework (VNGenerateForegroundInstanceMaskRequest)",
+    }, null, 2);
+  }
+
+  let targets = [];
+  if (args.input) {
+    const out = args.output || (args.outDir.replace(/\/+$/, "") + "/mask.png");
+    targets.push({ shot_id: "single", graphic_type: "manual", input: args.input, output: out });
+  } else if (args.edl) {
+    targets = collectTargetsFromEdl(args.edl, args.outDir, args.shots);
+  } else {
+    throw new Error("Provide either --edl <edl.json> or --input <image>.");
+  }
+
+  if (args.dryRun) {
+    return JSON.stringify({
+      status: "dry_run",
+      tool: "macos-vision-mask-extractor",
+      vision_available: Boolean($.NSClassFromString("VNGenerateForegroundInstanceMaskRequest")),
+      feather_px: args.feather,
+      target_count: targets.length,
+      targets: targets,
+    }, null, 2);
+  }
+
+  ensureDir(args.outDir);
+  const results = [];
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    const r = extractMaskForImage(t.input, t.output, args.feather);
+    r.shot_id = t.shot_id;
+    r.graphic_type = t.graphic_type;
+    results.push(r);
+  }
+
+  return JSON.stringify({
+    status: "completed",
+    tool: "macos-vision-mask-extractor",
+    processed: results.length,
+    extracted: results.filter((r) => r.status === "extracted").length,
+    results: results,
+  }, null, 2);
+}

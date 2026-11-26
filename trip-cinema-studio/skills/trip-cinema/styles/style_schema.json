@@ -1,0 +1,434 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trip-cinema-studio.local/schemas/style-pack.schema.json",
+  "title": "Trip Cinema Studio Declarative Style Pack Schema",
+  "description": "Declarative visual, typography, color grade, texture, layout, graphic card, transition, pacing, and audio specification for Trip Cinema Studio v0.2.0.",
+  "type": "object",
+  "required": [
+    "style_id",
+    "display_name",
+    "tagline",
+    "best_for",
+    "palette",
+    "typography",
+    "color_grade",
+    "textures",
+    "layouts",
+    "cards",
+    "transitions",
+    "pacing_rules",
+    "audio"
+  ],
+  "properties": {
+    "style_id": {
+      "type": "string",
+      "enum": [
+        "cinema_doc",
+        "analog_scrapbook",
+        "wes_postcard",
+        "kinetic_montage",
+        "editorial_bento",
+        "super8_nostalgia",
+        "sitcom_cast"
+      ]
+    },
+    "display_name": { "type": "string" },
+    "tagline": { "type": "string" },
+    "description": { "type": "string" },
+    "best_for": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "vibe_tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "palette": {
+      "type": "object",
+      "required": [
+        "bg",
+        "surface",
+        "text_primary",
+        "text_secondary",
+        "accent",
+        "accent_secondary",
+        "border",
+        "swatches"
+      ],
+      "properties": {
+        "bg": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "surface": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "text_primary": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "text_secondary": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "accent": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "accent_secondary": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "border": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "swatches": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 6,
+          "items": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+        },
+        "alt_subpalette": {
+          "type": "object",
+          "description": "Optional alternate sub-palette (e.g. Darjeeling 70s for wes_postcard).",
+          "properties": {
+            "name": { "type": "string" },
+            "swatches": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+            }
+          }
+        }
+      }
+    },
+    "typography": {
+      "type": "object",
+      "required": [
+        "display_font",
+        "display_css",
+        "meta_font",
+        "meta_css",
+        "accent_font",
+        "accent_css",
+        "display_uppercase",
+        "meta_uppercase",
+        "display_letter_spacing",
+        "meta_letter_spacing"
+      ],
+      "properties": {
+        "display_font": { "type": "string", "description": "Verified macOS PostScript font name for AppKit/CoreGraphics." },
+        "display_css": { "type": "string", "description": "CSS font-family stack for Remotion and HTML outputs." },
+        "meta_font": { "type": "string", "description": "Verified macOS PostScript font name for dates, EXIF badges, and eyebrows." },
+        "meta_css": { "type": "string" },
+        "accent_font": { "type": "string", "description": "Verified macOS PostScript font name for captions, subtitles, or callouts." },
+        "accent_css": { "type": "string" },
+        "display_uppercase": { "type": "boolean" },
+        "meta_uppercase": { "type": "boolean" },
+        "display_letter_spacing": { "type": "number" },
+        "meta_letter_spacing": { "type": "number" }
+      }
+    },
+    "color_grade": {
+      "type": "object",
+      "required": ["look_id", "coreimage", "ffmpeg_vf"],
+      "properties": {
+        "look_id": { "type": "string" },
+        "coreimage": {
+          "type": "object",
+          "required": [
+            "contrast",
+            "saturation",
+            "brightness",
+            "temperature_target",
+            "tint_target",
+            "sepia_intensity",
+            "exposure_ev",
+            "fade_blacks"
+          ],
+          "properties": {
+            "contrast": { "type": "number", "minimum": 0.5, "maximum": 2.0 },
+            "saturation": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
+            "brightness": { "type": "number", "minimum": -0.5, "maximum": 0.5 },
+            "temperature_target": { "type": "number", "minimum": 3500, "maximum": 9500 },
+            "tint_target": { "type": "number", "minimum": -50, "maximum": 50 },
+            "sepia_intensity": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "exposure_ev": { "type": "number", "minimum": -1.5, "maximum": 1.5 },
+            "fade_blacks": { "type": "number", "minimum": 0.0, "maximum": 0.25 }
+          }
+        },
+        "ffmpeg_vf": {
+          "type": "string",
+          "description": "FFmpeg video filter chain implementing this style's color grade."
+        }
+      }
+    },
+    "textures": {
+      "type": "object",
+      "required": [
+        "grain_amount",
+        "vignette_intensity",
+        "vignette_radius",
+        "gate_weave_px",
+        "overlay_fps_step",
+        "letterbox_ratio",
+        "frame_style"
+      ],
+      "properties": {
+        "grain_amount": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "vignette_intensity": { "type": "number", "minimum": 0.0, "maximum": 2.5 },
+        "vignette_radius": { "type": "number", "minimum": 0.5, "maximum": 3.0 },
+        "gate_weave_px": { "type": "number", "minimum": 0.0, "maximum": 8.0 },
+        "overlay_fps_step": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30,
+          "description": "0 for smooth native FPS; 8, 12, or 18 for stepped stop-motion / Super 8 overlay cadence."
+        },
+        "letterbox_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2.76,
+          "description": "0 for full 16:9 frame; e.g. 2.35 or 2.39 for anamorphic matte bars."
+        },
+        "frame_style": {
+          "type": "string",
+          "enum": [
+            "editorial_clean",
+            "polaroid_scrapbook",
+            "postcard_matte",
+            "full_bleed",
+            "bento_hairline",
+            "super8_overscan",
+            "pop_sticker"
+          ]
+        },
+        "halation_amount": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0 }
+      }
+    },
+    "layouts": {
+      "type": "object",
+      "required": [
+        "default_portrait_layout",
+        "supported_layouts",
+        "gutter_px",
+        "corner_radius_px",
+        "border_px",
+        "polaroid_tilt_deg",
+        "pillarbox_dim_alpha",
+        "pillarbox_blur_sigma",
+        "allow_multi_video_grids"
+      ],
+      "properties": {
+        "default_portrait_layout": {
+          "type": "string",
+          "enum": [
+            "single",
+            "split_diptych_pair",
+            "blurred_bg_pillarbox",
+            "split_2up_video",
+            "triptych_3up_video",
+            "bento_living_grid",
+            "polaroid_stack",
+            "super8_frame"
+          ]
+        },
+        "supported_layouts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "single",
+              "split_diptych_pair",
+              "blurred_bg_pillarbox",
+              "split_2up_video",
+              "triptych_3up_video",
+              "bento_living_grid",
+              "polaroid_stack",
+              "super8_frame"
+            ]
+          }
+        },
+        "gutter_px": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "corner_radius_px": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "border_px": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "polaroid_tilt_deg": { "type": "number", "minimum": 0.0, "maximum": 12.0 },
+        "pillarbox_dim_alpha": { "type": "number", "minimum": 0.0, "maximum": 0.85 },
+        "pillarbox_blur_sigma": { "type": "number", "minimum": 4.0, "maximum": 60.0 },
+        "allow_multi_video_grids": { "type": "boolean" }
+      }
+    },
+    "cards": {
+      "type": "object",
+      "required": [
+        "chapter_card_variant",
+        "backdrop_blur_sigma",
+        "backdrop_dim_alpha",
+        "backdrop_zoom_pct",
+        "use_roman_numerals",
+        "show_divider_rule",
+        "show_date_stamp",
+        "route_map_skin",
+        "cast_intro_style"
+      ],
+      "properties": {
+        "chapter_card_variant": {
+          "type": "string",
+          "enum": [
+            "editorial_gold_serif",
+            "kraft_stamp_typewriter",
+            "pastel_futura_roman",
+            "bold_condensed_kinetic",
+            "swiss_linen_minimal",
+            "vintage_super8_date",
+            "bright_pop_sitcom"
+          ]
+        },
+        "backdrop_blur_sigma": { "type": "number", "minimum": 0, "maximum": 60 },
+        "backdrop_dim_alpha": { "type": "number", "minimum": 0.0, "maximum": 0.85 },
+        "backdrop_zoom_pct": { "type": "number", "minimum": 0.0, "maximum": 0.25 },
+        "use_roman_numerals": { "type": "boolean" },
+        "show_divider_rule": { "type": "boolean" },
+        "show_date_stamp": { "type": "boolean" },
+        "route_map_skin": {
+          "type": "string",
+          "enum": [
+            "dark_topo",
+            "parchment_ink",
+            "pastel_atlas",
+            "high_contrast_kinetic",
+            "linen_minimal",
+            "vintage_sepia",
+            "bright_playful"
+          ]
+        },
+        "cast_intro_style": {
+          "type": "string",
+          "enum": [
+            "editorial_frame",
+            "polaroid_frame",
+            "postcard_badge",
+            "vision_cutout_outline"
+          ]
+        }
+      }
+    },
+    "transitions": {
+      "type": "object",
+      "required": [
+        "default_in_chapter",
+        "default_between_chapters",
+        "allowed",
+        "default_duration_sec",
+        "signature_label"
+      ],
+      "properties": {
+        "default_in_chapter": {
+          "type": "string",
+          "enum": [
+            "cut",
+            "dissolve",
+            "whip_pan_left",
+            "whip_pan_right",
+            "whip_pan_up",
+            "whip_pan_down",
+            "light_leak",
+            "film_burn",
+            "flash_cut",
+            "zoom_punch",
+            "paper_wipe"
+          ]
+        },
+        "default_between_chapters": {
+          "type": "string",
+          "enum": [
+            "cut",
+            "dissolve",
+            "whip_pan_left",
+            "whip_pan_right",
+            "whip_pan_up",
+            "whip_pan_down",
+            "light_leak",
+            "film_burn",
+            "flash_cut",
+            "zoom_punch",
+            "paper_wipe"
+          ]
+        },
+        "allowed": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "cut",
+              "dissolve",
+              "whip_pan_left",
+              "whip_pan_right",
+              "whip_pan_up",
+              "whip_pan_down",
+              "light_leak",
+              "film_burn",
+              "flash_cut",
+              "zoom_punch",
+              "paper_wipe"
+            ]
+          }
+        },
+        "default_duration_sec": { "type": "number", "minimum": 0.15, "maximum": 1.2 },
+        "signature_label": { "type": "string" }
+      }
+    },
+    "pacing_rules": {
+      "type": "object",
+      "required": [
+        "target_bpm_min",
+        "target_bpm_max",
+        "target_bpm_label",
+        "avg_shot_sec_min",
+        "avg_shot_sec_max",
+        "max_consecutive_photos",
+        "max_identical_duration_run",
+        "allow_speed_ramps",
+        "max_speed_ramp_ratio",
+        "prefer_static_frames",
+        "wave_fast_burst_max",
+        "enable_blooper_stinger_default",
+        "enable_trip_wrapped_default",
+        "sonic_postcard_min_count"
+      ],
+      "properties": {
+        "target_bpm_min": { "type": "integer", "minimum": 50, "maximum": 200 },
+        "target_bpm_max": { "type": "integer", "minimum": 50, "maximum": 220 },
+        "target_bpm_label": { "type": "string" },
+        "avg_shot_sec_min": { "type": "number", "minimum": 0.2, "maximum": 10.0 },
+        "avg_shot_sec_max": { "type": "number", "minimum": 0.4, "maximum": 15.0 },
+        "max_consecutive_photos": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "max_identical_duration_run": { "type": "integer", "minimum": 2, "maximum": 10 },
+        "allow_speed_ramps": { "type": "boolean" },
+        "max_speed_ramp_ratio": { "type": "number", "minimum": 0.0, "maximum": 0.35 },
+        "prefer_static_frames": { "type": "boolean" },
+        "wave_fast_burst_max": { "type": "integer", "minimum": 2, "maximum": 10 },
+        "enable_blooper_stinger_default": { "type": "boolean" },
+        "enable_trip_wrapped_default": { "type": "boolean" },
+        "sonic_postcard_min_count": { "type": "integer", "minimum": 0, "maximum": 8 }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "required": [
+        "default_bgm_volume",
+        "duck_bgm_db",
+        "sonic_postcard_nat_gain_db",
+        "default_nat_bed_volume",
+        "default_j_cut_sec",
+        "default_l_cut_sec",
+        "sfx_pack",
+        "music_genre_hint"
+      ],
+      "properties": {
+        "default_bgm_volume": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "duck_bgm_db": { "type": "number", "minimum": -30.0, "maximum": 0.0 },
+        "sonic_postcard_nat_gain_db": { "type": "number", "minimum": -6.0, "maximum": 6.0 },
+        "default_nat_bed_volume": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "default_j_cut_sec": { "type": "number", "minimum": 0.0, "maximum": 3.0 },
+        "default_l_cut_sec": { "type": "number", "minimum": 0.0, "maximum": 3.0 },
+        "sfx_pack": {
+          "type": "string",
+          "enum": [
+            "ambient_foley",
+            "paper_polaroid",
+            "typewriter_bell",
+            "whoosh_sub_riser",
+            "minimal_click",
+            "projector_reel",
+            "sitcom_pop_rewind"
+          ]
+        },
+        "music_genre_hint": { "type": "string" }
+      }
+    }
+  }
+}

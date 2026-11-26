@@ -60,20 +60,10 @@ function ensureDir(dirPath) {
 
 function loadOrientedCIImage(filePath) {
   const url = $.NSURL.fileURLWithPath(filePath);
-  const src = $.CGImageSourceCreateWithURL(url, null);
-  let orient = 1;
-  if (src) {
-    const props = $.CGImageSourceCopyPropertiesAtIndex(src, 0, null);
-    if (props) {
-      const oVal = ObjC.unwrap(props)["Orientation"];
-      if (oVal) orient = Number(oVal);
-    }
-  }
-  let img = $.CIImage.imageWithContentsOfURL(url);
+  const opts = $.NSMutableDictionary.dictionary;
+  opts.setObjectForKey($.NSNumber.numberWithBool(true), $.kCIImageApplyOrientationProperty);
+  let img = $.CIImage.imageWithContentsOfURLOptions(url, opts);
   if (!img) throw new Error("Failed to load image: " + filePath);
-  if (orient > 1) {
-    img = img.imageByApplyingCGOrientation(orient);
-  }
   // Normalize origin to (0, 0)
   const ext = img.extent;
   if (ext.origin.x !== 0 || ext.origin.y !== 0) {
@@ -158,10 +148,9 @@ function saveCIImageAsJPEG(ciCtx, ciImg, width, height, outPath, labelText) {
     const nsImg = $.NSImage.alloc.initWithSize($.NSMakeSize(width, height));
     nsImg.addRepresentation(rep);
     nsImg.lockFocus;
-    const attrs = $({
-      NSFont: $.NSFont.systemFontOfSizeWeight(18, $.NSFontWeightSemibold),
-      NSForegroundColorAttributeName: $.NSColor.whiteColor,
-    });
+    const attrs = $.NSMutableDictionary.dictionary;
+    attrs.setObjectForKey($.NSFont.systemFontOfSizeWeight(18, $.NSFontWeightSemibold), $.NSFontAttributeName);
+    attrs.setObjectForKey($.NSColor.whiteColor, $.NSForegroundColorAttributeName);
     const textSize = $(labelText).sizeWithAttributes(attrs);
     $.NSColor.colorWithCalibratedRedGreenBlueAlpha(0.05, 0.05, 0.07, 0.88).setFill;
     $.NSBezierPath.fillRect($.NSMakeRect(16, height - 54, Math.max(220, textSize.width + 28), 36));
