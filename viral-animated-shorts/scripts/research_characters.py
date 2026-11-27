@@ -420,17 +420,39 @@ def query_wikipedia_entity(
             else None
         ),
         "signature_features": [
-            f"verified likeness from reference image ({canonical_name})"
+            f"downloaded portrait pending visual inspection ({canonical_name})"
             if local_ref_path
             else f"identity verified via Wikipedia ({canonical_name}); reference portrait needed",
             role_text,
         ],
         "reference_image_path": local_ref_path,
         "reference_image_url": thumb_url,
-        "likeness_verified": bool(local_ref_path),
+        "reference_downloaded": bool(local_ref_path),
+        "likeness_verified": False,
+        "needs_visual_inspection": bool(local_ref_path),
         "needs_manual_reference": not bool(local_ref_path),
         "no_held_props_confirmed": True,
     }
+
+
+BOILERPLATE_TRAIT_MARKERS = (
+    "matching facial features, hairstyle, eyewear, and signature attire in the verified reference portrait",
+    "matching exact silhouette, proportions, and colors in the verified reference image",
+    "obtain and visually inspect",
+    "match exact appearance, silhouette, colors, and details in user-supplied reference image",
+    "pending stage 0 visual reference inspection",
+)
+
+
+def is_boilerplate_visual_traits(traits: str) -> bool:
+    """Return True if visual_traits is empty or still auto-generated boilerplate instead of inspected traits."""
+    cleaned = (traits or "").strip()
+    if not cleaned:
+        return True
+    low = cleaned.lower()
+    if low.startswith("unverified:"):
+        return True
+    return any(marker in low for marker in BOILERPLATE_TRAIT_MARKERS)
 
 
 def parse_user_ref_arg(raw_spec: str) -> Tuple[str, str, str]:
@@ -469,7 +491,9 @@ def make_unverified_placeholder(name: str) -> Dict[str, Any]:
         "signature_features": [],
         "reference_image_path": "",
         "reference_image_url": "",
+        "reference_downloaded": False,
         "likeness_verified": False,
+        "needs_visual_inspection": False,
         "needs_manual_reference": True,
         "stage0_action_required": f"Search web or supply official image via --user-ref {char_id}=<path> and visually inspect before generating turnaround sheet.",
         "no_held_props_confirmed": True,
@@ -543,20 +567,31 @@ def research_characters(
         nonlocal registry_dirty
         ref_p = str(entry.get("reference_image_path", "")).strip()
         ref_url = str(entry.get("reference_image_url", "")).strip()
-        if ref_p and Path(ref_p).exists():
-            entry["likeness_verified"] = True
-            entry["needs_manual_reference"] = False
-            return
-        if allow_web and ref_url:
+        has_local = bool(ref_p and Path(ref_p).exists())
+
+        if not has_local and allow_web and ref_url:
             dl = _download_image(ref_url, ref_dir / f"{cid}_ref")
             if dl:
-                entry["reference_image_path"] = str(dl)
-                entry["likeness_verified"] = True
-                entry["needs_manual_reference"] = False
+                ref_p = str(dl)
+                entry["reference_image_path"] = ref_p
+                has_local = True
                 if cid in reg_chars:
-                    reg_chars[cid]["reference_image_path"] = str(dl)
-                    reg_chars[cid]["likeness_verified"] = True
-                    reg_chars[cid]["needs_manual_reference"] = False
+                    reg_chars[cid]["reference_image_path"] = ref_p
+                    registry_dirty = True
+
+        has_real_traits = not is_boilerplate_visual_traits(str(entry.get("visual_traits") or ""))
+        verified_ok = bool(entry.get("likeness_verified", False)) and has_local and has_real_traits
+        needs_inspect = has_local and not verified_ok
+
+        entry["reference_downloaded"] = has_local
+        entry["likeness_verified"] = verified_ok
+        entry["needs_visual_inspection"] = needs_inspect
+        entry["needs_manual_reference"] = not has_local
+
+        if cid in reg_chars:
+            for k in ("reference_downloaded", "likeness_verified", "needs_visual_inspection", "needs_manual_reference"):
+                if reg_chars[cid].get(k) != entry[k]:
+                    reg_chars[cid][k] = entry[k]
                     registry_dirty = True
 
     def add_from_registry(cid: str, source: str) -> None:
@@ -624,7 +659,11 @@ def research_characters(
         entry.setdefault("signature_features", [f"user-supplied official reference ({entry['name']})"])
         entry["reference_image_path"] = final_img_path
         entry.setdefault("reference_image_url", "")
-        entry["likeness_verified"] = exists_on_disk
+        has_real_traits = not is_boilerplate_visual_traits(str(entry.get("visual_traits") or ""))
+        verified_ok = exists_on_disk and has_real_traits and bool(entry.get("likeness_verified", False))
+        entry["reference_downloaded"] = exists_on_disk
+        entry["likeness_verified"] = verified_ok
+        entry["needs_visual_inspection"] = exists_on_disk and not verified_ok
         entry["needs_manual_reference"] = not exists_on_disk
         entry["no_held_props_confirmed"] = True
         entry.pop("stage0_action_required", None)
@@ -671,7 +710,7 @@ def research_characters(
                 registry_dirty = True
                 newly_discovered.append(cid)
                 print(
-                    f"[CharacterResearch] Verified via Wikipedia: {discovered['name']} "
+                    f"[CharacterResearch] Downloaded via Wikipedia (pending visual inspection): {discovered['name']} "
                     f"({discovered['entity_type']}) -> ref={discovered.get('reference_image_path') or 'none'}",
                     file=sys.stderr,
                 )
@@ -732,7 +771,7 @@ def research_characters(
                         registry_dirty = True
                         newly_discovered.append(cid)
                         print(
-                            f"[CharacterResearch] Discovered from story prose via Wikipedia: "
+                            f"[CharacterResearch] Discovered from story prose via Wikipedia (pending inspection): "
                             f"{discovered['name']} ({discovered['role']}) -> ref={discovered.get('reference_image_path') or 'none'}",
                             file=sys.stderr,
                         )
@@ -745,17 +784,20 @@ def research_characters(
     all_characters = list(matched.values())
     ref_paths: Dict[str, str] = {}
     unverified_entities: List[str] = []
+    uninspected_entities: List[str] = []
     for ch in all_characters:
         rp = str(ch.get("reference_image_path", "")).strip()
         if rp and Path(rp).exists():
             ref_paths[ch["id"]] = rp
         if not ch.get("likeness_verified", False):
             unverified_entities.append(ch["id"])
+        if ch.get("needs_visual_inspection", False):
+            uninspected_entities.append(ch["id"])
 
     shot_assignments = assign_characters_to_shots(story, all_characters) if story else {}
 
     result: Dict[str, Any] = {
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "researched_utc": utc_now_iso(),
         "slug": str(story.get("slug", "cli-entities")) if story else "cli-entities",
         "title": str(story.get("title", "")) if story else "",
@@ -765,6 +807,7 @@ def research_characters(
         "characters": all_characters,
         "reference_image_paths": ref_paths,
         "unverified_entities": unverified_entities,
+        "uninspected_entities": uninspected_entities,
         "newly_discovered_from_web": newly_discovered,
         "shot_character_assignments": shot_assignments,
     }
@@ -774,12 +817,87 @@ def research_characters(
         out_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(
             f"[CharacterResearch] Saved {out_path} "
-            f"(characters={len(all_characters)}, verified_refs={len(ref_paths)}, "
-            f"unverified={len(unverified_entities)}, new_web={len(newly_discovered)})",
+            f"(characters={len(all_characters)}, downloaded_refs={len(ref_paths)}, "
+            f"uninspected={len(uninspected_entities)}, unverified={len(unverified_entities)}, "
+            f"new_web={len(newly_discovered)})",
             file=sys.stderr,
         )
 
     return result
+
+
+def verify_character_in_registry(
+    registry_path: Path,
+    ref_dir: Path,
+    entity_query: str,
+    traits: str,
+    attire: str = "",
+    out_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Record visually inspected observable traits and lock likeness_verified=True in the registry."""
+    cleaned_traits = (traits or "").strip()
+    if is_boilerplate_visual_traits(cleaned_traits):
+        raise ValueError(
+            "--traits must describe concrete observable traits from inspecting the portrait (not empty or boilerplate)."
+        )
+
+    registry = load_registry(registry_path, ref_dir)
+    reg_chars: Dict[str, Dict[str, Any]] = registry.setdefault("characters", {})
+    target_id = find_in_registry(entity_query, reg_chars)
+    if not target_id:
+        raise ValueError(
+            f"Entity '{entity_query}' not found in registry {registry_path}. Run Stage 0 research first."
+        )
+
+    entry = dict(reg_chars[target_id])
+    ref_p = str(entry.get("reference_image_path", "")).strip()
+    has_local = bool(ref_p and Path(ref_p).exists())
+
+    entry["visual_traits"] = cleaned_traits
+    if attire.strip():
+        entry["attire"] = attire.strip()
+    entry["reference_downloaded"] = has_local
+    entry["likeness_verified"] = True
+    entry["needs_visual_inspection"] = False
+    entry["needs_manual_reference"] = not has_local
+    entry["likeness_verified_utc"] = utc_now_iso()
+    entry.pop("stage0_action_required", None)
+
+    reg_chars[target_id] = entry
+    save_registry(registry, registry_path)
+    print(
+        f"[CharacterResearch] Verified likeness for '{target_id}' in {registry_path} "
+        f"(reference_downloaded={has_local}, likeness_verified=True)",
+        file=sys.stderr,
+    )
+
+    # Also update an existing character_references.json in place when --out is provided
+    if out_path is not None and out_path.exists():
+        ref_doc = json.loads(out_path.read_text(encoding="utf-8"))
+        if isinstance(ref_doc, dict) and isinstance(ref_doc.get("characters"), list):
+            for idx, ch in enumerate(ref_doc["characters"]):
+                if isinstance(ch, dict) and ch.get("id") == target_id:
+                    merged = dict(ch)
+                    merged.update({
+                        "visual_traits": entry["visual_traits"],
+                        "attire": entry.get("attire", merged.get("attire", "")),
+                        "reference_downloaded": entry["reference_downloaded"],
+                        "likeness_verified": True,
+                        "needs_visual_inspection": False,
+                        "needs_manual_reference": entry["needs_manual_reference"],
+                        "likeness_verified_utc": entry["likeness_verified_utc"],
+                    })
+                    ref_doc["characters"][idx] = merged
+            ref_doc["unverified_entities"] = [
+                c["id"] for c in ref_doc["characters"] if not c.get("likeness_verified", False)
+            ]
+            ref_doc["uninspected_entities"] = [
+                c["id"] for c in ref_doc["characters"] if c.get("needs_visual_inspection", False)
+            ]
+            out_path.write_text(json.dumps(ref_doc, indent=2) + "\n", encoding="utf-8")
+            print(f"[CharacterResearch] Synced verified traits into {out_path}", file=sys.stderr)
+
+    return entry
 
 
 def parse_entities_csv(raw: str) -> List[str]:
@@ -830,9 +948,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Copy --user-ref images into --ref-dir so all references live in one directory",
     )
     parser.add_argument(
+        "--verify",
+        default="",
+        metavar="ENTITY_ID",
+        help="Lock likeness_verified=True in --registry for an inspected entity ID or name (requires --traits).",
+    )
+    parser.add_argument(
+        "--traits",
+        default="",
+        help="Observable visual traits recorded after inspecting the Stage 0 portrait (used with --verify).",
+    )
+    parser.add_argument(
+        "--attire",
+        default="",
+        help="Optional observed signature attire to record alongside --traits when running --verify.",
+    )
+    parser.add_argument(
         "--out",
         default="",
-        help="Output path for character_references.json (prints JSON to stdout if omitted)",
+        help="Output path for character_references.json (prints JSON to stdout if omitted; updated in place with --verify if it exists)",
     )
     parser.add_argument(
         "--no-web",
@@ -846,6 +980,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    ref_dir = Path(args.ref_dir)
+    registry_path = Path(args.registry) if args.registry else (ref_dir / "character_registry.json")
+    out_path = Path(args.out) if args.out else None
+
+    if args.verify:
+        if not args.traits.strip():
+            parser.error("--traits is required when using --verify.")
+        try:
+            entry = verify_character_in_registry(
+                registry_path=registry_path,
+                ref_dir=ref_dir,
+                entity_query=args.verify,
+                traits=args.traits,
+                attire=args.attire,
+                out_path=out_path,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(entry, indent=2))
+        return 0
+
     entities = parse_entities_csv(args.entities)
     story: Optional[Dict[str, Any]] = None
     if args.story_json:
@@ -857,11 +1013,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         story = raw.get("selected", raw) if isinstance(raw, dict) else None
 
     if not entities and story is None and not args.user_ref:
-        parser.error("Provide at least one of --entities, --story-json, or --user-ref.")
-
-    ref_dir = Path(args.ref_dir)
-    registry_path = Path(args.registry) if args.registry else (ref_dir / "character_registry.json")
-    out_path = Path(args.out) if args.out else None
+        parser.error("Provide at least one of --entities, --story-json, --user-ref, or --verify.")
 
     try:
         result = research_characters(

@@ -10,9 +10,9 @@ Supports both Shorts (30-55s) and Long-Form Episodes (3-15+ min, 90-150+ shots) 
   - Supports slicing via --start-idx / --end-idx (1-based inclusive), --shot-ids, or --act <N>,
     plus --workers <N> for ThreadPoolExecutor parallelism and --skip-existing for rerolls.
 
-Motion presets (11):
+Motion presets (12):
   whip_zoom, bounce_pop, shake_zoom, zoom_in, zoom_out,
-  pan_left, pan_right, static_drift, slow_dolly_in, tilt_up, tilt_down
+  pan_left, pan_right, static_drift, static_hold, slow_dolly_in, tilt_up, tilt_down
   (Any unrecognized preset emits a warning and safely falls back to zoom_in.)
 
 Focal anchors (7):
@@ -59,6 +59,7 @@ PRESETS = (
     "pan_left",
     "pan_right",
     "static_drift",
+    "static_hold",
     "slow_dolly_in",
     "tilt_up",
     "tilt_down",
@@ -251,6 +252,9 @@ def build_zoompan_expr(
         z = "1.14"
         y = f"(ih-ih/zoom)*({ease})"
         return z, cx, y
+    if motion == "static_hold":
+        # Zero-crop lock (z=1.00) for dense 16:9 data charts and End-Screen slates
+        return "1.00", "0", "0"
     # static_drift
     z = f"1.02+0.03*(on/{denom})"
     return z, cx, cy

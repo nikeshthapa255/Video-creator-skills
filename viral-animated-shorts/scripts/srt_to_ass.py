@@ -9,7 +9,7 @@ Features (v4.0 Fun Kinetic):
   - Aspect-ratio-aware layout (--aspect-ratio 9:16|16:9, default 9:16):
       * 9:16 (PlayRes 1080x1920): 86px bold, Outline=8, Shadow=4.5, MarginV=420,
         max_chars=18, tilt=+/-2.5 deg (100% identical to v3.1/v3.2 Shorts).
-      * 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=96,
+      * 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=116,
         max_chars=36, tilt=0.0 deg (horizontal subtitle framing).
   - Resets caption chunks cleanly on every SRT cue boundary.
   - Elastic entry overshoot (84% -> 122% -> 100%) + 126% -> 108% keyword pop + optional
@@ -146,7 +146,7 @@ def main() -> int:
         "--margin-v",
         type=int,
         default=None,
-        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V} for 9:16, 96 for 16:9).",
+        help=f"ASS MarginV vertical offset from bottom in px (default: {DEFAULT_MARGIN_V} for 9:16, 116 for 16:9).",
     )
     parser.add_argument(
         "--tilt",

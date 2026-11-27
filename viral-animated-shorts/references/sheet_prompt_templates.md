@@ -2,7 +2,18 @@
 
 Lock character identity as pixels, not text. Always generate a 16:9 3-panel turnaround sheet with neutral lighting, a plain light-gray background, and **zero held props**.
 
-> **Avoid "blank signs" (`LITERAL_BLANK_SIGN`):** Never put `"blank signs"` in image or video prompts. Image models often print the literal text `"BLANK"` or `"ADSPACE AVAILABLE"` on storefronts and vehicles. Write `"unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage"` instead.
+> **Avoid "blank signs" (`LITERAL_BLANK_SIGN`):** Never put `"blank signs"` or `"empty billboards"` in image or video prompts. Image models often print the literal text `"BLANK"` or `"ADSPACE AVAILABLE"` on storefronts and vehicles. Write `"unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage"` instead.
+
+### Text-magnet prop substitution table
+
+Avoid background props that invite image models to hallucinate garbled letters or digits (`TEXT_WARP`). `tts_and_captions_v2.py --lint-plan` flags these props automatically:
+
+| Text-magnet prop (triggers `TEXT_WARP`) | Safe visual substitution |
+| :--- | :--- |
+| Neon signs, storefront signs, billboards | Colored glass light tubes, striped fabric awnings, plain brick or glass facades |
+| Street signs, bus signs, license plates | Bare metal poles, painted road curbs, unadorned vehicle bumpers and grilles |
+| Wall calendars, text clocks, menu boards | Hourglass or sunlit window angle shift, unadorned wooden panels or geometric tiles |
+| News tickers, computer monitors, phone screens | Clean glowing color bars, abstract waveform lines, colored screen glow on the character's face |
 
 ## 1A. 2D stickman-in-3D turnaround sheet
 

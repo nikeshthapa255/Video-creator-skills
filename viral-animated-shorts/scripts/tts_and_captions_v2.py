@@ -25,7 +25,7 @@ Features:
   4. Aspect-Ratio-Aware Fun Kinetic ASS Captions & Clean SRT Export (--export-srt):
      - 9:16 (PlayRes 1080x1920): 86px bold, Outline=8, Shadow=4.5, MarginV=420,
        max_chars=18, tilt=+/-2.5 deg (identical to v3.1/v3.2 Shorts).
-     - 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=96,
+     - 16:9 (PlayRes 1920x1080): 62px bold, Outline=6, Shadow=3.5, MarginV=116,
        max_chars=36, tilt=0.0 deg, plus automatic clean captions.srt export.
      - Semantic keyword palettes: --keyword-color auto (v3.1 neon), --keyword-color palace
        (Imperial Gold / Fiery Crimson-Coral / Pearl Cyan-Jade), custom ASS BGR hex, and
@@ -35,6 +35,7 @@ Features:
 Examples:
   python3 tts_and_captions_v2.py --lint-plan shot_plan.json
   python3 tts_and_captions_v2.py --lint-plan shot_plan.json --strict-slop
+  python3 tts_and_captions_v2.py --lint-metadata packaging.md --strict-slop
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --voice en-US-AvaNeural
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --aspect-ratio 16:9 --export-srt
   python3 tts_and_captions_v2.py --shot-plan shot_plan.json --out-dir audio --keyword-color palace --concurrency 4
@@ -67,7 +68,7 @@ DEFAULT_MAX_CHARS = 18
 DEFAULT_MARGIN_V = 420
 DEFAULT_TILT_DEG = 2.5
 DEFAULT_KEYWORD_COLOR = "auto"
-DEFAULT_SHORT_RATE = "+6%"
+DEFAULT_SHORT_RATE = "+10%"
 DEFAULT_LONG_RATE = "+0%"
 DEFAULT_PITCH = "+0Hz"
 DEFAULT_GAP_SEC = 0.06
@@ -91,7 +92,7 @@ ASPECT_RATIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "play_res_y": 1080,
         "font_size": 62,
         "max_chars": 36,
-        "margin_v": 96,
+        "margin_v": 116,
         "tilt": 0.0,
         "outline": 6,
         "shadow": 3.5,
@@ -278,16 +279,108 @@ NON_NOUN_FOLLOWERS = {
 
 RISKY_ALLCAPS_WORDS = {"US", "IT", "IN", "ON", "OR", "AM"}
 
+COMPACT_CURRENCY_SUFFIX = {
+    "K": "thousand",
+    "M": "million",
+    "B": "billion",
+    "T": "trillion",
+}
+
+COMPARISON_SYMBOL_WORDS = {
+    "<=": "less than or equal to",
+    ">=": "greater than or equal to",
+    "!=": "not equal to",
+    "->": "to",
+    "<": "under",
+    ">": "over",
+    "ω": "omega",
+}
+
+
+def _expand_pronunciation_map(pronunciations: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Build display -> phonetic map, auto-deriving safe plural keys (e.g. NPC -> NPCs) when unmapped."""
+    if not isinstance(pronunciations, dict) or not pronunciations:
+        return {}
+    clean_map: Dict[str, str] = {}
+    for raw_k, raw_v in pronunciations.items():
+        if isinstance(raw_k, str) and isinstance(raw_v, str) and raw_k.strip():
+            clean_map[raw_k] = raw_v
+    if not clean_map:
+        return {}
+    expanded = dict(clean_map)
+    for k, v in clean_map.items():
+        if re.fullmatch(r"[A-Z][A-Z0-9]{1,7}", k) and any(ch.isalpha() for ch in k):
+            plural_k = f"{k}s"
+            if plural_k not in expanded:
+                v_clean = v.strip()
+                if re.search(r"(?:^|\s)[A-Z]$", v_clean):
+                    expanded[plural_k] = f"{v_clean}'s"
+                else:
+                    expanded[plural_k] = f"{v_clean}s"
+    return expanded
+
+
+def _covered_spans(text: str, pronunciations: Optional[Dict[str, str]]) -> List[Tuple[int, int]]:
+    expanded = _expand_pronunciation_map(pronunciations)
+    if not expanded or not text:
+        return []
+    sorted_keys = sorted(expanded.keys(), key=lambda k: (-len(k), k))
+    pat = re.compile(
+        "|".join(r"(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])" for k in sorted_keys)
+    )
+    return [(m.start(), m.end()) for m in pat.finditer(text)]
+
+
+def _span_overlaps(s: int, e: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(s < ce and cs < e for cs, ce in spans)
+
+
+def _span_inside(s: int, e: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(cs <= s and e <= ce for cs, ce in spans)
+
+
+def lint_display_phonetic_leaks(display_text: str) -> List[Dict[str, str]]:
+    """Flag spaced phonetic spellings like 'N P C' or 'A W S' in raw display dialogue_or_vo."""
+    issues: List[Dict[str, str]] = []
+    if not display_text:
+        return issues
+    for m in re.finditer(r"\b((?:[A-Z]\s+){2,}[A-Z])\b", display_text):
+        matched = m.group(1)
+        collapsed = re.sub(r"\s+", "", matched)
+        issues.append({
+            "code": "TTS_MISREAD",
+            "severity": "error",
+            "match": matched,
+            "suggestion": f'{collapsed} (map "{collapsed}": "{matched}" in tts_pronunciations)',
+            "reason": "Spaced phonetic letters in display dialogue_or_vo leak into burned-in captions; keep clean acronyms in dialogue_or_vo and put phonetics in tts_pronunciations or tts_text.",
+        })
+    return issues
+
 
 def lint_narration_text(
     text: str,
     pronunciations: Optional[Dict[str, str]] = None,
+    *,
+    is_tts_text: bool = False,
 ) -> List[Dict[str, str]]:
-    """Detect common neural TTS mispronunciations before synthesis."""
+    """Detect neural TTS mispronunciations and soft pronunciation risks before synthesis."""
     issues: List[Dict[str, str]] = []
+    if not text:
+        return issues
+
+    pron_keys = set(pronunciations.keys()) if isinstance(pronunciations, dict) else set()
+    pron_keys_lower = {k.lower() for k in pron_keys}
+    covered = _covered_spans(text, pronunciations)
+    warned_spans: List[Tuple[int, int]] = []
+
+    # 0. Spaced phonetic leaks in display text (always an error when linting raw display dialogue_or_vo)
+    if not is_tts_text:
+        issues.extend(lint_display_phonetic_leaks(text))
 
     # 1. "$700 PS5 Pro" -> often misread as "seven hundred dollars PS5 Pro"
     for m in re.finditer(r"\$(\d+(?:,\d{3})*)\s+([A-Za-z][A-Za-z0-9-]*)", text):
+        if _span_inside(m.start(), m.end(), covered):
+            continue
         num = m.group(1).replace(",", "")
         noun = m.group(2)
         if noun.lower() in NON_NOUN_FOLLOWERS:
@@ -300,8 +393,24 @@ def lint_narration_text(
             "reason": "Currency before a noun can read as '<amount> dollars <noun>' instead of '<amount>-dollar <noun>'.",
         })
 
+    # 1b. Compact currency like "$10M" or "$1.5T" -> neural TTS often reads "$1.5T" as "one point five T"
+    for m in re.finditer(r"\$(\d+(?:\.\d+)?)([KMBT])\b", text):
+        if m.group(0) in pron_keys or _span_inside(m.start(), m.end(), covered):
+            continue
+        unit_word = COMPACT_CURRENCY_SUFFIX[m.group(2)]
+        issues.append({
+            "code": "TTS_MISREAD",
+            "severity": "error",
+            "match": m.group(0),
+            "suggestion": f"${m.group(1)} {unit_word}",
+            "reason": "Compact currency suffix (K/M/B/T) is often read literally as a letter by neural TTS; write out the magnitude or map it in tts_pronunciations/tts_text.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
     # 2. "no 60 FPS" -> neural TTS often reads "no <digits>" as "number <digits>"
     for m in re.finditer(r"\b(no)\s+(\d{1,3})\b", text, flags=re.IGNORECASE):
+        if _span_inside(m.start(), m.end(), covered):
+            continue
         num = int(m.group(2))
         word_num = int_to_words(num)
         issues.append({
@@ -318,6 +427,8 @@ def lint_narration_text(
         (r"\bvs\.(?=\s)", "versus", "Abbreviation 'vs.' can pause awkwardly."),
     ]:
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            if _span_inside(m.start(), m.end(), covered):
+                continue
             issues.append({
                 "code": "TTS_MISREAD",
                 "severity": "error",
@@ -326,12 +437,26 @@ def lint_narration_text(
                 "reason": desc,
             })
 
-    # 4. Soft warning: risky 2-letter ALL-CAPS English words often read as acronyms/state codes
-    pron_keys = set(pronunciations.keys()) if isinstance(pronunciations, dict) else set()
+    # 4. Soft warning: risky 2-letter ALL-CAPS English words (with clock-time "3 AM" handling)
     for m in re.finditer(r"\b(US|IT|IN|ON|OR|AM)\b", text):
         word = m.group(1)
-        if word in pron_keys:
+        if word in pron_keys or _span_inside(m.start(), m.end(), covered):
             continue
+        if word == "AM":
+            m_clock = re.search(r"\b(\d{1,2}(?::\d{2})?)\s+$", text[: m.start()])
+            if m_clock:
+                clock_str = f"{m_clock.group(1)} AM"
+                if clock_str in pron_keys:
+                    continue
+                issues.append({
+                    "code": "TTS_PRONUNCIATION_WARNING",
+                    "severity": "warning",
+                    "match": clock_str,
+                    "suggestion": 'map "AM": "A M" in tts_pronunciations',
+                    "reason": f"Clock time '{clock_str}' should not be lowercased to 'am'; map '\"AM\": \"A M\"' in tts_pronunciations if TTS reads it as 'am'.",
+                })
+                warned_spans.append((m.start(), m.end()))
+                continue
         issues.append({
             "code": "TTS_ALLCAPS_WARNING",
             "severity": "warning",
@@ -339,6 +464,125 @@ def lint_narration_text(
             "suggestion": word.lower(),
             "reason": f"2-letter ALL-CAPS '{word}' is often read by neural TTS as an acronym or state code; lowercase it unless intentional.",
         })
+        warned_spans.append((m.start(), m.end()))
+
+    # 5. Soft warning: unmapped plural acronyms (e.g. NPCs, GPUs, APIs)
+    for m in re.finditer(r"\b([A-Z]{2,5}s)\b", text):
+        tok = m.group(1)
+        base = tok[:-1]
+        if tok in pron_keys or base in pron_keys or _span_inside(m.start(), m.end(), covered):
+            continue
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{base}" (or "{tok}") in tts_pronunciations',
+            "reason": f"Plural acronym '{tok}' can be slurred or misread by neural TTS; add '{base}' to tts_pronunciations.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 6. Soft warning: possessive acronyms (e.g. MCP's, AWS's)
+    for m in re.finditer(r"\b([A-Z]{2,6}['’]s)\b", text):
+        tok = m.group(1)
+        base = tok[:-2]
+        if tok in pron_keys or base in pron_keys or _span_inside(m.start(), m.end(), covered) or _span_inside(m.start(), m.end() - 2, covered):
+            continue
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{base}" in tts_pronunciations',
+            "reason": f"Possessive acronym '{tok}' can be slurred by neural TTS; add '{base}' to tts_pronunciations.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 7. Soft warning: resolutions and error codes (1080p, 4K, CE-108255-1)
+    for m in re.finditer(r"\b(\d{3,4}[pPkK]|[2468][kK]|[A-Z]{2,4}-\d[\w-]*)\b", text):
+        tok = m.group(1)
+        if tok in pron_keys or _span_inside(m.start(), m.end(), covered) or _span_overlaps(m.start(), m.end(), warned_spans):
+            continue
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{tok}" in tts_pronunciations or spell out in tts_text',
+            "reason": f"Resolution or code '{tok}' can be read unevenly by neural TTS; verify or map in tts_pronunciations.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 8. Soft warning: credit/grade signs (AA-, A+, B-)
+    for m in re.finditer(r"(?<![A-Za-z0-9/+-])([A-F]{1,3}[+-])(?=\s|$|[.,;!?])", text):
+        tok = m.group(1)
+        if tok in pron_keys or _span_inside(m.start(), m.end(), covered) or _span_overlaps(m.start(), m.end(), warned_spans):
+            continue
+        sign_word = "plus" if tok.endswith("+") else "minus"
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{tok}" to "{tok[:-1]} {sign_word}" in tts_pronunciations',
+            "reason": f"Credit or grade sign '{tok}' often drops the '{tok[-1]}' in neural TTS; spell out '{sign_word}' in tts_pronunciations or tts_text.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 9. Soft warning: comparison / math symbols (<=, >=, !=, ->, <, >, ω)
+    for m in re.finditer(r"(<=|>=|!=|->|[<>ω])", text):
+        sym = m.group(1)
+        if sym in pron_keys or _span_inside(m.start(), m.end(), covered):
+            continue
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": sym,
+            "suggestion": COMPARISON_SYMBOL_WORDS.get(sym, "spell out in words"),
+            "reason": f"Symbol '{sym}' is often skipped or misread by neural TTS; write it in words in tts_text.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 10. Soft warning: compact units (750B, 42.4pp, 120tok/s, tok/s)
+    for m in re.finditer(r"(?<!\$)\b(\d+(?:\.\d+)?(?:pp|tok/s|[BMKT])|tok/s)\b", text):
+        tok = m.group(1)
+        if tok in pron_keys or _span_inside(m.start(), m.end(), covered) or _span_overlaps(m.start(), m.end(), warned_spans):
+            continue
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{tok}" in tts_pronunciations or spell out units in tts_text',
+            "reason": f"Compact unit '{tok}' is often read literally as letters by neural TTS; expand in tts_pronunciations or tts_text.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 11. Soft warning: unmapped consonant-cluster acronyms (SDR, HDR, NPC, PSN, FPS, DLC)
+    for m in re.finditer(r"\b([BCDFGHJKLMNPQRSTVWXYZ]{3,5})\b", text):
+        tok = m.group(1)
+        if tok in pron_keys or _span_inside(m.start(), m.end(), covered) or _span_overlaps(m.start(), m.end(), warned_spans):
+            continue
+        spaced = " ".join(tok)
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": f'map "{tok}": "{spaced}" in tts_pronunciations',
+            "reason": f"Consonant-cluster acronym '{tok}' can be garbled by neural TTS; map it in tts_pronunciations.",
+        })
+        warned_spans.append((m.start(), m.end()))
+
+    # 12. Soft warning: "eval" / "evals" -> often misread as "eh-val"
+    for m in re.finditer(r"\b(evals?)\b", text, flags=re.IGNORECASE):
+        tok = m.group(1)
+        low = tok.lower()
+        if low in pron_keys_lower or "eval" in pron_keys_lower or _span_inside(m.start(), m.end(), covered):
+            continue
+        repl = "evaluations" if low.endswith("s") else "evaluation"
+        issues.append({
+            "code": "TTS_PRONUNCIATION_WARNING",
+            "severity": "warning",
+            "match": tok,
+            "suggestion": repl,
+            "reason": f"Neural TTS often mispronounces '{tok}'; use '{repl}' or map it in tts_pronunciations.",
+        })
+        warned_spans.append((m.start(), m.end()))
 
     return issues
 
@@ -350,6 +594,11 @@ def autofix_narration_text(text: str) -> str:
         return f"{m.group(1).replace(',', '')}-dollar {m.group(2)}"
 
     fixed = re.sub(r"\$(\d+(?:,\d{3})*)\s+([A-Za-z][A-Za-z0-9-]*)", _dollar_repl, text)
+    fixed = re.sub(
+        r"\$(\d+(?:\.\d+)?)([KMBT])\b",
+        lambda m: f"${m.group(1)} {COMPACT_CURRENCY_SUFFIX[m.group(2)]}",
+        fixed,
+    )
     fixed = re.sub(
         r"\b(no)\s+(\d{1,3})\b",
         lambda m: f"{m.group(1)} {int_to_words(int(m.group(2)))}",
@@ -461,7 +710,8 @@ SLOP_PATTERNS: List[Tuple[str, re.Pattern, str, bool, bool, bool]] = [
         "colon_reveal",
         re.compile(
             r"\b((?:the\s+(?:best|worst|crazy|wild|scary|funny)\s+part"
-            r"|the\s+(?:secret|catch|twist|truth|reality)"
+            r"|the\s+(?:secret|catch|twist|truth|reality|takeaway)"
+            r"|lesson\s+learned|bottom\s+line"
             r"|one\s+thing\s+is\s+clear|plot\s+twist)\s*:)",
             flags=re.IGNORECASE,
         ),
@@ -584,6 +834,36 @@ DRAMA_SLOP_PATTERNS: List[Tuple[str, re.Pattern, str]] = [
     ),
 ]
 
+METADATA_SLOP_PATTERNS: List[Tuple[str, re.Pattern, str]] = [
+    (
+        "metadata_opener",
+        re.compile(r"(?:^|[.!?\n]\s*|[-*]\s*|\*\*\s*)(imagine(?:\.{3}|…|\s+\w+))", flags=re.IGNORECASE),
+        "Cut recycled 'Imagine...' metadata opener; lead with the concrete fact or hook.",
+    ),
+    (
+        "metadata_opener",
+        re.compile(r"\b(be\s+honest\s*:|honest\s+question\s*:)", flags=re.IGNORECASE),
+        "Cut recycled 'Be honest:' / 'Honest question:' opener; ask the question directly.",
+    ),
+    (
+        "metadata_opener",
+        re.compile(r"\b(wait\s*[—–-]+\s*did\s+you)\b", flags=re.IGNORECASE),
+        "Cut recycled 'Wait-did you...' clickbait opener; state the concrete hook directly.",
+    ),
+]
+
+LITERAL_BLANK_SIGN_RE = re.compile(
+    r"\b((?:blank|empty)\s+(?:signs?|billboards?|awnings?|screens?|posters?))\b",
+    flags=re.IGNORECASE,
+)
+
+TEXT_MAGNET_PROP_RE = re.compile(
+    r"\b(neon\s+signs?|billboards?|calendars?|bus\s+signs?|street\s+signs?|storefront\s+signs?|menu\s+boards?|news\s+tickers?)\b",
+    flags=re.IGNORECASE,
+)
+
+CARTOON_SFX_CUES = {"bonk_boing", "pop", "record_scratch", "siren_chirp"}
+
 
 def _extract_slop_cluster_terms(text: str) -> List[str]:
     terms: List[str] = []
@@ -665,8 +945,138 @@ def lint_slop_text(
     return issues
 
 
+def lint_metadata_text(
+    text: str,
+    field_name: str,
+    *,
+    is_title: bool = False,
+) -> List[Dict[str, str]]:
+    """Lint YouTube titles, descriptions, and pinned comments for AI slop, em-dash spam, and illegal title chars."""
+    if not text or not text.strip():
+        return []
+
+    warnings: List[Dict[str, str]] = []
+    for iss in lint_slop_text(
+        text,
+        is_last_shot=False,
+        skip_loop_checks=True,
+        skip_commentary_patterns=False,
+        check_drama_slop=False,
+    ):
+        warnings.append({
+            "code": "AI_SLOP_SCRIPT",
+            "shot_id": field_name,
+            "category": iss["category"],
+            "match": iss["match"],
+            "hint": iss["hint"],
+        })
+
+    seen_spans: List[Tuple[int, int]] = []
+    for category, pattern, hint in METADATA_SLOP_PATTERNS:
+        for m in pattern.finditer(text):
+            grp = 1 if m.lastindex else 0
+            s, e = m.start(grp), m.end(grp)
+            if any(s < es and ss < e for ss, es in seen_spans):
+                continue
+            matched = m.group(grp).strip()
+            if not matched:
+                continue
+            seen_spans.append((s, e))
+            warnings.append({
+                "code": "AI_SLOP_SCRIPT",
+                "shot_id": field_name,
+                "category": category,
+                "match": matched,
+                "hint": hint,
+            })
+
+    em_dash_count = text.count("—")
+    if em_dash_count >= 1:
+        label = f"em-dash spam ({em_dash_count}x '—')" if em_dash_count >= 2 else "em-dash '—'"
+        warnings.append({
+            "code": "AI_SLOP_SCRIPT",
+            "shot_id": field_name,
+            "category": "em_dash_spam",
+            "match": label,
+            "hint": "Replace em dashes ('—') with commas, periods, colons, or parentheses per clear-natural-english.",
+        })
+
+    if is_title:
+        m_ang = re.search(r"[<>]", text)
+        if m_ang:
+            warnings.append({
+                "code": "AI_SLOP_SCRIPT",
+                "shot_id": field_name,
+                "category": "youtube_illegal_title_char",
+                "match": m_ang.group(0),
+                "hint": "YouTube rejects raw '<' and '>' in titles; write 'under' or 'over' instead.",
+            })
+
+    return warnings
+
+
+def lint_metadata_file(path: Path) -> List[Dict[str, str]]:
+    """Lint a JSON plan/packaging file or a Markdown packaging.md file for metadata slop."""
+    raw = path.read_text(encoding="utf-8")
+    warnings: List[Dict[str, str]] = []
+
+    if path.suffix.lower() == ".json":
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            if isinstance(data.get("title"), str):
+                warnings.extend(lint_metadata_text(data["title"], "title", is_title=True))
+            pkg = data.get("packaging") if isinstance(data.get("packaging"), dict) else data
+            if isinstance(pkg, dict):
+                cands = pkg.get("title_candidates")
+                if isinstance(cands, list):
+                    for idx, cand in enumerate(cands):
+                        if isinstance(cand, str):
+                            warnings.extend(
+                                lint_metadata_text(cand, f"packaging.title_candidates[{idx}]", is_title=True)
+                            )
+                for title_key in ("yt_title", "thumbnail_headline", "thumbnail_accent"):
+                    if isinstance(pkg.get(title_key), str):
+                        warnings.extend(lint_metadata_text(pkg[title_key], f"packaging.{title_key}", is_title=True))
+                for body_key in ("description", "yt_description", "pinned_comment", "yt_pinned_comment"):
+                    if isinstance(pkg.get(body_key), str):
+                        warnings.extend(lint_metadata_text(pkg[body_key], f"packaging.{body_key}", is_title=False))
+        return warnings
+
+    # Markdown / plain-text packaging file
+    in_code = False
+    in_title_section = False
+    body_lines: List[str] = []
+    for line_no, raw_line in enumerate(raw.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if re.match(r"^#{1,6}\s+", stripped):
+            heading_low = stripped.lower()
+            in_title_section = ("title" in heading_low) and ("chapter" not in heading_low)
+            continue
+        m_inline_title = re.match(r"^(?:\*\*)?(?:youtube\s+)?title(?:\s*\d+)?(?:\*\*)?\s*:\s*(.+)$", stripped, flags=re.IGNORECASE)
+        if m_inline_title:
+            title_val = m_inline_title.group(1).strip().strip("`\"'")
+            warnings.extend(lint_metadata_text(title_val, f"{path.name}:L{line_no}(title)", is_title=True))
+            continue
+        if in_title_section and stripped:
+            clean_t = re.sub(r"^(?:[-*]|\d+\.)\s+", "", stripped).strip().strip("`\"'")
+            if clean_t:
+                warnings.extend(lint_metadata_text(clean_t, f"{path.name}:L{line_no}(title)", is_title=True))
+            continue
+        body_lines.append(raw_line)
+
+    body_text = "\n".join(body_lines)
+    if body_text.strip():
+        warnings.extend(lint_metadata_text(body_text, f"{path.name}(body)", is_title=False))
+    return warnings
+
+
 def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
-    """Run genre- and speaker-aware AI_SLOP_SCRIPT checks across every shot plus a plan-wide buzzword cluster check."""
+    """Run genre- and speaker-aware AI_SLOP_SCRIPT checks across every shot, metadata fields, and plan-wide buzzword clusters."""
     shots = plan.get("shots", []) or []
     video_format = infer_video_format(plan)
     script_genre = str(plan.get("script_genre") or "commentary").strip().lower() or "commentary"
@@ -685,11 +1095,19 @@ def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
         is_last = idx == len(shots) - 1
         speaker = str(shot.get("speaker") or "").strip().lower()
         is_narrator = speaker in NARRATOR_SPEAKER_ROLES
-        is_character_dialogue = bool(speaker) and not is_narrator
-        skip_commentary = (
-            (script_genre == "drama" and not is_narrator)
-            or (video_format == "long_form" and is_character_dialogue)
-        )
+        skip_commentary = (script_genre == "drama" and not is_narrator)
+
+        if video_format != "long_form" and idx == 0:
+            m_because = re.match(r"^\s*(because\b)", text, flags=re.IGNORECASE)
+            if m_because:
+                warnings.append({
+                    "code": "AI_SLOP_SCRIPT",
+                    "shot_id": sid,
+                    "category": "because_cold_open",
+                    "match": m_because.group(1),
+                    "hint": "Avoid opening Shot 1 with 'Because ...'; start with a standalone concrete hook that lands cold at 0:00.",
+                })
+
         for iss in lint_slop_text(
             text,
             is_last_shot=is_last,
@@ -720,26 +1138,188 @@ def lint_plan_slop(plan: Dict) -> List[Dict[str, str]]:
             "hint": "Replace clustered AI buzzwords across the script with plain spoken English.",
         })
 
+    # Scan plan.title and plan.packaging metadata fields
+    if isinstance(plan.get("title"), str) and plan["title"].strip():
+        warnings.extend(lint_metadata_text(plan["title"], "title", is_title=True))
+    pkg = plan.get("packaging")
+    if isinstance(pkg, dict):
+        cands = pkg.get("title_candidates")
+        if isinstance(cands, list):
+            for idx, cand in enumerate(cands):
+                if isinstance(cand, str) and cand.strip():
+                    warnings.extend(
+                        lint_metadata_text(cand, f"packaging.title_candidates[{idx}]", is_title=True)
+                    )
+        for title_key in ("thumbnail_headline", "thumbnail_accent"):
+            if isinstance(pkg.get(title_key), str) and pkg[title_key].strip():
+                warnings.extend(lint_metadata_text(pkg[title_key], f"packaging.{title_key}", is_title=True))
+        for body_key in ("description", "pinned_comment"):
+            if isinstance(pkg.get(body_key), str) and pkg[body_key].strip():
+                warnings.extend(lint_metadata_text(pkg[body_key], f"packaging.{body_key}", is_title=False))
+
+    return warnings
+
+
+def lint_plan_prompt_hygiene(plan: Dict) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Check style_bible, spatial_layout, beats[].action, and negative_constraints for text-warp triggers."""
+    errors: List[Dict[str, str]] = []
+    warnings: List[Dict[str, str]] = []
+
+    style_bible = str(plan.get("style_bible") or "")
+    if style_bible.strip():
+        for m in LITERAL_BLANK_SIGN_RE.finditer(style_bible):
+            errors.append({
+                "code": "LITERAL_BLANK_SIGN",
+                "location": "style_bible",
+                "match": m.group(1),
+                "hint": "Replace with 'unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage' so models do not print literal 'BLANK'.",
+            })
+        sb_low = style_bible.lower()
+        if "zero letters" not in sb_low and "zero signage" not in sb_low:
+            warnings.append({
+                "code": "MISSING_NO_TEXT_GUARD",
+                "location": "style_bible",
+                "match": "style_bible",
+                "hint": "Append 'unadorned facades, plain empty surfaces, zero letters, zero digits, zero signage' to style_bible to prevent background TEXT_WARP.",
+            })
+
+    for idx, shot in enumerate(plan.get("shots", []) or []):
+        sid = str(shot.get("shot_id", f"shot_{idx + 1:02d}"))
+        fields_to_check: List[Tuple[str, str, bool]] = [
+            (f"{sid}.spatial_layout", str(shot.get("spatial_layout") or ""), True),
+            (f"{sid}.negative_constraints", str(shot.get("negative_constraints") or ""), False),
+        ]
+        for b_idx, beat in enumerate(shot.get("beats", []) or []):
+            if isinstance(beat, dict):
+                fields_to_check.append((f"{sid}.beats[{b_idx}].action", str(beat.get("action") or ""), True))
+
+        for loc, text, check_magnet in fields_to_check:
+            if not text.strip():
+                continue
+            for m in LITERAL_BLANK_SIGN_RE.finditer(text):
+                errors.append({
+                    "code": "LITERAL_BLANK_SIGN",
+                    "location": loc,
+                    "match": m.group(1),
+                    "hint": "Remove literal 'blank/empty sign' phrasing; use 'unadorned facades, plain empty surfaces, zero letters, zero signage'.",
+                })
+            if check_magnet:
+                for m in TEXT_MAGNET_PROP_RE.finditer(text):
+                    warnings.append({
+                        "code": "TEXT_MAGNET_PROP",
+                        "location": loc,
+                        "match": m.group(1),
+                        "hint": "Text-magnet prop often causes TEXT_WARP; swap for unadorned facades, colored light tubes, striped awnings, hourglasses, or abstract color bars (see references/sheet_prompt_templates.md).",
+                    })
+
+    return errors, warnings
+
+
+def _parse_rate_percent(raw_rate: Any) -> Optional[float]:
+    if raw_rate is None:
+        return None
+    s = str(raw_rate).strip()
+    m = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)%", s)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
+def lint_plan_pacing_and_sfx(plan: Dict) -> List[Dict[str, str]]:
+    """Run format-aware word budget, 16:9 commentary WPM/rate, and SFX tone checks."""
+    warnings: List[Dict[str, str]] = []
+    shots = plan.get("shots", []) or []
+    if not shots:
+        return warnings
+
+    video_format = infer_video_format(plan)
+    script_genre = str(plan.get("script_genre") or "commentary").strip().lower() or "commentary"
+    aspect_ratio = str(plan.get("aspect_ratio") or "9:16").strip()
+    pronunciations = plan.get("tts_pronunciations") if isinstance(plan.get("tts_pronunciations"), dict) else None
+
+    if video_format == "short":
+        spoken_words = sum(
+            len(resolve_tts_text(shot, pronunciations=pronunciations, autofix=False).split())
+            for shot in shots
+        )
+        avg_words = spoken_words / max(1, len(shots))
+        if spoken_words > 125:
+            warnings.append({
+                "code": "PACING_OVERRUN",
+                "location": "plan",
+                "match": f"{spoken_words} spoken words",
+                "hint": "Short script exceeds 125 expanded spoken words (target 95-115 words / 34-42s to stay safely under 48s).",
+            })
+        if avg_words > 11.0:
+            warnings.append({
+                "code": "PACING_OVERRUN",
+                "location": "plan",
+                "match": f"{avg_words:.1f} words/shot",
+                "hint": "Average spoken words per shot exceeds 11 (risk of >3.8s shots); split long beats into faster cuts.",
+            })
+
+    if video_format == "long_form" and script_genre == "commentary" and aspect_ratio == "16:9":
+        # Check TTS rates > +12%
+        rates_to_check: List[Tuple[str, Any]] = []
+        if plan.get("rate") is not None:
+            rates_to_check.append(("plan.rate", plan.get("rate")))
+        vc = plan.get("voice_cast")
+        if isinstance(vc, dict):
+            for sp, cfg in vc.items():
+                if isinstance(cfg, dict) and cfg.get("rate") is not None:
+                    rates_to_check.append((f"voice_cast.{sp}.rate", cfg.get("rate")))
+        for idx, shot in enumerate(shots):
+            sid = str(shot.get("shot_id", f"shot_{idx + 1:03d}"))
+            if shot.get("rate") is not None:
+                rates_to_check.append((f"{sid}.rate", shot.get("rate")))
+            sfx = str(shot.get("sfx_type") or "").strip().lower()
+            if sfx in CARTOON_SFX_CUES:
+                warnings.append({
+                    "code": "SFX_TONE_MISMATCH",
+                    "location": sid,
+                    "match": sfx,
+                    "hint": "Cartoon SFX cue clashes with 16:9 commentary tone; use Tech/UI cues (ui_tick, ui_click, data_chime, sub_whoosh, alert_ping, soft_thud).",
+                })
+
+        for loc, raw_r in rates_to_check:
+            pct = _parse_rate_percent(raw_r)
+            if pct is not None and pct > 12.0:
+                warnings.append({
+                    "code": "PACING_FIREHOSE",
+                    "location": loc,
+                    "match": str(raw_r).strip(),
+                    "hint": "16:9 commentary TTS rate exceeds +12% (firehose risk); keep between +6% and +10%.",
+                })
+
+        target_dur = plan.get("target_duration_sec")
+        if isinstance(target_dur, (int, float)) and target_dur > 0:
+            display_words = sum(len(str(s.get("dialogue_or_vo", "") or "").split()) for s in shots)
+            wpm = display_words / (float(target_dur) / 60.0)
+            if wpm > 130.0:
+                warnings.append({
+                    "code": "PACING_FIREHOSE",
+                    "location": "plan",
+                    "match": f"{wpm:.0f} WPM ({display_words} words / {target_dur:.0f}s)",
+                    "hint": "16:9 commentary display pace exceeds 130 WPM; target 100-115 WPM (~300 words/3m, ~525 words/5m) and move caveats to packaging.md.",
+                })
+
     return warnings
 
 
 def apply_tts_pronunciations(text: str, pronunciations: Optional[Dict[str, str]]) -> str:
-    """Apply top-level display -> phonetic TTS overrides longest-key-first with safe boundaries."""
+    """Apply top-level display -> phonetic TTS overrides longest-key-first with safe boundaries and plural acronym support."""
     if not text or not isinstance(pronunciations, dict) or not pronunciations:
         return text
 
-    clean_map: Dict[str, str] = {}
-    for raw_k, raw_v in pronunciations.items():
-        if isinstance(raw_k, str) and isinstance(raw_v, str) and raw_k.strip():
-            clean_map[raw_k] = raw_v
-    if not clean_map:
+    expanded_map = _expand_pronunciation_map(pronunciations)
+    if not expanded_map:
         return text
 
-    sorted_keys = sorted(clean_map.keys(), key=lambda k: (-len(k), k))
+    sorted_keys = sorted(expanded_map.keys(), key=lambda k: (-len(k), k))
     pattern = re.compile(
         "|".join(r"(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])" for k in sorted_keys)
     )
-    return pattern.sub(lambda m: clean_map[m.group(0)], text)
+    return pattern.sub(lambda m: expanded_map[m.group(0)], text)
 
 
 def resolve_tts_text(
@@ -1545,6 +2125,8 @@ def resolve_shot_voice_params(
     plan_default_voice: str,
     fallback_rate: str,
     fallback_pitch: str,
+    plan_default_rate: str = "",
+    plan_default_pitch: str = "",
 ) -> Tuple[str, str, str, str, Optional[str]]:
     """Resolve (speaker, voice, rate, pitch, speaker_keyword_color) for a shot.
 
@@ -1552,7 +2134,7 @@ def resolve_shot_voice_params(
       1. Per-shot explicit shot.voice / shot.rate / shot.pitch
       2. plan.voice_cast[speaker] (exact or case-insensitive fallback, plus plan.speaker_voices)
       3. Explicit CLI --voice / --rate / --pitch
-      4. Explicit plan.voice when voice_cast is absent (keeps single-voice plans intact)
+      4. Explicit plan.voice / plan.rate / plan.pitch when voice_cast is absent (keeps single-voice plans intact)
       5. Generic built-in defaults (only when a speaker is named on the shot)
       6. Plan default voice / format fallback rate & pitch
     """
@@ -1591,22 +2173,48 @@ def resolve_shot_voice_params(
         )
 
     shot_rate = str(shot["rate"]).strip() if shot.get("rate") is not None and str(shot["rate"]).strip() else ""
-    rate = (
-        shot_rate
-        or cast_cfg.get("rate")
-        or (cli_rate.strip() if cli_rate else "")
-        or generic_cfg.get("rate")
-        or fallback_rate
-    )
+    cli_r = cli_rate.strip() if cli_rate else ""
+    plan_r = plan_default_rate.strip() if plan_default_rate else ""
+    if not plan_voice_cast and plan_r:
+        rate = (
+            shot_rate
+            or cast_cfg.get("rate")
+            or cli_r
+            or plan_r
+            or generic_cfg.get("rate")
+            or fallback_rate
+        )
+    else:
+        rate = (
+            shot_rate
+            or cast_cfg.get("rate")
+            or cli_r
+            or generic_cfg.get("rate")
+            or plan_r
+            or fallback_rate
+        )
 
     shot_pitch = str(shot["pitch"]).strip() if shot.get("pitch") is not None and str(shot["pitch"]).strip() else ""
-    pitch = (
-        shot_pitch
-        or cast_cfg.get("pitch")
-        or (cli_pitch.strip() if cli_pitch else "")
-        or generic_cfg.get("pitch")
-        or fallback_pitch
-    )
+    cli_p = cli_pitch.strip() if cli_pitch else ""
+    plan_p = plan_default_pitch.strip() if plan_default_pitch else ""
+    if not plan_voice_cast and plan_p:
+        pitch = (
+            shot_pitch
+            or cast_cfg.get("pitch")
+            or cli_p
+            or plan_p
+            or generic_cfg.get("pitch")
+            or fallback_pitch
+        )
+    else:
+        pitch = (
+            shot_pitch
+            or cast_cfg.get("pitch")
+            or cli_p
+            or generic_cfg.get("pitch")
+            or plan_p
+            or fallback_pitch
+        )
 
     sp_kw_color = str(shot.get("keyword_color") or cast_cfg.get("keyword_color") or "").strip() or None
     return (speaker or "narrator"), voice, (rate or fallback_rate), (pitch or fallback_pitch), sp_kw_color
@@ -1886,15 +2494,26 @@ def lint_plan(
     check_tts_misread: bool = True,
 ) -> int:
     found = 0
+    prompt_errors = 0
     tts_warnings = 0
+    hygiene_warnings = 0
+    pacing_sfx_warnings = 0
+
     if check_tts_misread:
         pronunciations = plan.get("tts_pronunciations")
         if not isinstance(pronunciations, dict):
             pronunciations = None
         for shot in plan.get("shots", []):
             sid = shot.get("shot_id", "unknown")
+            raw_display = str(shot.get("dialogue_or_vo", "") or "")
+            for iss in lint_display_phonetic_leaks(raw_display):
+                found += 1
+                print(
+                    f"[{iss['code']}] {sid}: '{iss['match']}' -> '{iss['suggestion']}' ({iss['reason']})",
+                    file=sys.stderr,
+                )
             spoken_text = resolve_tts_text(shot, pronunciations=pronunciations, autofix=False)
-            issues = lint_narration_text(spoken_text, pronunciations=pronunciations)
+            issues = lint_narration_text(spoken_text, pronunciations=pronunciations, is_tts_text=True)
             for iss in issues:
                 if iss.get("severity") == "warning":
                     tts_warnings += 1
@@ -1909,6 +2528,27 @@ def lint_plan(
                         file=sys.stderr,
                     )
 
+        p_errs, p_warns = lint_plan_prompt_hygiene(plan)
+        for err in p_errs:
+            prompt_errors += 1
+            print(
+                f"[{err['code']}] {err['location']}: '{err['match']}' -> {err['hint']}",
+                file=sys.stderr,
+            )
+        for warn in p_warns:
+            hygiene_warnings += 1
+            print(
+                f"WARNING [{warn['code']}] {warn['location']}: '{warn['match']}' -> {warn['hint']}",
+                file=sys.stderr,
+            )
+
+        for warn in lint_plan_pacing_and_sfx(plan):
+            pacing_sfx_warnings += 1
+            print(
+                f"WARNING [{warn['code']}] {warn['location']}: '{warn['match']}' -> {warn['hint']}",
+                file=sys.stderr,
+            )
+
     slop_warnings: List[Dict[str, str]] = []
     if check_slop:
         slop_warnings = lint_plan_slop(plan)
@@ -1919,10 +2559,16 @@ def lint_plan(
             )
 
     slop_count = len(slop_warnings)
-    if check_tts_misread and found > 0:
-        extra = f" and {slop_count} AI_SLOP_SCRIPT warning(s)" if slop_count > 0 else ""
+    if check_tts_misread and (found > 0 or prompt_errors > 0):
+        parts: List[str] = []
+        if found > 0:
+            parts.append(f"{found} TTS misread issue(s)")
+        if prompt_errors > 0:
+            parts.append(f"{prompt_errors} prompt-hygiene error(s)")
+        if slop_count > 0:
+            parts.append(f"{slop_count} AI_SLOP_SCRIPT warning(s)")
         print(
-            f"TTS lint failed: {found} misread issue(s){extra} found. Fix shot_plan.json or pass --autofix.",
+            f"Plan lint failed: {', '.join(parts)} found. Fix shot_plan.json (or pass --autofix for TTS rules).",
             file=sys.stderr,
         )
         return 2
@@ -1937,13 +2583,17 @@ def lint_plan(
     if check_tts_misread:
         notes: List[str] = []
         if tts_warnings > 0:
-            notes.append(f"{tts_warnings} TTS_ALLCAPS_WARNING warning(s)")
+            notes.append(f"{tts_warnings} TTS pronunciation warning(s)")
+        if hygiene_warnings > 0:
+            notes.append(f"{hygiene_warnings} prompt-hygiene warning(s)")
+        if pacing_sfx_warnings > 0:
+            notes.append(f"{pacing_sfx_warnings} pacing/SFX warning(s)")
         if slop_count > 0:
             notes.append(f"{slop_count} AI_SLOP_SCRIPT warning(s)")
         if notes:
-            print(f"TTS lint passed: 0 misread risks found ({', '.join(notes)}).")
+            print(f"TTS lint passed: 0 blocking errors found ({', '.join(notes)}).")
         else:
-            print("TTS lint passed: 0 misread risks found.")
+            print("TTS lint passed: 0 blocking errors found.")
     return 0
 
 
@@ -1963,9 +2613,11 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
     preset = get_aspect_preset(aspect_ratio)
 
     raw_plan_voice = str(plan.get("voice") or "").strip()
+    raw_plan_rate = str(plan.get("rate") or "").strip()
+    raw_plan_pitch = str(plan.get("pitch") or "").strip()
     default_voice = args.voice.strip() if args.voice else (raw_plan_voice or "en-US-AvaNeural")
-    fallback_rate = DEFAULT_SHORT_RATE if video_format != "long_form" else DEFAULT_LONG_RATE
-    fallback_pitch = DEFAULT_PITCH
+    fallback_rate = raw_plan_rate or (DEFAULT_SHORT_RATE if video_format != "long_form" else DEFAULT_LONG_RATE)
+    fallback_pitch = raw_plan_pitch or DEFAULT_PITCH
     plan_voice_cast = build_plan_voice_cast(plan)
 
     check_slop = not getattr(args, "no_slop_check", False)
@@ -2009,6 +2661,8 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
                 plan_default_voice=raw_plan_voice,
                 fallback_rate=fallback_rate,
                 fallback_pitch=fallback_pitch,
+                plan_default_rate=raw_plan_rate,
+                plan_default_pitch=raw_plan_pitch,
             )
             cast_rec: Dict[str, str] = {"voice": shot_voice, "rate": shot_rate, "pitch": shot_pitch}
             if sp_kw_color:
@@ -2148,6 +2802,7 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         )
 
     total_dur = round(cursor, 4)
+    avg_shot_len = round(total_dur / max(1, len(shot_timings)), 3)
     act_summaries = build_act_summaries(shot_timings, plan=plan)
     timings_payload: Dict[str, Any] = {
         "slug": plan.get("slug", ""),
@@ -2157,14 +2812,32 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
         "voice_cast": resolved_cast_used,
         "total_duration_sec": total_dur,
         "shot_count": len(shot_timings),
-        "avg_shot_length_sec": round(total_dur / max(1, len(shot_timings)), 3),
+        "avg_shot_length_sec": avg_shot_len,
         "acts": act_summaries,
         "shots": shot_timings,
     }
     if plan.get("ending_style"):
         timings_payload["ending_style"] = str(plan["ending_style"]).strip()
+    amb_bed = str(plan.get("ambience_bed") or "").strip()
+    if amb_bed:
+        timings_payload["ambience_bed"] = amb_bed
     timings_path = out_dir / "shot_timings.json"
     timings_path.write_text(json.dumps(timings_payload, indent=2) + "\n", encoding="utf-8")
+
+    if video_format == "short":
+        if total_dur > 59.0 and not bool(getattr(args, "allow_over_60s", False)):
+            print(
+                f"[SHORT_OVER_60S] Short runtime {total_dur:.2f}s exceeds 59.0s YouTube Shorts cap. "
+                "Trim the script, raise plan.rate, or pass --allow-over-60s to override.",
+                file=sys.stderr,
+            )
+            return 2
+        if total_dur > 48.0 or avg_shot_len > 3.8:
+            print(
+                f"WARNING [PACING_OVERRUN] Short runtime {total_dur:.2f}s (avg {avg_shot_len:.2f}s/shot) "
+                "exceeds 48.0s / 3.8s target ceiling.",
+                file=sys.stderr,
+            )
 
     chapters_path: Optional[Path] = None
     if act_summaries:
@@ -2174,7 +2847,11 @@ def run_synthesis(args: argparse.Namespace, plan: Dict) -> int:
     global_keywords = parse_keyword_list(args.keywords) or parse_keyword_list(plan.get("highlight_keywords"))
     caption_style = args.caption_style or plan.get("caption_style") or "kinetic_keyword"
     plan_max_chars = (plan.get("fun_pacing_gate") or {}).get("max_caption_chars")
-    explicit_caption_max = plan.get("caption_max_chars")
+    explicit_caption_max = (
+        plan.get("max_caption_chars")
+        if plan.get("max_caption_chars") is not None
+        else plan.get("caption_max_chars")
+    )
     if args.max_chars is not None:
         max_chars = args.max_chars
     elif explicit_caption_max is not None:
@@ -2254,7 +2931,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Synthesize voiceover with edge-tts, lint narration scripts, and build v4.0 Fun Kinetic ASS/SRT captions."
     )
-    parser.add_argument("--lint-plan", help="Run Pre-TTS narration linter on shot_plan.json and exit.")
+    parser.add_argument("--lint-plan", help="Run Pre-TTS narration, prompt-hygiene, pacing, and slop linter on shot_plan.json and exit.")
+    parser.add_argument("--lint-metadata", help="Lint a JSON packaging/plan file or Markdown packaging.md for metadata AI slop and illegal title chars.")
     parser.add_argument("--shot-plan", help="Path to shot_plan.json for full audio-first synthesis.")
     parser.add_argument("--out-dir", help="Output directory for voiceover.wav, shot_timings.json, captions.ass.")
     parser.add_argument(
@@ -2268,14 +2946,14 @@ def main() -> int:
         "--rate",
         default=None,
         help=(
-            f"Speech rate adjustment (default: {DEFAULT_SHORT_RATE.replace('%', '%%')} for Shorts, "
+            f"Speech rate adjustment (default: plan.rate or {DEFAULT_SHORT_RATE.replace('%', '%%')} for Shorts, "
             f"{DEFAULT_LONG_RATE.replace('%', '%%')} for long-form unless set by voice_cast/shot)."
         ),
     )
     parser.add_argument(
         "--pitch",
         default=None,
-        help=f"Pitch adjustment (default: {DEFAULT_PITCH} unless set by voice_cast/shot).",
+        help=f"Pitch adjustment (default: plan.pitch or {DEFAULT_PITCH} unless set by voice_cast/shot).",
     )
     parser.add_argument(
         "--gap",
@@ -2306,7 +2984,7 @@ def main() -> int:
         "--margin-v",
         type=int,
         default=None,
-        help="ASS MarginV vertical offset from bottom in px (default: plan.caption_margin_v or 420 for 9:16 / 96 for 16:9).",
+        help="ASS MarginV vertical offset from bottom in px (default: plan.caption_margin_v or 420 for 9:16 / 116 for 16:9).",
     )
     parser.add_argument(
         "--tilt",
@@ -2343,6 +3021,11 @@ def main() -> int:
     )
     parser.add_argument("--autofix", action="store_true", help="Auto-rewrite TTS_MISREAD patterns during synthesis.")
     parser.add_argument(
+        "--allow-over-60s",
+        action="store_true",
+        help="Allow Short-Form synthesis to exceed 59.0s instead of failing with SHORT_OVER_60S.",
+    )
+    parser.add_argument(
         "--strict-slop",
         action="store_true",
         help="Fail with exit code 2 if any AI_SLOP_SCRIPT warning is found.",
@@ -2367,6 +3050,29 @@ def main() -> int:
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
 
+    if args.lint_metadata:
+        meta_path = Path(args.lint_metadata)
+        if not meta_path.exists():
+            print(f"Error: --lint-metadata path not found: {meta_path}", file=sys.stderr)
+            return 2
+        warnings = lint_metadata_file(meta_path)
+        for w in warnings:
+            print(
+                f"WARNING [AI_SLOP_SCRIPT] {w['shot_id']} ({w['category']}): '{w['match']}' -> {w['hint']}",
+                file=sys.stderr,
+            )
+        if args.strict_slop and warnings:
+            print(
+                f"Metadata lint failed (--strict-slop): {len(warnings)} issue(s) found.",
+                file=sys.stderr,
+            )
+            return 2
+        if warnings:
+            print(f"Metadata lint finished with {len(warnings)} warning(s).")
+        else:
+            print("Metadata lint passed: 0 issues found.")
+        return 0
+
     if args.lint_plan:
         plan = json.loads(Path(args.lint_plan).read_text(encoding="utf-8"))
         return lint_plan(
@@ -2382,7 +3088,7 @@ def main() -> int:
         plan = json.loads(Path(args.shot_plan).read_text(encoding="utf-8"))
         return run_synthesis(args, plan)
 
-    parser.error("Provide --lint-plan or --shot-plan")
+    parser.error("Provide --lint-plan, --lint-metadata, or --shot-plan")
     return 2
 
 

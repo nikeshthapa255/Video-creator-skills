@@ -6,7 +6,7 @@ pure-stdlib interval-sparse fallback when NumPy is unavailable. Synthesized cues
 cached per cue name so rendering 55+ cues across a 5-15 minute (300-900s) timeline runs
 in well under 2 seconds.
 
-Supported cues (20 total):
+Supported cues (26 total):
   Shorts comedic/punch cues (9):
     record_scratch, vine_boom, siren_chirp, bonk_boing,
     cash_ching, ding_levelup, laser_zap, whoosh, pop
@@ -15,11 +15,13 @@ Supported cues (20 total):
     blade_unsheathe, guzheng_gliss, fire_crackle_burst, court_gasp_swell
   General long-form cinematic cues (2):
     cinematic_riser, heartbeat_pulse
+  Tech / UI editorial cues (6):
+    ui_tick, ui_click, data_chime, sub_whoosh, alert_ping, soft_thud
 
 Examples:
   python3 sfx_engine.py --list
   python3 sfx_engine.py --cue vine_boom --out boom.wav
-  python3 sfx_engine.py --cue palace_gong --out gong.wav
+  python3 sfx_engine.py --cue data_chime --out chime.wav
   python3 sfx_engine.py --timings audio/shot_timings.json --out audio/sfx_track.wav
 """
 
@@ -78,6 +80,13 @@ CUE_CALIBRATION: Dict[str, Tuple[float, float]] = {
     "whoosh": (-16.0, -2.5),
     "silk_whoosh": (-16.0, -2.5),
     "court_gasp_swell": (-16.0, -2.5),
+    # Tech / UI editorial cues (-17 to -19 dBFS RMS, -4.0 dBFS peak)
+    "ui_tick": (-18.0, -4.0),
+    "ui_click": (-17.5, -4.0),
+    "data_chime": (-17.5, -4.0),
+    "sub_whoosh": (-18.5, -4.0),
+    "alert_ping": (-17.0, -4.0),
+    "soft_thud": (-18.0, -4.0),
 }
 
 
@@ -870,6 +879,184 @@ def _py_heartbeat_pulse(rng: random.Random) -> Tuple[List[float], List[float]]:
     return l, r
 
 
+def _py_ui_tick(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.045s crisp micro-tick for data bullets and subtle UI highlights."""
+    dur = 0.045
+    n = int(SR * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    exp = math.exp
+    tanh = math.tanh
+    uni = rng.uniform
+    inv_sr = 1.0 / SR
+    p_jit = uni(0.985, 1.015)
+    click_bp = _stdlib_bandpass([uni(-1.0, 1.0) for _ in range(n)], 2200.0, 6800.0)
+    f1 = 1850.0 * p_jit
+    f2 = 3720.0 * p_jit
+    for i in range(n):
+        t = i * inv_sr
+        env = exp(-t * 135.0) * _adsr_scalar(t, dur, a=0.001, d=0.006)
+        tone_l = (sin(TWO_PI * f1 * t) * 0.65 + sin(TWO_PI * f2 * t) * 0.30) * env
+        tone_r = (sin(TWO_PI * (f1 + 4.0) * t + 0.12) * 0.65 + sin(TWO_PI * f2 * t) * 0.30) * env
+        ck = click_bp[i] * exp(-t * 280.0) * 0.35
+        l[i] = tanh(tone_l + ck) * 0.85
+        r[i] = tanh(tone_r - ck * 0.6) * 0.85
+    return l, r
+
+
+def _py_ui_click(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.070s clean tactile editorial switch click for card/slide switches."""
+    dur = 0.070
+    n = int(SR * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    exp = math.exp
+    tanh = math.tanh
+    uni = rng.uniform
+    inv_sr = 1.0 / SR
+    p_jit = uni(0.985, 1.015)
+    raw = [uni(-1.0, 1.0) for _ in range(n)]
+    snap_bp = _stdlib_bandpass(raw, 1600.0, 7200.0)
+    f_body = 920.0 * p_jit
+    f_top = 3150.0 * p_jit
+    for i in range(n):
+        t = i * inv_sr
+        e1 = exp(-t * 145.0)
+        body = sin(TWO_PI * f_body * t) * e1 * 0.68
+        top = sin(TWO_PI * f_top * t) * exp(-t * 240.0) * 0.34
+        snap = snap_bp[i] * exp(-t * 260.0) * 0.42
+        rel = 0.0
+        if t >= 0.022:
+            tr = t - 0.022
+            rel = (sin(TWO_PI * (f_body * 1.28) * tr) * 0.30 + snap_bp[i] * 0.16) * exp(-tr * 190.0)
+        att = _adsr_scalar(t, dur, a=0.0008, d=0.008)
+        l[i] = tanh((body + top + snap + rel) * att) * 0.86
+        r[i] = tanh((body + top * 0.94 - snap * 0.5 + rel) * att) * 0.86
+    return l, r
+
+
+def _py_data_chime(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.52s warm two-note minimalist fifth chime for verified stats and charts."""
+    dur = 0.52
+    n = int(SR * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    cos = math.cos
+    exp = math.exp
+    tanh = math.tanh
+    inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.994, 1.006)
+    notes = (
+        (0.000, 1046.5 * p_jit, 0.44, 0.45),
+        (0.065, 1568.0 * p_jit, 0.56, 0.55),
+    )
+    for start_t, freq, pan_pos, amp in notes:
+        s_idx = int(start_t * SR)
+        avail = n - s_idx
+        if avail < 16:
+            continue
+        pan = pan_pos * math.pi * 0.5
+        gl = cos(pan) * 1.414 * amp
+        gr = sin(pan) * 1.414 * amp
+        w = TWO_PI * freq
+        for j in range(avail):
+            tn = j * inv_sr
+            env = min(1.0, tn / 0.006) * exp(-tn * 7.2)
+            sl = (sin(w * tn) + 0.18 * sin(2.0 * w * tn)) * env
+            sr_v = (sin((w + TWO_PI * 1.6) * tn + 0.15) + 0.18 * sin(2.0 * w * tn)) * env
+            l[s_idx + j] += sl * gl
+            r[s_idx + j] += sr_v * gr
+    for i in range(n):
+        att = _adsr_scalar(i * inv_sr, dur, a=0.004, d=0.06)
+        l[i] = tanh(l[i] * att) * 0.85
+        r[i] = tanh(r[i] * att) * 0.85
+    return l, r
+
+
+def _py_sub_whoosh(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.42s restrained airy low-mid editorial sweep for slide and Act transitions."""
+    dur = 0.42
+    n_out = int(SR * dur)
+    sr_h = SR // 2
+    n = int(sr_h * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    cos = math.cos
+    tanh = math.tanh
+    uni = rng.uniform
+    inv_sr = 1.0 / sr_h
+    raw = [uni(-1.0, 1.0) for _ in range(n)]
+    air = _stdlib_bandpass(raw, 140.0, 1150.0, sr=sr_h)
+    pi_dur = math.pi / dur
+    ph = 0.0
+    p_jit = uni(0.97, 1.03)
+    for i in range(n):
+        t = i * inv_sr
+        bell = sin(pi_dur * t) ** 1.7
+        freq = (54.0 + 36.0 * bell) * p_jit
+        ph += TWO_PI * freq * inv_sr
+        sub = sin(ph) * bell * 0.62
+        breath = air[i] * bell * 1.55
+        mono = tanh(sub + breath) * 0.84
+        pan = (0.32 + 0.36 * (t / dur)) * math.pi * 0.5
+        l[i] = mono * cos(pan) * 1.414
+        r[i] = mono * sin(pan) * 1.414
+    return _upsample_2x(l, n_out), _upsample_2x(r, n_out)
+
+
+def _py_alert_ping(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.38s clean broadcast notification ping for breaking facts and caveats."""
+    dur = 0.38
+    n = int(SR * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    exp = math.exp
+    tanh = math.tanh
+    inv_sr = 1.0 / SR
+    p_jit = rng.uniform(0.992, 1.008)
+    f0 = 1318.5 * p_jit
+    for i in range(n):
+        t = i * inv_sr
+        env = min(1.0, t / 0.0025) * exp(-t * 9.0) * _adsr_scalar(t, dur, a=0.002, d=0.05)
+        shimmer = exp(-t * 18.0) * 0.24
+        sl = (sin(TWO_PI * f0 * t) * 0.72 + sin(TWO_PI * (f0 * 2.0) * t) * shimmer + sin(TWO_PI * (f0 * 1.5) * t) * 0.14) * env
+        sr_v = (sin(TWO_PI * (f0 + 2.2) * t + 0.18) * 0.72 + sin(TWO_PI * (f0 * 2.0) * t) * shimmer + sin(TWO_PI * (f0 * 1.5) * t) * 0.14) * env
+        l[i] = tanh(sl) * 0.85
+        r[i] = tanh(sr_v) * 0.85
+    return l, r
+
+
+def _py_soft_thud(rng: random.Random) -> Tuple[List[float], List[float]]:
+    """0.32s muted warm low-end weight for editorial headlines and skeptic beats."""
+    dur = 0.32
+    n = int(SR * dur)
+    l = [0.0] * n
+    r = [0.0] * n
+    sin = math.sin
+    exp = math.exp
+    tanh = math.tanh
+    uni = rng.uniform
+    inv_sr = 1.0 / SR
+    p_jit = uni(0.98, 1.02)
+    felt = _stdlib_bandpass([uni(-1.0, 1.0) for _ in range(n)], 90.0, 420.0)
+    ph = 0.0
+    for i in range(n):
+        t = i * inv_sr
+        freq = (48.0 + 68.0 * exp(-t * 24.0)) * p_jit
+        ph += TWO_PI * freq * inv_sr
+        body = (sin(ph) + 0.22 * sin(2.0 * ph)) * exp(-t * 11.0)
+        tap = felt[i] * exp(-t * 48.0) * 0.40
+        att = _adsr_scalar(t, dur, a=0.003, d=0.04)
+        l[i] = tanh((body + tap) * att) * 0.88
+        r[i] = tanh((body - tap * 0.5) * att) * 0.88
+    return l, r
+
+
 STDLIB_GENERATORS: Dict[str, Callable[[random.Random], Tuple[List[float], List[float]]]] = {
     # Shorts cues (9)
     "vine_boom": _py_vine_boom,
@@ -894,6 +1081,13 @@ STDLIB_GENERATORS: Dict[str, Callable[[random.Random], Tuple[List[float], List[f
     # General long-form cues (2)
     "cinematic_riser": _py_cinematic_riser,
     "heartbeat_pulse": _py_heartbeat_pulse,
+    # Tech / UI editorial cues (6)
+    "ui_tick": _py_ui_tick,
+    "ui_click": _py_ui_click,
+    "data_chime": _py_data_chime,
+    "sub_whoosh": _py_sub_whoosh,
+    "alert_ping": _py_alert_ping,
+    "soft_thud": _py_soft_thud,
 }
 
 
@@ -1297,6 +1491,102 @@ if HAS_NUMPY:
         att = _np_adsr(t, dur, a=0.004, d=0.08)
         return np.tanh(l * 1.25 * att) * 0.90, np.tanh(r * 1.25 * att) * 0.90
 
+    def _np_ui_tick(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.045
+        n = int(SR * dur)
+        t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.985, 1.015))
+        f1 = 1850.0 * p_jit
+        f2 = 3720.0 * p_jit
+        env = np.exp(-t * 135.0) * _np_adsr(t, dur, a=0.001, d=0.006)
+        tone_l = (np.sin(TWO_PI * f1 * t) * 0.65 + np.sin(TWO_PI * f2 * t) * 0.30) * env
+        tone_r = (np.sin(TWO_PI * (f1 + 4.0) * t + 0.12) * 0.65 + np.sin(TWO_PI * f2 * t) * 0.30) * env
+        ck = _np_fft_bandpass(rng.uniform(-1.0, 1.0, size=n), 2200.0, 6800.0) * np.exp(-t * 280.0) * 0.35
+        return np.tanh(tone_l + ck) * 0.85, np.tanh(tone_r - ck * 0.6) * 0.85
+
+    def _np_ui_click(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.070
+        n = int(SR * dur)
+        t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.985, 1.015))
+        f_body = 920.0 * p_jit
+        f_top = 3150.0 * p_jit
+        snap_bp = _np_fft_bandpass(rng.uniform(-1.0, 1.0, size=n), 1600.0, 7200.0)
+        body = np.sin(TWO_PI * f_body * t) * np.exp(-t * 145.0) * 0.68
+        top = np.sin(TWO_PI * f_top * t) * np.exp(-t * 240.0) * 0.34
+        snap = snap_bp * np.exp(-t * 260.0) * 0.42
+        tr = np.maximum(0.0, t - 0.022)
+        active = (t >= 0.022).astype(np.float64)
+        rel = (np.sin(TWO_PI * (f_body * 1.28) * tr) * 0.30 + snap_bp * 0.16) * np.exp(-tr * 190.0) * active
+        att = _np_adsr(t, dur, a=0.0008, d=0.008)
+        return (
+            np.tanh((body + top + snap + rel) * att) * 0.86,
+            np.tanh((body + top * 0.94 - snap * 0.5 + rel) * att) * 0.86,
+        )
+
+    def _np_data_chime(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.52
+        n = int(SR * dur)
+        l = np.zeros(n, dtype=np.float64)
+        r = np.zeros(n, dtype=np.float64)
+        p_jit = float(rng.uniform(0.994, 1.006))
+        for start_t, freq, pan_pos, amp in (
+            (0.000, 1046.5 * p_jit, 0.44, 0.45),
+            (0.065, 1568.0 * p_jit, 0.56, 0.55),
+        ):
+            s_idx = int(start_t * SR)
+            avail = n - s_idx
+            if avail < 16:
+                continue
+            tn = np.arange(avail, dtype=np.float64) / SR
+            env = np.minimum(1.0, tn / 0.006) * np.exp(-tn * 7.2)
+            sl = (np.sin(TWO_PI * freq * tn) + 0.18 * np.sin(4.0 * math.pi * freq * tn)) * env
+            sr_v = (np.sin(TWO_PI * (freq + 1.6) * tn + 0.15) + 0.18 * np.sin(4.0 * math.pi * freq * tn)) * env
+            pan = pan_pos * math.pi * 0.5
+            l[s_idx:] += sl * (math.cos(pan) * 1.414 * amp)
+            r[s_idx:] += sr_v * (math.sin(pan) * 1.414 * amp)
+        t_all = np.arange(n, dtype=np.float64) / SR
+        att = _np_adsr(t_all, dur, a=0.004, d=0.06)
+        return np.tanh(l * att) * 0.85, np.tanh(r * att) * 0.85
+
+    def _np_sub_whoosh(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.42
+        n = int(SR * dur)
+        t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.97, 1.03))
+        bell = np.sin(math.pi * t / dur) ** 1.7
+        freq = (54.0 + 36.0 * bell) * p_jit
+        ph = TWO_PI * np.cumsum(freq) / SR
+        sub = np.sin(ph) * bell * 0.62
+        air = _np_fft_bandpass(rng.uniform(-1.0, 1.0, size=n), 140.0, 1150.0) * bell * 1.55
+        mono = np.tanh(sub + air) * 0.84
+        pan = (0.32 + 0.36 * (t / dur)) * math.pi * 0.5
+        return mono * np.cos(pan) * 1.414, mono * np.sin(pan) * 1.414
+
+    def _np_alert_ping(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.38
+        n = int(SR * dur)
+        t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.992, 1.008))
+        f0 = 1318.5 * p_jit
+        env = np.minimum(1.0, t / 0.0025) * np.exp(-t * 9.0) * _np_adsr(t, dur, a=0.002, d=0.05)
+        shimmer = np.exp(-t * 18.0) * 0.24
+        sl = (np.sin(TWO_PI * f0 * t) * 0.72 + np.sin(TWO_PI * (f0 * 2.0) * t) * shimmer + np.sin(TWO_PI * (f0 * 1.5) * t) * 0.14) * env
+        sr_v = (np.sin(TWO_PI * (f0 + 2.2) * t + 0.18) * 0.72 + np.sin(TWO_PI * (f0 * 2.0) * t) * shimmer + np.sin(TWO_PI * (f0 * 1.5) * t) * 0.14) * env
+        return np.tanh(sl) * 0.85, np.tanh(sr_v) * 0.85
+
+    def _np_soft_thud(rng: Any) -> Tuple[Any, Any]:
+        dur = 0.32
+        n = int(SR * dur)
+        t = np.arange(n, dtype=np.float64) / SR
+        p_jit = float(rng.uniform(0.98, 1.02))
+        freq = (48.0 + 68.0 * np.exp(-t * 24.0)) * p_jit
+        ph = TWO_PI * np.cumsum(freq) / SR
+        body = (np.sin(ph) + 0.22 * np.sin(2.0 * ph)) * np.exp(-t * 11.0)
+        tap = _np_fft_bandpass(rng.uniform(-1.0, 1.0, size=n), 90.0, 420.0) * np.exp(-t * 48.0) * 0.40
+        att = _np_adsr(t, dur, a=0.003, d=0.04)
+        return np.tanh((body + tap) * att) * 0.88, np.tanh((body - tap * 0.5) * att) * 0.88
+
     NUMPY_GENERATORS: Dict[str, Callable[[Any], Tuple[Any, Any]]] = {
         "vine_boom": _np_vine_boom,
         "record_scratch": _np_record_scratch,
@@ -1318,6 +1608,12 @@ if HAS_NUMPY:
         "court_gasp_swell": _np_court_gasp_swell,
         "cinematic_riser": _np_cinematic_riser,
         "heartbeat_pulse": _np_heartbeat_pulse,
+        "ui_tick": _np_ui_tick,
+        "ui_click": _np_ui_click,
+        "data_chime": _np_data_chime,
+        "sub_whoosh": _np_sub_whoosh,
+        "alert_ping": _np_alert_ping,
+        "soft_thud": _np_soft_thud,
     }
 else:
     NUMPY_GENERATORS = {}
@@ -1828,6 +2124,26 @@ def load_cues(timings_path: Path) -> Tuple[List[Dict], float]:
     return cues, total_dur
 
 
+def load_ambience_from_timings(timings_path: Path) -> str:
+    """Read optional ambience_bed from shot_timings.json, falling back to 'none'."""
+    try:
+        data = json.loads(timings_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "none"
+    if not isinstance(data, dict):
+        return "none"
+    raw = str(data.get("ambience_bed") or "").strip().lower()
+    if not raw or raw == "none":
+        return "none"
+    if raw in AMBIENCE_PRESETS:
+        return raw
+    print(
+        f"Warning: unknown ambience_bed '{raw}' in {timings_path.name}; falling back to 'none'.",
+        file=sys.stderr,
+    )
+    return "none"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Procedural Shorts & Long-Form cinematic SFX engine (48 kHz stereo WAV)."
@@ -1840,8 +2156,8 @@ def main() -> int:
     parser.add_argument(
         "--ambience",
         choices=AMBIENCE_PRESETS,
-        default="none",
-        help="Optional continuous -36 dBFS stereo room-tone bed mixed into timeline WAV (default: none).",
+        default=None,
+        help="Optional continuous -36 dBFS stereo room-tone bed mixed into timeline WAV (default: shot_timings.json ambience_bed or none).",
     )
     parser.add_argument("--out", help="Output WAV path.")
     args = parser.parse_args()
@@ -1881,14 +2197,16 @@ def main() -> int:
         return 0
 
     if args.timings:
-        cues, inferred_dur = load_cues(Path(args.timings))
+        timings_path = Path(args.timings)
+        cues, inferred_dur = load_cues(timings_path)
         total_dur = max(args.duration, inferred_dur, 1.0)
+        ambience = args.ambience if args.ambience is not None else load_ambience_from_timings(timings_path)
         if HAS_NUMPY:
-            placed = _render_timeline_numpy(cues, total_dur, out_path, ambience=args.ambience)
+            placed = _render_timeline_numpy(cues, total_dur, out_path, ambience=ambience)
         else:
-            placed = _render_timeline_stdlib(cues, total_dur, out_path, ambience=args.ambience)
+            placed = _render_timeline_stdlib(cues, total_dur, out_path, ambience=ambience)
         engine_tag = "numpy" if HAS_NUMPY else "stdlib"
-        amb_tag = f", ambience={args.ambience}" if args.ambience != "none" else ""
+        amb_tag = f", ambience={ambience}" if ambience != "none" else ""
         print(f"Rendered {placed} SFX cues ({total_dur:.2f}s, {engine_tag}{amb_tag}) to {out_path}")
         return 0
 

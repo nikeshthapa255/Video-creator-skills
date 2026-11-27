@@ -98,6 +98,14 @@
       "type": "string",
       "description": "Default/fallback neural TTS voice (e.g., en-US-AvaNeural, en-US-EmmaNeural, en-GB-SoniaNeural)."
     },
+    "rate": {
+      "type": "string",
+      "description": "Optional default TTS speech rate for single-voice plans (e.g., '+10%' for Shorts, '+8%' for 16:9 commentary)."
+    },
+    "pitch": {
+      "type": "string",
+      "description": "Optional default TTS pitch offset for single-voice plans (e.g., '+0Hz', '-2Hz')."
+    },
     "voice_cast": {
       "type": "object",
       "additionalProperties": {
@@ -110,7 +118,7 @@
           },
           "rate": {
             "type": "string",
-            "description": "Speech rate offset such as '+14%' or '+4%'."
+            "description": "Speech rate offset such as '+14%' or '+8%'."
           },
           "pitch": {
             "type": "string",
@@ -127,7 +135,7 @@
     "tts_pronunciations": {
       "type": "object",
       "additionalProperties": { "type": "string" },
-      "description": "Optional map of clean display strings to phonetic TTS strings (e.g., {\"AWS\": \"A W S\", \"Pei Xuan\": \"Pay Shwen\", \"911\": \"nine-one-one\"}). Applied during TTS synthesis while captions render dialogue_or_vo."
+      "description": "Optional map of clean display strings to phonetic TTS strings (e.g., {\"AWS\": \"A W S\", \"NPC\": \"N P C\", \"Pei Xuan\": \"Pay Shwen\", \"911\": \"nine-one-one\"}). Applied during TTS synthesis while captions render dialogue_or_vo."
     },
     "bgm_mood": {
       "type": "string",
@@ -161,7 +169,7 @@
       "type": "string",
       "enum": ["none", "palace_courtyard", "throne_hall", "newsroom_air", "hearth_embers"],
       "default": "none",
-      "description": "Optional subtle -36 dBFS room-tone bed mixed by sfx_engine.py --ambience so silent pauses never drop to digital mute."
+      "description": "Optional subtle -36 dBFS room-tone bed forwarded into shot_timings.json and auto-loaded by sfx_engine.py so silent pauses never drop to digital mute."
     },
     "caption_style": {
       "type": "string",
@@ -174,11 +182,17 @@
       "maximum": 120,
       "description": "ASS caption font size (defaults: 86 on 1080x1920, 62 on 1920x1080)."
     },
+    "max_caption_chars": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 48,
+      "description": "Optional top-level maximum visible characters per caption line (defaults: 18 on 9:16, 36 on 16:9)."
+    },
     "caption_margin_v": {
       "type": "integer",
       "minimum": 40,
       "maximum": 800,
-      "description": "ASS MarginV offset from bottom in px (defaults: 420 on 1080x1920 vertical, 96 on 1920x1080 horizontal to clear YouTube scrub bar)."
+      "description": "ASS MarginV offset from bottom in px (defaults: 420 on 1080x1920 vertical, 116 on 1920x1080 horizontal to clear YouTube scrub bar inside the bottom 16% safe zone)."
     },
     "caption_tilt": {
       "type": "number",
@@ -240,12 +254,17 @@
     },
     "packaging": {
       "type": "object",
-      "description": "Optional Stage 1 / Stage 6 creator packaging bundle (thumbnails, cover frame, titles, description, pinned comment).",
+      "description": "Optional Stage 1 / Stage 6 creator packaging bundle (thumbnails, cover frame, titles, description, hashtags, tags, category, pinned comment).",
       "properties": {
         "title_candidates": { "type": "array", "items": { "type": "string" } },
         "thumbnail_16x9_paths": { "type": "array", "items": { "type": "string" } },
         "cover_9x16_path": { "type": "string" },
+        "thumbnail_headline": { "type": "string" },
+        "thumbnail_accent": { "type": "string" },
         "description": { "type": "string" },
+        "hashtags": { "type": "array", "items": { "type": "string" } },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "category": { "type": "string" },
         "pinned_comment": { "type": "string" },
         "synthetic_content_disclosure": { "type": "boolean", "default": true }
       }
@@ -437,6 +456,7 @@
               "pan_left",
               "pan_right",
               "static_drift",
+              "static_hold",
               "slow_dolly_in",
               "tilt_up",
               "tilt_down"
@@ -520,6 +540,12 @@
               "court_gasp_swell",
               "cinematic_riser",
               "heartbeat_pulse",
+              "ui_tick",
+              "ui_click",
+              "data_chime",
+              "sub_whoosh",
+              "alert_ping",
+              "soft_thud",
               "none"
             ]
           },
