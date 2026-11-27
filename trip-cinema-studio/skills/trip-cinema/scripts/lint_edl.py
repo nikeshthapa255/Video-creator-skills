@@ -3,17 +3,20 @@
 
 Enforces:
   - Style Pack loading from `styles/<style_id>.json` with per-style rules
-  - Every photo/video/tile `source_path` and graphic `backdrop_path` exists
+  - Every photo/video/tile `source_path`, graphic `backdrop_path`, and `rendered_card_path` exists
   - `in_sec >= 0`, positive duration, and source span within `source_duration_sec`
   - Per-style `max_consecutive_photos` limit (replaces fixed >2 limit)
   - Pacing variance (per-style `max_identical_duration_run`, default 4)
   - Closed-form 5-phase cubic speed-ramp source span S_req and >=50fps guardrails
   - Transition overlap handle headroom (>=0.4s) on outgoing & incoming video shots
   - J-cut and L-cut audio source handle headroom
-  - Multi-video / hybrid `tiles[]` layout integrity
+  - Multi-video / hybrid `tiles[]` layout integrity, slot-vs-source aspect ratio (<=1.85x),
+    and `focal_anchor` warnings on `has_human_closeup` tiles
   - `graphic` shot validation (`chapter_title`, `route_map`, `trip_wrapped`,
-    `cast_intro`, `text_behind_subject`, `blooper_title`)
+    `cast_intro`, `text_behind_subject`, `blooper_title`) including `rendered_card_path`
   - All `locked_by_user` pins from manifest are included in the EDL
+  - Gate 1 privacy exclusions (`--gates-state` `excluded_ids`, `excluded_paths`,
+    `forbidden_video_ranges`, and manifest `excluded_by_user: true`)
   - Zero generative I2V on shots/tiles flagged `has_human_closeup: true`
   - Valid 16:9 portrait layout handling when `aspect_profile != "9:16"`
   - Optional beat-alignment check against `beat_map.json` using overlap-adjusted cut times
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +96,7 @@ GENERATIVE_I2V_MODES = {
     "omni_i2v_scenic",
 }
 MIN_TRANSITION_HANDLE_SEC = 0.4
+MAX_SLOT_ASPECT_MISMATCH = 1.85
 
 
 def _resolve_path_str(raw_path: str) -> str:
@@ -240,6 +245,247 @@ def _lookup_manifest_asset(
     return manifest_by_path.get(_resolve_path_str(raw_path))
 
 
+def _parse_canvas_dims(edl: dict[str, Any]) -> tuple[int, int]:
+    res_str = str(edl.get("resolution") or "")
+    m = re.match(r"^(\d+)x(\d+)$", res_str)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    if str(edl.get("aspect_profile") or "16:9") == "9:16":
+        return 1080, 1920
+    return 1920, 1080
+
+
+def _resolve_asset_aspect_ratio(
+    item: dict[str, Any],
+    m_asset: dict[str, Any] | None,
+) -> float | None:
+    """Return upright width/height aspect ratio from tile/shot or manifest metadata."""
+    w = item.get("width")
+    h = item.get("height")
+    if (w is None or h is None) and m_asset is not None:
+        w = m_asset.get("display_width") or m_asset.get("width")
+        h = m_asset.get("display_height") or m_asset.get("height")
+    orient = str(item.get("orientation") or (m_asset.get("orientation") if m_asset else "") or "").lower()
+    if w and h:
+        wf, hf = float(w), float(h)
+        if wf > 0 and hf > 0:
+            if orient == "portrait" and wf > hf:
+                wf, hf = hf, wf
+            elif orient == "landscape" and hf > wf:
+                wf, hf = hf, wf
+            return wf / hf
+    if orient == "portrait":
+        return 9.0 / 16.0
+    if orient == "landscape":
+        return 16.0 / 9.0
+    if orient == "square":
+        return 1.0
+    return None
+
+
+def _compute_tile_slot_ar(
+    layout: str,
+    n_tiles: int,
+    tile_idx: int,
+    canvas_w: int,
+    canvas_h: int,
+    gutter: int,
+    src_ar: float | None,
+) -> float | None:
+    """Compute rendered slot width/height aspect ratio matching render_trip.py geometry."""
+    if canvas_w <= 0 or canvas_h <= 0:
+        return None
+    g = max(0, min(32, gutter - (gutter % 2)))
+    if layout in {"split_2up_video", "split_diptych_pair"} or (layout == "bento_living_grid" and n_tiles == 2):
+        slot_w = (canvas_w - g) / 2.0
+        return slot_w / float(canvas_h)
+    if layout == "triptych_3up_video":
+        cols = 2 if n_tiles == 2 else 3
+        slot_w = (canvas_w - (cols - 1) * g) / float(cols)
+        return slot_w / float(canvas_h)
+    if layout == "bento_living_grid" and n_tiles == 3:
+        left_w = float(int(canvas_w * 0.58) & ~1)
+        if tile_idx == 0:
+            return left_w / float(canvas_h)
+        right_w = float(canvas_w) - left_w - g
+        half_h = (canvas_h - g) / 2.0
+        return right_w / max(1.0, half_h)
+    if layout == "bento_living_grid" and n_tiles >= 4:
+        slot_w = (canvas_w - g) / 2.0
+        slot_h = (canvas_h - g) / 2.0
+        return slot_w / max(1.0, slot_h)
+    if layout == "polaroid_stack":
+        if src_ar is not None and src_ar > 1.15:
+            return 4.0 / 3.0
+        if src_ar is not None and src_ar < 0.88:
+            return 4.0 / 5.0
+        return 1.0
+    return None
+
+
+def _asset_identity_tokens(raw_path: str | None, m_asset: dict[str, Any] | None) -> set[str]:
+    tokens: set[str] = set()
+    if raw_path:
+        p = Path(raw_path).expanduser()
+        tokens.add(p.name.lower())
+        tokens.add(p.stem.lower())
+    if m_asset:
+        for key in ("id", "video_code", "filename"):
+            val = m_asset.get(key)
+            if val is not None and str(val).strip():
+                tokens.add(str(val).strip().lower())
+        idx_val = m_asset.get("index")
+        if idx_val is not None:
+            try:
+                i_int = int(idx_val)
+                tokens.add(str(i_int))
+                tokens.add(f"#{i_int}")
+                tokens.add(f"#{i_int:03d}")
+                tokens.add(f"p{i_int:03d}")
+                tokens.add(f"#p{i_int:03d}")
+            except (TypeError, ValueError):
+                pass
+    return tokens
+
+
+def _parse_range_list(raw_val: Any) -> list[tuple[float, float]]:
+    ranges: list[tuple[float, float]] = []
+    if not isinstance(raw_val, list):
+        return ranges
+    if len(raw_val) == 2 and all(isinstance(x, (int, float)) for x in raw_val):
+        a, b = float(raw_val[0]), float(raw_val[1])
+        if b > a:
+            ranges.append((a, b))
+        return ranges
+    for entry in raw_val:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            try:
+                a, b = float(entry[0]), float(entry[1])
+                if b > a:
+                    ranges.append((a, b))
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(entry, dict) and "start" in entry and "end" in entry:
+            try:
+                a, b = float(entry["start"]), float(entry["end"])
+                if b > a:
+                    ranges.append((a, b))
+            except (TypeError, ValueError):
+                continue
+    return ranges
+
+
+def _parse_privacy_exclusions(
+    gates_state: dict[str, Any] | None,
+    manifest: dict[str, Any] | None,
+) -> tuple[set[str], set[str], dict[str, list[tuple[float, float]]], dict[str, list[tuple[float, float]]]]:
+    """Collect excluded paths/IDs and forbidden video time ranges from gates_state and manifest."""
+    excluded_paths: set[str] = set()
+    excluded_tokens: set[str] = set()
+    forbidden_by_path: dict[str, list[tuple[float, float]]] = {}
+    forbidden_by_token: dict[str, list[tuple[float, float]]] = {}
+
+    sources: list[dict[str, Any]] = []
+    if isinstance(gates_state, dict):
+        sources.append(gates_state)
+        if isinstance(gates_state.get("gate1"), dict):
+            sources.append(gates_state["gate1"])
+        if isinstance(gates_state.get("privacy"), dict):
+            sources.append(gates_state["privacy"])
+
+    for src in sources:
+        for item in src.get("excluded_ids") or []:
+            tok = str(item).strip().lower()
+            if tok:
+                excluded_tokens.add(tok)
+                if tok.startswith("#") and tok[1:].isdigit():
+                    n = int(tok[1:])
+                    excluded_tokens.update({str(n), f"#{n}", f"#{n:03d}"})
+                elif tok.isdigit():
+                    n = int(tok)
+                    excluded_tokens.update({str(n), f"#{n}", f"#{n:03d}"})
+        for raw_p in src.get("excluded_paths") or []:
+            if raw_p:
+                excluded_paths.add(_resolve_path_str(str(raw_p)))
+        f_map = src.get("forbidden_video_ranges")
+        if isinstance(f_map, dict):
+            for key, r_raw in f_map.items():
+                intervals = _parse_range_list(r_raw)
+                if not intervals:
+                    continue
+                k_str = str(key).strip()
+                if not k_str:
+                    continue
+                if "/" in k_str or "\\" in k_str or Path(k_str).expanduser().exists():
+                    resolved_k = _resolve_path_str(k_str)
+                    forbidden_by_path.setdefault(resolved_k, []).extend(intervals)
+                forbidden_by_token.setdefault(k_str.lower(), []).extend(intervals)
+
+    if manifest:
+        for asset in manifest.get("assets", []):
+            sp_raw = asset.get("source_path")
+            if not sp_raw:
+                continue
+            sp = _resolve_path_str(sp_raw)
+            tokens = _asset_identity_tokens(sp, asset)
+            if asset.get("excluded_by_user") or (tokens & excluded_tokens):
+                excluded_paths.add(sp)
+            for tok in tokens:
+                if tok in forbidden_by_token:
+                    forbidden_by_path.setdefault(sp, []).extend(forbidden_by_token[tok])
+
+    return excluded_paths, excluded_tokens, forbidden_by_path, forbidden_by_token
+
+
+def _check_excluded_path(
+    raw_path: str | None,
+    field_name: str,
+    label: str,
+    manifest_by_path: dict[str, dict[str, Any]],
+    excluded_paths: set[str],
+    excluded_tokens: set[str],
+    errors: list[str],
+) -> None:
+    if not raw_path:
+        return
+    resolved = _resolve_path_str(raw_path)
+    m_asset = manifest_by_path.get(resolved)
+    tokens = _asset_identity_tokens(raw_path, m_asset)
+    if resolved in excluded_paths or bool(tokens & excluded_tokens):
+        errors.append(
+            f"{label} Privacy exclusion violation (Gate 1): banned asset referenced in {field_name}: {raw_path}"
+        )
+
+
+def _check_forbidden_video_ranges(
+    raw_path: str | None,
+    m_asset: dict[str, Any] | None,
+    span_start: float,
+    span_end: float,
+    label: str,
+    forbidden_by_path: dict[str, list[tuple[float, float]]],
+    forbidden_by_token: dict[str, list[tuple[float, float]]],
+    errors: list[str],
+) -> None:
+    if not raw_path or span_end <= span_start:
+        return
+    resolved = _resolve_path_str(raw_path)
+    intervals: list[tuple[float, float]] = list(forbidden_by_path.get(resolved, []))
+    for tok in _asset_identity_tokens(raw_path, m_asset):
+        intervals.extend(forbidden_by_token.get(tok, []))
+    seen_iv: set[tuple[float, float]] = set()
+    for f_start, f_end in intervals:
+        iv = (round(f_start, 4), round(f_end, 4))
+        if iv in seen_iv:
+            continue
+        seen_iv.add(iv)
+        if span_start < f_end - 1e-4 and span_end > f_start + 1e-4:
+            errors.append(
+                f"{label} Privacy range violation (Gate 1): active clip span [{span_start:.2f}s, {span_end:.2f}s] "
+                f"(including J/L-cut and transition handles) overlaps forbidden_video_ranges [{f_start:.2f}s, {f_end:.2f}s] on {raw_path}."
+            )
+
+
 def lint_edl(
     edl: dict[str, Any],
     manifest: dict[str, Any] | None = None,
@@ -247,6 +493,7 @@ def lint_edl(
     beat_tolerance_sec: float = 0.18,
     strict_beats: bool = False,
     styles_dir: Path | None = None,
+    gates_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate an EDL v1.0 or v2.0 dict and return structured errors, warnings, and stats."""
     errors: list[str] = []
@@ -269,12 +516,15 @@ def lint_edl(
     active_style_id = str(style_pack.get("style_id", edl.get("style_id") or "cinema_doc"))
     pacing = style_pack.get("pacing_rules") or {}
     transitions_cfg = style_pack.get("transitions") or {}
+    layouts_cfg = style_pack.get("layouts") or {}
     max_consec_photos = int(pacing.get("max_consecutive_photos", 2))
     max_identical_run = int(pacing.get("max_identical_duration_run", 4))
     allow_speed_ramps = bool(pacing.get("allow_speed_ramps", True))
     max_speed_ramp_ratio = float(pacing.get("max_speed_ramp_ratio", 0.20))
     allowed_transitions = set(transitions_cfg.get("allowed") or VALID_TRANSITIONS_OUT)
     default_trans_dur = float(transitions_cfg.get("default_duration_sec", 0.45))
+    style_gutter = int(layouts_cfg.get("gutter_px", 8))
+    canvas_w, canvas_h = _parse_canvas_dims(edl)
 
     aspect_profile = str(edl.get("aspect_profile") or "16:9")
     if aspect_profile not in {"16:9", "9:16"}:
@@ -291,6 +541,12 @@ def lint_edl(
             manifest_by_path[sp] = asset
             if asset.get("locked_by_user"):
                 locked_paths.add(sp)
+
+    excluded_paths, excluded_tokens, forbidden_by_path, forbidden_by_token = _parse_privacy_exclusions(
+        gates_state=gates_state,
+        manifest=manifest,
+    )
+    locked_paths -= excluded_paths
 
     # Precompute shot output durations for neighbor J/L-cut sanity checks
     shot_out_durs = [_resolve_output_duration(s) for s in shots]
@@ -363,22 +619,32 @@ def lint_edl(
 
             backdrop = shot.get("backdrop_path")
             if backdrop:
+                _check_excluded_path(backdrop, "backdrop_path", f"[{sid}]", manifest_by_path, excluded_paths, excluded_tokens, errors)
                 if not Path(backdrop).expanduser().exists():
                     errors.append(f"[{sid}] Missing backdrop_path on disk: {backdrop}")
                 else:
                     seen_edl_paths.add(_resolve_path_str(backdrop))
-            elif gtype == "chapter_title" and active_style_id == "cinema_doc":
+            elif gtype == "chapter_title" and active_style_id == "cinema_doc" and not shot.get("rendered_card_path"):
                 warnings.append(
                     f"[{sid}] cinema_doc chapter_title should provide backdrop_path (blurred hero photo, never flat black)."
                 )
 
+            rendered_card = shot.get("rendered_card_path")
+            if rendered_card:
+                _check_excluded_path(rendered_card, "rendered_card_path", f"[{sid}]", manifest_by_path, excluded_paths, excluded_tokens, errors)
+                if not Path(rendered_card).expanduser().exists():
+                    errors.append(f"[{sid}] Missing rendered_card_path on disk: {rendered_card}")
+                else:
+                    seen_edl_paths.add(_resolve_path_str(rendered_card))
+
             if src:
+                _check_excluded_path(src, "source_path", f"[{sid}]", manifest_by_path, excluded_paths, excluded_tokens, errors)
                 if not Path(src).expanduser().exists():
                     errors.append(f"[{sid}] Missing graphic source_path on disk: {src}")
                 else:
                     seen_edl_paths.add(_resolve_path_str(src))
-            elif gtype in {"text_behind_subject", "cast_intro"} and not backdrop:
-                errors.append(f"[{sid}] graphic_type={gtype!r} requires source_path or backdrop_path.")
+            elif gtype in {"text_behind_subject", "cast_intro"} and not backdrop and not rendered_card:
+                errors.append(f"[{sid}] graphic_type={gtype!r} requires source_path, backdrop_path, or rendered_card_path.")
 
             mask_path = shot.get("mask_path")
             if mask_path and not Path(mask_path).expanduser().exists():
@@ -436,6 +702,8 @@ def lint_edl(
                 t_mtype = str(tile.get("media_type", "video"))
                 if t_mtype not in {"photo", "video"}:
                     errors.append(f"{t_label} invalid media_type {t_mtype!r}; expected 'photo' or 'video'.")
+                if t_src:
+                    _check_excluded_path(t_src, "tiles[].source_path", t_label, manifest_by_path, excluded_paths, excluded_tokens, errors)
                 if not t_src or not Path(t_src).expanduser().exists():
                     errors.append(f"{t_label} missing source_path on disk: {t_src}")
                 else:
@@ -447,6 +715,29 @@ def lint_edl(
                 t_human = bool(tile.get("has_human_closeup", False)) or bool(
                     t_asset.get("has_human_closeup", False) if t_asset else False
                 )
+                if t_human and tile.get("focal_anchor") is None:
+                    warnings.append(
+                        f"{t_label} tile has has_human_closeup=true but omits focal_anchor; "
+                        f"set focal_anchor (e.g. [0.5, 0.35]) to protect faces from center-cropping."
+                    )
+
+                # Slot-vs-source aspect ratio check (> 1.85x mismatch -> hard error unless explicitly overridden)
+                src_ar = _resolve_asset_aspect_ratio(tile, t_asset)
+                slot_ar = _compute_tile_slot_ar(layout, len(tiles), t_idx, canvas_w, canvas_h, style_gutter, src_ar)
+                if src_ar is not None and slot_ar is not None and not tile.get("allow_aspect_crop"):
+                    ar_ratio = max(slot_ar / src_ar, src_ar / slot_ar)
+                    if ar_ratio > MAX_SLOT_ASPECT_MISMATCH:
+                        suggestion = (
+                            "split_2up_video, triptych_3up_video, polaroid_stack, or bento_living_grid slot 0"
+                            if src_ar < 0.9
+                            else "bento_living_grid (3-up right / 4-up), polaroid_stack, or single"
+                        )
+                        errors.append(
+                            f"{t_label} Aspect mismatch ({ar_ratio:.2f}x > {MAX_SLOT_ASPECT_MISMATCH:.2f}x): "
+                            f"source AR {src_ar:.2f} does not fit layout={layout!r} slot AR {slot_ar:.2f}. "
+                            f"Use {suggestion} instead."
+                        )
+
                 motion_lower = str(shot.get("motion_type", "")).lower()
                 if t_human and (bool(shot.get("use_i2v", False)) or motion_lower in GENERATIVE_I2V_MODES):
                     errors.append(
@@ -494,6 +785,8 @@ def lint_edl(
         else:
             if layout in MULTI_VIDEO_REQUIRED_TILES:
                 errors.append(f"[{sid}] layout={layout!r} requires a non-empty tiles[] array.")
+            if src:
+                _check_excluded_path(src, "source_path", f"[{sid}]", manifest_by_path, excluded_paths, excluded_tokens, errors)
             if not src or not Path(src).expanduser().exists():
                 errors.append(f"[{sid}] Missing source_path on disk: {src}")
             else:
@@ -640,6 +933,9 @@ def lint_edl(
         orient = shot.get("orientation")
         if not orient and m_asset is not None:
             orient = m_asset.get("orientation")
+        pair_src = shot.get("pair_source_path")
+        if pair_src:
+            _check_excluded_path(pair_src, "pair_source_path", f"[{sid}]", manifest_by_path, excluded_paths, excluded_tokens, errors)
         if aspect_profile == "16:9" and orient == "portrait" and mtype in {"photo", "video"} and not has_tiles:
             handling = shot.get("layout") or shot.get("aspect_handling") or edl.get("vertical_layout")
             if handling not in VALID_PORTRAIT_MODES:
@@ -647,11 +943,27 @@ def lint_edl(
                     f"[{sid}] Portrait asset in 16:9 requires layout/aspect_handling in {sorted(VALID_PORTRAIT_MODES)}, got {handling!r}."
                 )
             elif handling == "split_diptych_pair":
-                pair_src = shot.get("pair_source_path")
                 if not pair_src or not Path(pair_src).expanduser().exists():
                     errors.append(f"[{sid}] split_diptych_pair requires an existing pair_source_path (or tiles[]).")
                 else:
                     seen_edl_paths.add(_resolve_path_str(pair_src))
+
+        if layout == "split_diptych_pair" and not has_tiles and pair_src:
+            slot_ar = _compute_tile_slot_ar("split_diptych_pair", 2, 0, canvas_w, canvas_h, style_gutter, None)
+            if slot_ar is not None and not shot.get("allow_aspect_crop"):
+                for p_lbl, p_path, p_item in (
+                    (f"[{sid}].source_path", src, shot),
+                    (f"[{sid}].pair_source_path", pair_src, {}),
+                ):
+                    p_asset = _lookup_manifest_asset(p_path, manifest_by_path)
+                    p_ar = _resolve_asset_aspect_ratio(p_item, p_asset)
+                    if p_ar is not None:
+                        ar_ratio = max(slot_ar / p_ar, p_ar / slot_ar)
+                        if ar_ratio > MAX_SLOT_ASPECT_MISMATCH:
+                            errors.append(
+                                f"{p_lbl} Aspect mismatch ({ar_ratio:.2f}x > {MAX_SLOT_ASPECT_MISMATCH:.2f}x): "
+                                f"source AR {p_ar:.2f} does not fit split_diptych_pair slot AR {slot_ar:.2f}."
+                            )
 
         # ---- 8. Transition overlap handle headroom (>= 0.4s) ----
         trans_out = _resolve_transition_out(shot)
@@ -763,6 +1075,47 @@ def lint_edl(
                         f"({tail_avail:.2f}s; source ends at {src_dur:.2f}s, shot uses through {eff_src_end:.2f}s)."
                     )
 
+        # ---- 10. Gate 1 forbidden_video_ranges overlap check (including J/L-cut & transition handles) ----
+        prev_trans_handle = 0.0
+        if idx > 0 and _resolve_transition_out(shots[idx - 1]) != "cut":
+            prev_trans_handle = max(
+                MIN_TRANSITION_HANDLE_SEC,
+                float(shots[idx - 1].get("transition_duration_sec", default_trans_dur)),
+            )
+        next_trans_handle = max(MIN_TRANSITION_HANDLE_SEC, overlap_sec) if overlap_sec > 0 else 0.0
+        sp_rate_for_audio = (
+            float(sp.get("rate", 1.0))
+            if isinstance(sp, dict) and str(sp.get("mode", "")) == "constant" and float(sp.get("rate", 1.0)) > 0
+            else 1.0
+        )
+
+        if mtype == "video" and not has_tiles and src:
+            active_start = max(0.0, in_sec - max(j_cut * sp_rate_for_audio, prev_trans_handle * sp_rate_for_audio))
+            active_end = eff_src_end + max(l_cut * sp_rate_for_audio, next_trans_handle * sp_rate_for_audio)
+            _check_forbidden_video_ranges(
+                src, m_asset, active_start, active_end, f"[{sid}]",
+                forbidden_by_path, forbidden_by_token, errors,
+            )
+        elif has_tiles:
+            lead_idx = shot.get("audio_lead_tile")
+            for t_idx, tile in enumerate(tiles):
+                if str(tile.get("media_type", "video")) != "video":
+                    continue
+                t_src = tile.get("source_path")
+                t_asset = _lookup_manifest_asset(t_src, manifest_by_path)
+                t_in = float(tile.get("in_sec", 0.0))
+                t_out = tile.get("out_sec")
+                t_end = float(t_out) if t_out is not None else (t_in + out_dur)
+                is_audio_tile = (isinstance(lead_idx, int) and lead_idx == t_idx) or bool(tile.get("audio_lead"))
+                t_j = j_cut if is_audio_tile else 0.0
+                t_l = l_cut if is_audio_tile else 0.0
+                t_start = max(0.0, t_in - max(t_j, prev_trans_handle))
+                t_active_end = t_end + max(t_l, next_trans_handle)
+                _check_forbidden_video_ranges(
+                    t_src, t_asset, t_start, t_active_end, f"[{sid}.tiles[{t_idx}]]",
+                    forbidden_by_path, forbidden_by_token, errors,
+                )
+
         timeline_cursor += max(0.0, out_dur - overlap_sec)
         cut_times.append(round(timeline_cursor, 3))
 
@@ -822,6 +1175,8 @@ def lint_edl(
             "transition_overlaps": transition_overlaps_count,
             "estimated_duration_sec": round(timeline_cursor, 2),
             "locked_pins_checked": len(locked_paths),
+            "excluded_assets_checked": len(excluded_paths) + len(excluded_tokens),
+            "forbidden_video_ranges_checked": len(forbidden_by_path) + len(forbidden_by_token),
             "beat_alignment": beat_stats,
         },
     }
@@ -830,8 +1185,9 @@ def lint_edl(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic $0 JSON EDL v2.0 validator for trip-cinema-studio.")
     parser.add_argument("--edl", required=True, help="Path to EDL JSON file.")
-    parser.add_argument("--manifest", help="Optional path to ./work/manifest.json for locked_by_user pin checks.")
+    parser.add_argument("--manifest", help="Optional path to ./work/manifest.json for locked_by_user and aspect checks.")
     parser.add_argument("--beat-map", help="Optional path to ./work/beat_map.json for beat alignment checks.")
+    parser.add_argument("--gates-state", help="Optional path to ./work/gates_state.json for Gate 1 privacy exclusion checks.")
     parser.add_argument("--styles-dir", help="Optional override directory for styles/<style_id>.json presets.")
     parser.add_argument("--beat-tolerance", type=float, default=0.18, help="Beat alignment tolerance in seconds (default: 0.18).")
     parser.add_argument("--strict-beats", action="store_true", help="Treat low beat alignment as a validation error.")
@@ -840,6 +1196,7 @@ def main() -> int:
     edl = json.loads(Path(args.edl).expanduser().read_text(encoding="utf-8"))
     manifest = json.loads(Path(args.manifest).expanduser().read_text(encoding="utf-8")) if args.manifest else None
     beat_map = json.loads(Path(args.beat_map).expanduser().read_text(encoding="utf-8")) if args.beat_map else None
+    gates_state = json.loads(Path(args.gates_state).expanduser().read_text(encoding="utf-8")) if args.gates_state else None
     styles_dir = Path(args.styles_dir).expanduser() if args.styles_dir else None
 
     report = lint_edl(
@@ -849,6 +1206,7 @@ def main() -> int:
         beat_tolerance_sec=args.beat_tolerance,
         strict_beats=args.strict_beats,
         styles_dir=styles_dir,
+        gates_state=gates_state,
     )
     print(json.dumps(report, indent=2))
     return 0 if report["valid"] else 1

@@ -25,13 +25,40 @@ fi
 CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // "."' 2>/dev/null || echo ".")"
 QA_FLAG="${CWD}/work/qa_passed.flag"
 
-if [[ -f "$QA_FLAG" ]]; then
+shopt -s nullglob
+CANDIDATES=(
+  "${CWD}/output/"*.mp4
+  "${CWD}/work/"*master*.mp4
+  "${CWD}/work/final_trip.mp4"
+  "${CWD}/work/trip_master_1080p.mp4"
+  "${CWD}/work/trip_master_4k.mp4"
+  "${CWD}/output/trip_cinema.mp4"
+  "${CWD}/output/final_trip.mp4"
+)
+shopt -u nullglob
+
+NEWEST_MP4=""
+for mp4 in "${CANDIDATES[@]}"; do
+  [[ -f "$mp4" ]] || continue
+  if [[ -z "$NEWEST_MP4" || "$mp4" -nt "$NEWEST_MP4" ]]; then
+    NEWEST_MP4="$mp4"
+  fi
+done
+
+if [[ -z "$NEWEST_MP4" ]]; then
   echo '{}'
   exit 0
 fi
 
-if [[ -f "${CWD}/work/final_trip.mp4" || -f "${CWD}/work/trip_master_1080p.mp4" || -f "${CWD}/work/trip_master_4k.mp4" || -f "${CWD}/output/trip_cinema.mp4" || -f "${CWD}/output/final_trip.mp4" ]]; then
-  jq -nc '{decision:"continue",reason:"A rendered MP4 exists, but ./work/qa_passed.flag is missing. Run render_trip.py --extract-qa, inspect the end-frame contact sheets and <=60s chunks with read_file, and write ./work/qa_passed.flag once verified."}'
+if [[ ! -f "$QA_FLAG" ]]; then
+  jq -nc --arg mp4 "$NEWEST_MP4" \
+    '{decision:"continue",reason:("A rendered MP4 exists (" + $mp4 + "), but ./work/qa_passed.flag is missing. Run render_trip.py --extract-qa --edl (or macos_extract_qa.jxa), inspect qa_video_alignment.jpg, qa_chapter_cards.jpg, qa_collages.jpg, qa_transitions.jpg, qa_metrics.json, qa_sheet_*.jpg, and <=60s chunks, complete the 3-persona review panel, and write ./work/qa_passed.flag once verified.")}'
+  exit 0
+fi
+
+if [[ "$NEWEST_MP4" -nt "$QA_FLAG" ]]; then
+  jq -nc --arg mp4 "$NEWEST_MP4" \
+    '{decision:"continue",reason:("Rendered MP4 (" + $mp4 + ") is newer than ./work/qa_passed.flag (stale QA sign-off). Re-run --extract-qa --edl, re-inspect all QA artifacts and <=60s chunks, and update ./work/qa_passed.flag once verified.")}'
   exit 0
 fi
 

@@ -185,6 +185,10 @@
             "type": "string",
             "description": "Optional pre-extracted PNG foreground alpha mask (from macos_extract_masks.jxa) for text_behind_subject or cast_intro."
           },
+          "rendered_card_path": {
+            "type": "string",
+            "description": "Optional pre-rendered bespoke PNG/JPG or MP4 graphic card passed directly through the renderer for any graphic_type (cast_intro, text_behind_subject, route_map, chapter_title, trip_wrapped, blooper_title)."
+          },
           "waypoints": {
             "type": "array",
             "description": "Ordered GPS stops for graphic_type='route_map'.",

@@ -1,42 +1,51 @@
 #!/usr/bin/env python3
-"""Deterministic FFmpeg master renderer and QA extractor for trip-cinema-studio (v0.2.0).
+"""Deterministic FFmpeg master renderer and QA extractor for trip-cinema-studio (v0.2.1).
 
-Implements v0.2.0 parity with the macOS native engine:
+Implements cross-platform Linux / FFmpeg production parity:
   - Declarative Style Pack loading from `styles/<style_id>.json`
     (`color_grade.ffmpeg_vf`, `textures.grain_amount`, `audio.duck_bgm_db`, palette/typography)
-  - Explicit `timeline_cursor` video assembly with frame-locked `xfade` offsets
-    (`dissolve`, `slideleft`/`slideright`/`slideup`/`slidedown` + `boxblur` whip-pan,
-    `fadewhite` flash cut, `wipeleft` paper wipe, warm `light_leak`/`film_burn`, `zoom_punch`)
-    — eliminating the v0.1.0 cumulative `-0.25s` A/V desync bug
-  - `media_type == "graphic"` support (compositing pre-rendered Remotion PNG/MP4 cards
-    or rendering styled Pillow/FFmpeg cards for `chapter_title`, `route_map`,
-    `trip_wrapped`, `cast_intro`, `text_behind_subject`, `blooper_title`)
-  - `speed_profile` support (`constant` slow-mo `setpts=2.0*PTS`/`2.5*PTS` and
-    5-phase analytical micro-slice `cubic_ramp` smoothstep ramps)
-  - Multi-source video/photo layouts: `split_2up_video`, `triptych_3up_video`,
-    `split_diptych_pair`, `bento_living_grid`, `polaroid_stack`, `super8_frame`,
-    and `blurred_bg_pillarbox`
+  - Separate HLG (`arib-std-b67`) vs. PQ (`smpte2084`) HDR-to-SDR Rec.709 decode
+    (never applying PQ `npl=100` Mobius tonemapping to HLG smartphone clips)
+  - Video-only (`-an -frames:v`) shot intermediates, probed `xfade` offsets,
+    cut-aligned segment assembly (`-c copy` concat), `--workers N` parallel rendering,
+    and `--reuse-cache` content-hash caching
+  - Clean `xfade` transitions (`dissolve`, `smoothleft`/`smoothright`/`smoothup`/`smoothdown`,
+    `wipeleft`, warm `light_leak`/`film_burn`, `zoomin`) with auto-fade collision guard
+  - Portrait & framed video pipeline running HDR decode -> `vidstab` -> `speed_profile`
+    BEFORE `single`, `blurred_bg_pillarbox`, or `super8_frame` framing
+  - `focal_anchor`-aware collage tile crops + balanced `4:5`/`4:3` `polaroid_stack` framing
+  - `media_type == "graphic"` support including bespoke `rendered_card_path` passthrough
   - 4-track (`NAT_A`, `NAT_B`, `BGM`, `SFX`) `adelay` + `amix` frame-locked audio
-    with J/L-cut overlaps and smooth `sonic_postcard` BGM ducking
-  - HDR-to-SDR Rec.709 Mobius tone-mapping (`zscale`/`tonemap`), optional 2-pass
-    `vidstab`, 2x supersampled `zoompan` Ken Burns, two-pass `-14 LUFS` `LRA=9`
-    `linear=true` EBU R128 mastering, and `--extract-qa` review extraction
+    with J/L-cut overlaps, smooth `sonic_postcard` BGM ducking, and two-pass `-14 LUFS` mastering
+  - EDL-aware `--extract-qa --edl` generating `qa_video_alignment.jpg`, `qa_chapter_cards.jpg`,
+    `qa_collages.jpg`, `qa_transitions.jpg`, `qa_metrics.json`, `qa_sheet_*.jpg`, and `<=60s` chunks
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import math
+import os
 import re
+import statistics
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 
-HDR_TONEMAP_CHAIN = (
-    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
-    "tonemap=tonemap=mobius:desat=0,"
+RENDERER_VERSION = "0.2.1-t1t5"
+
+HLG_TO_SDR_ZSCALE = (
+    "zscale=pin=bt2020:min=bt2020nc:p=bt709:m=bt709:r=tv,"
+    "format=yuv420p,eq=gamma=0.95:brightness=-0.02"
+)
+PQ_TO_SDR_MOBIUS = (
+    "zscale=tin=smpte2084:pin=bt2020:min=bt2020nc:t=linear:npl=100,"
+    "format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,"
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
 
@@ -96,19 +105,26 @@ DEFAULT_STYLE_PACK: dict[str, Any] = {
 XFADE_TRANSITIONS: dict[str, tuple[str, float, str | None]] = {
     "dissolve": ("dissolve", 0.45, None),
     "xfade_dissolve": ("dissolve", 0.45, None),
-    "whip_pan_left": ("slideleft", 0.36, "whip"),
-    "whip_pan_right": ("slideright", 0.36, "whip"),
-    "whip_pan_up": ("slideup", 0.36, "whip"),
-    "whip_pan_down": ("slidedown", 0.36, "whip"),
-    "flash_cut": ("fadewhite", 0.20, None),
+    "whip_pan_left": ("smoothleft", 0.36, None),
+    "whip_pan_right": ("smoothright", 0.36, None),
+    "whip_pan_up": ("smoothup", 0.36, None),
+    "whip_pan_down": ("smoothdown", 0.36, None),
+    "flash_cut": ("dissolve", 0.18, None),
     "paper_wipe": ("wipeleft", 0.38, None),
     "light_leak": ("dissolve", 0.45, "warm_burn"),
-    "film_burn": ("fadewhite", 0.45, "warm_burn"),
+    "film_burn": ("dissolve", 0.45, "warm_burn"),
     "zoom_punch": ("zoomin", 0.32, None),
 }
 
 VIDEO_CARD_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 IMAGE_CARD_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+MULTI_TILE_LAYOUTS = {
+    "split_2up_video",
+    "triptych_3up_video",
+    "bento_living_grid",
+    "polaroid_stack",
+    "split_diptych_pair",
+}
 
 
 def _run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -119,33 +135,173 @@ def _probe_filters() -> set[str]:
     proc = _run(["ffmpeg", "-hide_banner", "-filters"], timeout=10)
     return set(
         re.findall(
-            r"\b(zscale|vidstabdetect|vidstabtransform|acrossfade|loudnorm|xfade|boxblur|adelay|amix)\b",
+            r"\b(zscale|tonemap|signalstats|vidstabdetect|vidstabtransform|acrossfade|loudnorm|xfade|boxblur|adelay|amix)\b",
             proc.stdout or "",
         )
     )
 
 
 def _probe_video_info(path: Path, dry_run: bool = False) -> dict[str, Any]:
+    default_info: dict[str, Any] = {
+        "has_audio": True if dry_run else False,
+        "is_hdr": False,
+        "color_transfer": "",
+        "color_primaries": "",
+        "color_profile": "SDR_Rec709",
+        "duration_sec": None,
+        "width": None,
+        "height": None,
+    }
     if dry_run or not path.exists():
-        return {"has_audio": True, "is_hdr": False, "duration_sec": None}
+        return default_info
     proc = _run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         timeout=15,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
-        return {"has_audio": False, "is_hdr": False, "duration_sec": None}
+        return default_info
     data = json.loads(proc.stdout)
     streams = data.get("streams", [])
     v = next((s for s in streams if s.get("codec_type") == "video"), {})
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
     transfer = (v.get("color_transfer") or "").lower()
-    dur_raw = (data.get("format") or {}).get("duration")
+    primaries = (v.get("color_primaries") or "").lower()
+    if transfer == "arib-std-b67":
+        color_profile = "HDR_HLG"
+    elif transfer == "smpte2084":
+        color_profile = "HDR_PQ"
+    else:
+        color_profile = "SDR_Rec709"
+
+    dur_raw = v.get("duration") or (data.get("format") or {}).get("duration")
     dur = float(dur_raw) if dur_raw is not None else None
+    w = int(v["width"]) if v.get("width") else None
+    h = int(v["height"]) if v.get("height") else None
+    rot = 0
+    v_tags = {k.lower(): val for k, val in (v.get("tags") or {}).items()}
+    if "rotate" in v_tags:
+        try:
+            rot = abs(int(v_tags["rotate"]))
+        except (TypeError, ValueError):
+            rot = 0
+    for sd in v.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                rot = abs(int(sd["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    if w and h and rot in (90, 270):
+        w, h = h, w
+
     return {
         "has_audio": has_audio,
-        "is_hdr": transfer in {"arib-std-b67", "smpte2084"},
+        "is_hdr": color_profile in {"HDR_HLG", "HDR_PQ"},
+        "color_transfer": transfer,
+        "color_primaries": primaries,
+        "color_profile": color_profile,
         "duration_sec": dur,
+        "width": w,
+        "height": h,
     }
+
+
+def _hdr_to_sdr_vf(
+    info: dict[str, Any],
+    avail_filters: set[str],
+    shot_hint: dict[str, Any] | None = None,
+) -> str:
+    """Return HLG-safe or PQ-safe HDR-to-SDR FFmpeg filter chain (or '' for SDR).
+
+    Never applies PQ `npl=100` Mobius tonemapping to HLG (`arib-std-b67`) clips.
+    """
+    transfer = str(info.get("color_transfer") or "").lower()
+    profile = str(info.get("color_profile") or "")
+    hint_profile = str((shot_hint or {}).get("color_profile") or "")
+    hint_is_hdr = bool((shot_hint or {}).get("is_hdr", False))
+
+    if not transfer and hint_profile in {"HDR_HLG", "HDR_PQ"}:
+        profile = hint_profile
+
+    if transfer == "smpte2084" or profile == "HDR_PQ":
+        if "zscale" in avail_filters and "tonemap" in avail_filters:
+            return PQ_TO_SDR_MOBIUS
+        if "zscale" in avail_filters:
+            return "zscale=pin=bt2020:min=bt2020nc:p=bt709:m=bt709:r=tv,format=yuv420p,eq=gamma=0.92:brightness=-0.03"
+        return "format=yuv420p,eq=gamma=0.92:brightness=-0.03"
+
+    if transfer == "arib-std-b67" or profile == "HDR_HLG" or bool(info.get("is_hdr")) or hint_is_hdr:
+        if "zscale" in avail_filters:
+            return HLG_TO_SDR_ZSCALE
+        return "format=yuv420p,eq=gamma=0.95:brightness=-0.02"
+
+    return ""
+
+
+def _probe_clip_duration(path: Path, fallback: float) -> float:
+    """Probe exact video stream duration of a rendered shot/segment via ffprobe."""
+    if not path.is_file():
+        return fallback
+    proc = _run(
+        [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_entries", "stream=codec_type,duration:format=duration",
+            str(path),
+        ],
+        timeout=15,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return fallback
+    try:
+        data = json.loads(proc.stdout)
+        v_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+        raw = v_stream.get("duration") or (data.get("format") or {}).get("duration")
+        if raw is not None:
+            val = float(raw)
+            if val > 0.01:
+                return val
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return fallback
+
+
+def _probe_media_aspect(
+    path: Path,
+    media_type: str,
+    item: dict[str, Any],
+    dry_run: bool = False,
+) -> float | None:
+    """Determine upright width/height aspect ratio for tile geometry decisions."""
+    orient = str(item.get("orientation") or "").lower()
+    if item.get("width") and item.get("height"):
+        wf, hf = float(item["width"]), float(item["height"])
+        if wf > 0 and hf > 0:
+            if orient == "portrait" and wf > hf:
+                wf, hf = hf, wf
+            elif orient == "landscape" and hf > wf:
+                wf, hf = hf, wf
+            return wf / hf
+    if not dry_run and path.is_file():
+        if media_type == "photo":
+            try:
+                from PIL import Image, ImageOps  # type: ignore
+
+                with Image.open(path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    if im.width > 0 and im.height > 0:
+                        return im.width / float(im.height)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            info = _probe_video_info(path, dry_run=False)
+            if info.get("width") and info.get("height"):
+                return float(info["width"]) / float(info["height"])
+    if orient == "portrait":
+        return 9.0 / 16.0
+    if orient == "landscape":
+        return 16.0 / 9.0
+    if orient == "square":
+        return 1.0
+    return None
 
 
 def _load_style_pack(edl: dict[str, Any]) -> dict[str, Any]:
@@ -199,21 +355,36 @@ def _resolve_grade_and_grain(
     return look_id, look_vf, grain_vf
 
 
-def _parse_focal_anchor(raw: Any) -> tuple[float, float]:
+def _parse_focal_anchor(raw: Any, default_y: float = 0.5) -> tuple[float, float]:
     """Accept both EDL v1.0 `{x, y}` and v2.0 `[x, y]` focal anchor shapes."""
-    fx, fy = 0.5, 0.5
+    fx, fy = 0.5, default_y
     if isinstance(raw, (list, tuple)) and len(raw) >= 2:
         try:
             fx, fy = float(raw[0]), float(raw[1])
         except (TypeError, ValueError):
-            fx, fy = 0.5, 0.5
+            fx, fy = 0.5, default_y
     elif isinstance(raw, dict):
         try:
             fx = float(raw.get("x", 0.5))
-            fy = float(raw.get("y", 0.5))
+            fy = float(raw.get("y", default_y))
         except (TypeError, ValueError):
-            fx, fy = 0.5, 0.5
+            fx, fy = 0.5, default_y
     return min(0.95, max(0.05, fx)), min(0.95, max(0.05, fy))
+
+
+def _crop_vf_with_anchor(
+    tw: int,
+    th: int,
+    focal_anchor: Any,
+    has_human_closeup: bool = False,
+) -> str:
+    """Build clamped FFmpeg scale+crop filter centered on focal_anchor (default fy=0.35 for human closeups)."""
+    default_y = 0.35 if has_human_closeup else 0.5
+    fx, fy = _parse_focal_anchor(focal_anchor, default_y=default_y)
+    return (
+        f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
+        f"crop={tw}:{th}:x='max(0,min(iw-ow,iw*{fx:.3f}-ow/2))':y='max(0,min(ih-oh,ih*{fy:.3f}-oh/2))'"
+    )
 
 
 def _hex_to_rgb(hex_str: str, fallback: tuple[int, int, int] = (15, 17, 21)) -> tuple[int, int, int]:
@@ -396,10 +567,11 @@ def _render_ken_burns_shot(
     grain_vf: str,
     style_pack: dict[str, Any],
 ) -> list[str]:
-    """Build 2x-supersampled zoompan Ken Burns command anchored to `focal_anchor`."""
+    """Build 2x-supersampled zoompan Ken Burns command anchored to `focal_anchor` (video-only)."""
     dur = _shot_output_duration(shot)
-    frames = max(1, int(round(dur * fps)))
-    fx, fy = _parse_focal_anchor(shot.get("focal_anchor"))
+    frames = max(2, int(round(dur * fps)))
+    is_human = bool(shot.get("has_human_closeup", False))
+    fx, fy = _parse_focal_anchor(shot.get("focal_anchor"), default_y=0.35 if is_human else 0.5)
 
     super_w = width * 2
     super_h = height * 2
@@ -426,17 +598,17 @@ def _render_ken_burns_shot(
 
     vf = (
         f"scale={super_w}:{super_h}:force_original_aspect_ratio=increase,"
-        f"crop={super_w}:{super_h},setsar=1,"
+        f"crop={super_w}:{super_h}:x='max(0,min(iw-ow,iw*{fx:.3f}-ow/2))':y='max(0,min(ih-oh,ih*{fy:.3f}-oh/2))',"
+        f"setsar=1,"
         f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={width}x{height}:fps={fps},"
         f"{tail_vf}"
     )
     return [
         "ffmpeg", "-y", "-loop", "1", "-i", shot["source_path"],
-        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-        "-t", f"{dur:.4f}",
         "-vf", vf,
+        "-an", "-r", str(fps), "-frames:v", str(frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(out_clip),
     ]
 
@@ -454,8 +626,9 @@ def _render_multi_tile_shot(
     avail_filters: set[str],
     dry_run: bool,
 ) -> list[str]:
-    """Render synchronized 2-up, 3-up triptych, Living Bento, or Polaroid grids via hstack/vstack."""
+    """Render synchronized 2-up, 3-up triptych, Living Bento, or Polaroid grids via hstack/vstack (video-only)."""
     dur = _shot_output_duration(shot)
+    n_frames = max(2, int(round(dur * fps)))
     tiles_raw = shot.get("tiles")
     tiles: list[dict[str, Any]] = []
     if isinstance(tiles_raw, list) and len(tiles_raw) >= 2:
@@ -463,8 +636,19 @@ def _render_multi_tile_shot(
     elif shot.get("source_path") and shot.get("pair_source_path"):
         default_mt = shot.get("media_type", "photo")
         tiles = [
-            {"source_path": shot["source_path"], "media_type": default_mt, "in_sec": float(shot.get("in_sec", 0.0))},
-            {"source_path": shot["pair_source_path"], "media_type": default_mt, "in_sec": float(shot.get("in_sec", 0.0))},
+            {
+                "source_path": shot["source_path"],
+                "media_type": default_mt,
+                "in_sec": float(shot.get("in_sec", 0.0)),
+                "focal_anchor": shot.get("focal_anchor"),
+                "has_human_closeup": bool(shot.get("has_human_closeup", False)),
+            },
+            {
+                "source_path": shot["pair_source_path"],
+                "media_type": default_mt,
+                "in_sec": float(shot.get("in_sec", 0.0)),
+                "has_human_closeup": bool(shot.get("has_human_closeup", False)),
+            },
         ]
     else:
         raise ValueError(f"Layout {layout!r} on shot {shot.get('shot_id')} requires >=2 tiles or pair_source_path.")
@@ -491,24 +675,52 @@ def _render_multi_tile_shot(
         t_mt = str(tile.get("media_type", "video")).lower()
         t_in = float(tile.get("in_sec", 0.0))
         if t_mt == "photo":
-            inputs.extend(["-loop", "1", "-t", f"{dur:.4f}", "-i", str(t_src)])
+            inputs.extend(["-loop", "1", "-t", f"{dur + 0.25:.4f}", "-i", str(t_src)])
             hdr_prefix = ""
         else:
-            inputs.extend(["-ss", f"{t_in:.4f}", "-t", f"{dur:.4f}", "-i", str(t_src)])
+            inputs.extend(["-ss", f"{t_in:.4f}", "-t", f"{dur + 0.25:.4f}", "-i", str(t_src)])
             info = _probe_video_info(t_src, dry_run=dry_run)
-            hdr_prefix = f"{HDR_TONEMAP_CHAIN}," if (info["is_hdr"] and "zscale" in avail_filters) else ""
+            hdr_chain = _hdr_to_sdr_vf(info, avail_filters, shot_hint=tile)
+            hdr_prefix = f"{hdr_chain}," if hdr_chain else ""
 
+        t_human = bool(tile.get("has_human_closeup", False))
+        crop_vf = _crop_vf_with_anchor(tw, th, tile.get("focal_anchor"), has_human_closeup=t_human)
         lbl = f"[t{idx}]"
-        chain = (
-            f"[{idx}:v]{hdr_prefix}"
-            f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
-            f"crop={tw}:{th},setsar=1,fps={fps},setpts=PTS-STARTPTS"
-        )
+        chain = f"[{idx}:v]{hdr_prefix}{crop_vf},setsar=1,fps={fps},setpts=PTS-STARTPTS"
         if extra_pad:
             chain += f",{extra_pad}"
         chain += lbl
         tile_filters.append(chain)
         return lbl
+
+    def _polaroid_tile(idx: int, tile: dict[str, Any], col_w: int, right_gutter: int, max_card_w: int | None = None) -> str:
+        """Render a balanced 4:5 (portrait) / 4:3 (landscape) / 1:1 Polaroid print with clean white caption margin."""
+        t_src = Path(tile["source_path"])
+        t_mt = str(tile.get("media_type", "photo")).lower()
+        ar = _probe_media_aspect(t_src, t_mt, tile, dry_run=dry_run)
+        card_w = min(max_card_w, col_w - 28) if max_card_w else (col_w - 28)
+        card_w = max(120, card_w) & ~1
+        border = max(16, int(round(card_w * 0.045))) & ~1
+        inner_w = max(64, card_w - 2 * border) & ~1
+        bottom_margin = max(84, int(round(border * 4.2))) & ~1
+        max_inner_h = max(64, height - border - bottom_margin - 48) & ~1
+        if ar is not None and ar > 1.15:
+            # 4:3 balanced landscape window
+            inner_h = min(max_inner_h, int(round(inner_w * 3.0 / 4.0))) & ~1
+        elif ar is not None and ar < 0.88:
+            # 4:5 balanced portrait window
+            inner_h = min(max_inner_h, int(round(inner_w * 5.0 / 4.0))) & ~1
+        else:
+            # Classic 1:1 instant Polaroid window
+            inner_h = min(max_inner_h, inner_w) & ~1
+        card_h = min(height - 24, inner_h + border + bottom_margin) & ~1
+        pad_chain = (
+            f"pad={card_w}:{card_h}:{border}:{border}:color=0xFAF7F2,"
+            f"pad={col_w}:{height}:(ow-iw)/2:(oh-ih)/2:color={bg_hex}"
+        )
+        if right_gutter > 0:
+            pad_chain += f",pad={col_w + right_gutter}:{height}:0:0:color={bg_hex}"
+        return _tile_input_and_pre(idx, tile, inner_w, inner_h, pad_chain)
 
     if layout in {"split_2up_video", "split_diptych_pair"} or (layout == "bento_living_grid" and len(tiles) == 2):
         w0 = ((width - gutter) // 2) & ~1
@@ -531,14 +743,9 @@ def _render_multi_tile_shot(
             w1 = w0
             w2 = width - w0 - w1 - 2 * gutter
             if layout == "polaroid_stack":
-                inner_w = max(64, w0 - 44) & ~1
-                inner_h = max(64, height - 150) & ~1
-                pad_g0 = f",pad={w0 + gutter}:{height}:0:0:color={bg_hex}" if gutter > 0 else ""
-                pad_g1 = f",pad={w1 + gutter}:{height}:0:0:color={bg_hex}" if gutter > 0 else ""
-                l0 = _tile_input_and_pre(0, tiles[0], inner_w, inner_h, f"pad={w0}:{height}:(ow-iw)/2:36:color=0xFAF7F2{pad_g0}")
-                l1 = _tile_input_and_pre(1, tiles[1], inner_w, inner_h, f"pad={w1}:{height}:(ow-iw)/2:36:color=0xFAF7F2{pad_g1}")
-                w2_inner = max(64, w2 - 44) & ~1
-                l2 = _tile_input_and_pre(2, tiles[2], w2_inner, inner_h, f"pad={w2}:{height}:(ow-iw)/2:36:color=0xFAF7F2")
+                l0 = _polaroid_tile(0, tiles[0], w0, gutter)
+                l1 = _polaroid_tile(1, tiles[1], w1, gutter)
+                l2 = _polaroid_tile(2, tiles[2], w2, 0)
             else:
                 pad0 = f"pad={w0 + gutter}:{height}:0:0:color={bg_hex}" if gutter > 0 else ""
                 pad1 = f"pad={w1 + gutter}:{height}:0:0:color={bg_hex}" if gutter > 0 else ""
@@ -574,27 +781,58 @@ def _render_multi_tile_shot(
         # 2-card Polaroid stack fallback
         w0 = ((width - gutter) // 2) & ~1
         w1 = width - w0 - gutter
-        in_w = max(64, w0 - 64) & ~1
-        in_h = max(64, height - 160) & ~1
-        pad0 = f"pad={w0}:{height}:(ow-iw)/2:40:color=0xFAF7F2" + (f",pad={w0 + gutter}:{height}:0:0:color={bg_hex}" if gutter > 0 else "")
-        pad1 = f"pad={w1}:{height}:(ow-iw)/2:40:color=0xFAF7F2"
-        l0 = _tile_input_and_pre(0, tiles[0], in_w, in_h, pad0)
-        l1 = _tile_input_and_pre(1, tiles[1], in_w, in_h, pad1)
+        max_card_w = min(760, w0 - 64) & ~1
+        l0 = _polaroid_tile(0, tiles[0], w0, gutter, max_card_w=max_card_w)
+        l1 = _polaroid_tile(1, tiles[1], w1, 0, max_card_w=max_card_w)
         combine = f"{l0}{l1}hstack=inputs=2,{tail_vf}[v]"
 
     fc = ";".join(tile_filters) + ";" + combine
-    anull_idx = len(tiles)
     return [
         "ffmpeg", "-y",
         *inputs,
-        "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
         "-filter_complex", fc,
-        "-map", "[v]", "-map", f"{anull_idx}:a",
-        "-t", f"{dur:.4f}", "-r", str(fps),
+        "-map", "[v]",
+        "-an", "-r", str(fps), "-frames:v", str(n_frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(out_clip),
     ]
+
+
+def _build_layout_stage_fc(
+    in_label: str,
+    layout: str,
+    width: int,
+    height: int,
+    shot: dict[str, Any],
+    style_pack: dict[str, Any],
+    tail_vf: str,
+) -> list[str]:
+    """Build layout framing filter stage (`single`, `blurred_bg_pillarbox`, or `super8_frame`) -> `[v]`."""
+    lay_cfg = style_pack.get("layouts") or {}
+    blur_sigma = float(lay_cfg.get("pillarbox_blur_sigma", 28.0))
+    dim_alpha = float(lay_cfg.get("pillarbox_dim_alpha", 0.22))
+    dim_brightness = -min(0.32, max(0.08, dim_alpha * 0.65))
+    is_human = bool(shot.get("has_human_closeup", False))
+
+    if layout == "super8_frame":
+        gate_w = min(width, int(round(height * 4.0 / 3.0))) & ~1
+        gate_h = (height - 48) & ~1
+        crop_vf = _crop_vf_with_anchor(gate_w, gate_h, shot.get("focal_anchor"), has_human_closeup=is_human)
+        return [
+            f"{in_label}{crop_vf},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0A0908,"
+            f"setsar=1,{tail_vf}[v]"
+        ]
+    if layout == "blurred_bg_pillarbox":
+        return [
+            f"{in_label}split=2[bg0][fg0]",
+            f"[bg0]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+            f"gblur=sigma={blur_sigma:.1f},eq=brightness={dim_brightness:.3f}[bg]",
+            f"[fg0]scale=-2:{height}:force_original_aspect_ratio=decrease[fg]",
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,{tail_vf}[v]",
+        ]
+    crop_vf = _crop_vf_with_anchor(width, height, shot.get("focal_anchor"), has_human_closeup=is_human)
+    return [f"{in_label}{crop_vf},setsar=1,{tail_vf}[v]"]
 
 
 def _render_portrait_or_framed_shot(
@@ -610,53 +848,36 @@ def _render_portrait_or_framed_shot(
     avail_filters: set[str],
     dry_run: bool,
 ) -> list[str]:
-    """Render single portrait (`blurred_bg_pillarbox`) or `super8_frame` clip."""
+    """Render single portrait (`blurred_bg_pillarbox`) or `super8_frame` still photo clip (video-only)."""
     dur = _shot_output_duration(shot)
+    n_frames = max(2, int(round(dur * fps)))
     mtype = str(shot.get("media_type", "photo")).lower()
     src = Path(shot["source_path"])
-    lay_cfg = style_pack.get("layouts") or {}
-    blur_sigma = float(lay_cfg.get("pillarbox_blur_sigma", 28.0))
-    dim_alpha = float(lay_cfg.get("pillarbox_dim_alpha", 0.22))
-    dim_brightness = -min(0.32, max(0.08, dim_alpha * 0.65))
     tail_vf = _compose_tail_vf(look_vf, grain_vf, shot, dur, style_pack, width, height)
 
-    hdr_prefix = ""
+    pre_parts: list[str] = []
     if mtype == "video":
         info = _probe_video_info(src, dry_run=dry_run)
-        if (bool(shot.get("is_hdr", False)) or info["is_hdr"]) and "zscale" in avail_filters:
-            hdr_prefix = f"{HDR_TONEMAP_CHAIN},"
-
-    if layout == "super8_frame":
-        gate_w = min(width, int(round(height * 4.0 / 3.0))) & ~1
-        gate_h = (height - 48) & ~1
-        fc = (
-            f"[0:v]{hdr_prefix}scale={gate_w}:{gate_h}:force_original_aspect_ratio=increase,"
-            f"crop={gate_w}:{gate_h},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0A0908,"
-            f"setsar=1,fps={fps},{tail_vf}[v]"
-        )
-    else:
-        fc = (
-            f"[0:v]{hdr_prefix}split=2[bg0][fg0];"
-            f"[bg0]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            f"gblur=sigma={blur_sigma:.1f},eq=brightness={dim_brightness:.3f}[bg];"
-            f"[fg0]scale=-2:{height}:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps},{tail_vf}[v]"
-        )
+        hdr_chain = _hdr_to_sdr_vf(info, avail_filters, shot_hint=shot)
+        if hdr_chain:
+            pre_parts.append(hdr_chain)
+    pre_parts.extend([f"fps={fps}", "setpts=PTS-STARTPTS"])
+    fc_parts = [f"[0:v]{','.join(pre_parts)}[vtimed]"]
+    fc_parts.extend(_build_layout_stage_fc("[vtimed]", layout, width, height, shot, style_pack, tail_vf))
 
     in_args = (
-        ["-loop", "1", "-t", f"{dur:.4f}", "-i", str(src)]
+        ["-loop", "1", "-t", f"{dur + 0.25:.4f}", "-i", str(src)]
         if mtype == "photo"
-        else ["-ss", f"{float(shot.get('in_sec', 0.0)):.4f}", "-t", f"{dur:.4f}", "-i", str(src)]
+        else ["-ss", f"{float(shot.get('in_sec', 0.0)):.4f}", "-t", f"{dur + 0.25:.4f}", "-i", str(src)]
     )
     return [
         "ffmpeg", "-y",
         *in_args,
-        "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
-        "-filter_complex", fc,
-        "-map", "[v]", "-map", "1:a",
-        "-t", f"{dur:.4f}", "-r", str(fps),
+        "-filter_complex", ";".join(fc_parts),
+        "-map", "[v]",
+        "-an", "-r", str(fps), "-frames:v", str(n_frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(out_clip),
     ]
 
@@ -674,27 +895,40 @@ def _render_video_shot(
     stabilize: bool,
     work_dir: Path,
     dry_run: bool,
+    layout: str = "single",
 ) -> list[list[str]]:
-    """Build command(s) for a video shot: HDR tone-map, vidstab, constant slow-mo, or cubic speed ramp."""
+    """Render any single-source video shot (video-only): HDR decode -> vidstab -> speed_profile -> layout framing."""
     in_sec = float(shot.get("in_sec", 0.0))
     dur = _shot_output_duration(shot)
+    n_frames = max(2, int(round(dur * fps)))
     src = Path(shot["source_path"])
     info = _probe_video_info(src, dry_run=dry_run)
-    is_hdr = bool(shot.get("is_hdr", False)) or info["is_hdr"]
+    hdr_chain = _hdr_to_sdr_vf(info, avail_filters, shot_hint=shot)
     tail_vf = _compose_tail_vf(look_vf, grain_vf, shot, dur, style_pack, width, height)
 
     sp = shot.get("speed_profile") if isinstance(shot.get("speed_profile"), dict) else None
     sp_mode = str(sp.get("mode") or sp.get("type") or "").lower() if sp else ""
 
-    # Analytical micro-slice piecewise cubic speed ramp
+    cmds: list[list[str]] = []
+
+    # Analytical micro-slice piecewise cubic speed ramp (works for landscape, portrait pillarbox, & super8_frame)
     if sp and sp_mode == "cubic_ramp":
         slices, total_out, total_src_req = _build_cubic_ramp_slices(sp)
         if slices:
             target_out = dur if shot.get("duration_sec") else total_out
+            target_frames = max(2, int(round(target_out * fps)))
             pre_parts: list[str] = []
-            if is_hdr and "zscale" in avail_filters:
-                pre_parts.append(HDR_TONEMAP_CHAIN)
-            pre_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,setpts=PTS-STARTPTS")
+            if hdr_chain:
+                pre_parts.append(hdr_chain)
+            if stabilize and "vidstabdetect" in avail_filters and "vidstabtransform" in avail_filters:
+                trf_path = work_dir / f"{out_clip.stem}.trf"
+                cmds.append([
+                    "ffmpeg", "-y", "-ss", f"{in_sec:.4f}", "-t", f"{total_src_req + 0.50:.4f}", "-i", str(src),
+                    "-vf", f"vidstabdetect=shakiness=5:accuracy=15:result={trf_path}",
+                    "-f", "null", "-",
+                ])
+                pre_parts.append(f"vidstabtransform=input={trf_path}:smoothing=15:zoom=0:optzoom=1")
+            pre_parts.append("setpts=PTS-STARTPTS")
             pre_chain = ",".join(pre_parts)
 
             k = len(slices)
@@ -711,19 +945,20 @@ def _render_video_shot(
                 slice_out_labels.append(f"[sr{idx}]")
             concat_in = "".join(slice_out_labels)
             fc_parts.append(
-                f"{concat_in}concat=n={k}:v=1:a=0,fps={fps},trim=duration={target_out:.4f},setpts=PTS-STARTPTS,{tail_vf}[v]"
+                f"{concat_in}concat=n={k}:v=1:a=0,fps={fps},trim=duration={target_out + 0.15:.4f},setpts=PTS-STARTPTS[vtimed]"
             )
-            return [[
+            fc_parts.extend(_build_layout_stage_fc("[vtimed]", layout, width, height, shot, style_pack, tail_vf))
+            cmds.append([
                 "ffmpeg", "-y",
-                "-ss", f"{in_sec:.4f}", "-t", f"{total_src_req + 0.50:.4f}", "-i", str(src),
-                "-f", "lavfi", "-t", f"{target_out:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
+                "-ss", f"{in_sec:.4f}", "-t", f"{total_src_req + 0.60:.4f}", "-i", str(src),
                 "-filter_complex", ";".join(fc_parts),
-                "-map", "[v]", "-map", "1:a",
-                "-t", f"{target_out:.4f}", "-r", str(fps),
+                "-map", "[v]",
+                "-an", "-r", str(fps), "-frames:v", str(target_frames),
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k", "-shortest",
+                "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
                 str(out_clip),
-            ]]
+            ])
+            return cmds
 
     # Constant speed (e.g. 0.5x -> setpts=2.0*PTS, 0.4x -> setpts=2.5*PTS) or 1.0x normal
     rate = 1.0
@@ -731,39 +966,37 @@ def _render_video_shot(
         rate = max(0.2, min(8.0, float(sp.get("rate", 1.0))))
     src_span = dur * rate
 
-    vf_parts: list[str] = []
-    if is_hdr and "zscale" in avail_filters:
-        vf_parts.append(HDR_TONEMAP_CHAIN)
+    pre_parts = []
+    if hdr_chain:
+        pre_parts.append(hdr_chain)
 
-    cmds: list[list[str]] = []
     if stabilize and "vidstabdetect" in avail_filters and "vidstabtransform" in avail_filters:
         trf_path = work_dir / f"{out_clip.stem}.trf"
         cmds.append([
-            "ffmpeg", "-y", "-ss", f"{in_sec:.4f}", "-t", f"{src_span:.4f}", "-i", str(src),
+            "ffmpeg", "-y", "-ss", f"{in_sec:.4f}", "-t", f"{src_span + 0.25:.4f}", "-i", str(src),
             "-vf", f"vidstabdetect=shakiness=5:accuracy=15:result={trf_path}",
             "-f", "null", "-",
         ])
-        vf_parts.append(f"vidstabtransform=input={trf_path}:smoothing=15:zoom=0:optzoom=1")
+        pre_parts.append(f"vidstabtransform=input={trf_path}:smoothing=15:zoom=0:optzoom=1")
 
-    vf_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1")
     if abs(rate - 1.0) > 1e-3:
         pts_mult = 1.0 / rate
-        vf_parts.append(f"setpts={pts_mult:.4f}*(PTS-STARTPTS)")
+        pre_parts.append(f"setpts={pts_mult:.4f}*(PTS-STARTPTS)")
     else:
-        vf_parts.append("setpts=PTS-STARTPTS")
-    vf_parts.append(f"fps={fps}")
-    vf_parts.append(tail_vf)
-    vf = ",".join(vf_parts)
+        pre_parts.append("setpts=PTS-STARTPTS")
+    pre_parts.append(f"fps={fps}")
+
+    fc_parts = [f"[0:v]{','.join(pre_parts)}[vtimed]"]
+    fc_parts.extend(_build_layout_stage_fc("[vtimed]", layout, width, height, shot, style_pack, tail_vf))
 
     cmds.append([
         "ffmpeg", "-y",
-        "-ss", f"{in_sec:.4f}", "-t", f"{src_span + 0.10:.4f}", "-i", str(src),
-        "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
-        "-vf", vf,
-        "-map", "0:v", "-map", "1:a",
-        "-t", f"{dur:.4f}", "-r", str(fps),
+        "-ss", f"{in_sec:.4f}", "-t", f"{src_span + 0.30:.4f}", "-i", str(src),
+        "-filter_complex", ";".join(fc_parts),
+        "-map", "[v]",
+        "-an", "-r", str(fps), "-frames:v", str(n_frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(out_clip),
     ])
     return cmds
@@ -1031,16 +1264,35 @@ def _render_graphic_shot(
     style_pack: dict[str, Any],
     cards_dir: Path,
     dry_run: bool,
+    prev_transition_out: str = "cut",
+    shot_transition_out: str = "cut",
+    shot_index: int = 0,
+    is_last_shot: bool = False,
 ) -> list[str]:
-    """Render `media_type == 'graphic'` via pre-rendered Remotion PNG/MP4 or styled Pillow/FFmpeg card."""
+    """Render `media_type == 'graphic'` via bespoke `rendered_card_path` or styled Pillow/FFmpeg card (video-only)."""
     dur = _shot_output_duration(shot)
+    n_frames = max(2, int(round(dur * fps)))
     gtype = str(shot.get("graphic_type") or shot.get("overlay") or "chapter_title").lower()
-    fade_parts = _fade_vf_parts(shot, dur)
-    if not fade_parts:
-        fd = min(0.45, dur * 0.25)
-        fade_parts = [f"fade=t=in:st=0:d={fd:.3f}", f"fade=t=out:st={max(0.0, dur - fd):.3f}:d={fd:.3f}"]
 
-    # Path A: Pre-rendered Remotion MP4 / PNG card
+    # Only auto-apply fade_in on shot 0 (or explicit fade_in > 0); never bake fade_out when transition_out != "cut"
+    prev_t = str(prev_transition_out or "cut").lower()
+    next_t = str(shot_transition_out or shot.get("transition_out") or shot.get("transition") or "cut").lower()
+    fade_parts: list[str] = []
+    fd = min(0.45, dur * 0.25)
+    explicit_fi = shot.get("fade_in")
+    explicit_fo = shot.get("fade_out")
+    if explicit_fi is not None and float(explicit_fi) > 0.01:
+        fade_parts.append(f"fade=t=in:st=0:d={min(float(explicit_fi), dur * 0.45):.3f}")
+    elif explicit_fi is None and shot_index == 0 and prev_t == "cut":
+        fade_parts.append(f"fade=t=in:st=0:d={fd:.3f}")
+    if next_t == "cut":
+        if explicit_fo is not None and float(explicit_fo) > 0.01:
+            fo = min(float(explicit_fo), dur * 0.45)
+            fade_parts.append(f"fade=t=out:st={max(0.0, dur - fo):.3f}:d={fo:.3f}")
+        elif explicit_fo is None and is_last_shot:
+            fade_parts.append(f"fade=t=out:st={max(0.0, dur - fd):.3f}:d={fd:.3f}")
+
+    # Path A: Pre-rendered Remotion or bespoke PNG/MP4 card (`rendered_card_path` works for ALL graphic_types)
     rendered_card = shot.get("rendered_card_path")
     src_raw = shot.get("source_path")
     pre_path: Path | None = None
@@ -1069,23 +1321,19 @@ def _render_graphic_shot(
             return [
                 "ffmpeg", "-y",
                 "-i", str(pre_path),
-                "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
                 "-vf", vf,
-                "-map", "0:v", "-map", "1:a",
-                "-t", f"{dur:.4f}", "-r", str(fps),
+                "-an", "-r", str(fps), "-frames:v", str(n_frames),
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k", "-shortest",
+                "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
                 str(out_clip),
             ]
         return [
             "ffmpeg", "-y",
-            "-loop", "1", "-t", f"{dur:.4f}", "-i", str(pre_path),
-            "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
+            "-loop", "1", "-t", f"{dur + 0.25:.4f}", "-i", str(pre_path),
             "-vf", vf,
-            "-map", "0:v", "-map", "1:a",
-            "-t", f"{dur:.4f}", "-r", str(fps),
+            "-an", "-r", str(fps), "-frames:v", str(n_frames),
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
+            "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
             str(out_clip),
         ]
 
@@ -1096,11 +1344,10 @@ def _render_graphic_shot(
         rendered_png = _render_card_png_pillow(shot, card_png, width, height, style_pack)
 
     if rendered_png:
-        frames = max(1, int(round(dur * fps)))
         zoom_pct = float((style_pack.get("cards") or {}).get("backdrop_zoom_pct", 0.04))
-        z_expr = f"1.0+{zoom_pct:.4f}*on/{frames}"
+        z_expr = f"1.0+{zoom_pct:.4f}*on/{n_frames}"
         vf_parts = [
-            f"zoompan=z='{z_expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d={frames}:s={width}x{height}:fps={fps}",
+            f"zoompan=z='{z_expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d={n_frames}:s={width}x{height}:fps={fps}",
         ]
         if grain_vf:
             vf_parts.append(grain_vf)
@@ -1108,13 +1355,11 @@ def _render_graphic_shot(
         vf_parts.append("format=yuv420p")
         return [
             "ffmpeg", "-y",
-            "-loop", "1", "-t", f"{dur:.4f}", "-i", str(card_png),
-            "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", str(card_png),
             "-vf", ",".join(vf_parts),
-            "-map", "0:v", "-map", "1:a",
-            "-t", f"{dur:.4f}", "-r", str(fps),
+            "-an", "-r", str(fps), "-frames:v", str(n_frames),
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
+            "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
             str(out_clip),
         ]
 
@@ -1133,7 +1378,7 @@ def _render_graphic_shot(
     backdrop_raw = shot.get("backdrop_path")
     use_backdrop = bool(backdrop_raw and (Path(str(backdrop_raw)).expanduser().is_file() or dry_run))
     if use_backdrop and backdrop_raw:
-        in_args = ["-loop", "1", "-t", f"{dur:.4f}", "-i", str(Path(str(backdrop_raw)).expanduser())]
+        in_args = ["-loop", "1", "-t", f"{dur + 0.25:.4f}", "-i", str(Path(str(backdrop_raw)).expanduser())]
         base_vf = [
             f"scale={width}:{height}:force_original_aspect_ratio=increase",
             f"crop={width}:{height},setsar=1,gblur=sigma=20,eq=brightness=-0.22",
@@ -1141,7 +1386,7 @@ def _render_graphic_shot(
         text_hex = "0xF7F4EE"
         muted_hex = "0xDFD9CE"
     else:
-        in_args = ["-f", "lavfi", "-t", f"{dur:.4f}", "-i", f"color=c={bg_hex}:s={width}x{height}:r={fps}"]
+        in_args = ["-f", "lavfi", "-t", f"{dur + 0.25:.4f}", "-i", f"color=c={bg_hex}:s={width}x{height}:r={fps}"]
         base_vf = ["setsar=1"]
 
     draw_vf = [
@@ -1162,14 +1407,113 @@ def _render_graphic_shot(
     return [
         "ffmpeg", "-y",
         *in_args,
-        "-f", "lavfi", "-t", f"{dur:.4f}", "-i", "anullsrc=r=48000:cl=stereo",
         "-vf", ",".join(vf_parts),
-        "-map", "0:v", "-map", "1:a",
-        "-t", f"{dur:.4f}", "-r", str(fps),
+        "-an", "-r", str(fps), "-frames:v", str(n_frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(out_clip),
     ]
+
+
+def _partition_cut_aligned_segments(
+    shots: list[dict[str, Any]],
+    target_size: int = 12,
+    max_size: int = 15,
+    has_xfade: bool = True,
+) -> list[tuple[int, int]]:
+    """Split shot indices into ~10-15 shot cut-aligned ranges (never splitting mid-xfade)."""
+    n = len(shots)
+    if n <= max_size:
+        return [(0, n)]
+
+    def _is_cut_boundary(idx: int) -> bool:
+        if idx <= 0 or idx >= n:
+            return True
+        if not has_xfade:
+            return True
+        raw_t = str(shots[idx - 1].get("transition_out") or shots[idx - 1].get("transition") or "cut").lower()
+        return raw_t not in XFADE_TRANSITIONS
+
+    segments: list[tuple[int, int]] = []
+    start = 0
+    while start < n:
+        if n - start <= max_size:
+            segments.append((start, n))
+            break
+        min_end = min(n, start + max(6, target_size - 4))
+        max_end = min(n, start + max_size)
+        ideal = min(n, start + target_size)
+        candidates = [b for b in range(min_end, max_end + 1) if _is_cut_boundary(b)]
+        if candidates:
+            best = min(candidates, key=lambda b: abs(b - ideal))
+        else:
+            # Scan forward to the next hard cut so we never split mid-transition
+            best = n
+            for b in range(max_end + 1, n):
+                if _is_cut_boundary(b):
+                    best = b
+                    break
+        segments.append((start, best))
+        start = best
+    return segments
+
+
+def _compute_shot_cache_key(
+    shot: dict[str, Any],
+    width: int,
+    height: int,
+    fps: int,
+    stabilize: bool,
+    style_id: str,
+    look_vf: str,
+    grain_vf: str,
+    style_pack: dict[str, Any],
+    prev_transition_out: str,
+    shot_transition_out: str,
+    shot_index: int,
+    is_last_shot: bool,
+    eff_layout: str,
+) -> str:
+    """Compute content-hash key from shot config, style settings, renderer version, and source mtime/size."""
+    source_stats: list[dict[str, Any]] = []
+    paths_to_check: list[str] = []
+    for k in ("source_path", "pair_source_path", "backdrop_path", "mask_path", "rendered_card_path"):
+        if shot.get(k):
+            paths_to_check.append(str(shot[k]))
+    for tile in shot.get("tiles") or []:
+        if isinstance(tile, dict) and tile.get("source_path"):
+            paths_to_check.append(str(tile["source_path"]))
+    for raw_p in sorted(set(paths_to_check)):
+        p = Path(raw_p).expanduser()
+        if p.exists():
+            st = p.stat()
+            source_stats.append({"path": str(p.resolve()), "mtime_ns": st.st_mtime_ns, "size": st.st_size})
+        else:
+            source_stats.append({"path": raw_p, "missing": True})
+
+    payload = {
+        "renderer_version": RENDERER_VERSION,
+        "shot": shot,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "stabilize": stabilize,
+        "style_id": style_id,
+        "look_vf": look_vf,
+        "grain_vf": grain_vf,
+        "layouts": style_pack.get("layouts"),
+        "textures": style_pack.get("textures"),
+        "cards": style_pack.get("cards"),
+        "palette": style_pack.get("palette"),
+        "prev_transition_out": prev_transition_out,
+        "shot_transition_out": shot_transition_out,
+        "is_first_shot": shot_index == 0,
+        "is_last_shot": is_last_shot,
+        "eff_layout": eff_layout,
+        "sources": source_stats,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _build_video_timeline_cmd(
@@ -1181,12 +1525,16 @@ def _build_video_timeline_cmd(
     style_pack: dict[str, Any],
     avail_filters: set[str],
 ) -> tuple[list[str], list[float], float]:
-    """Assemble frame-locked video timeline using explicit `timeline_cursor` + `xfade` offsets.
+    """Assemble frame-locked video timeline segment using probed shot durations + `xfade` offsets.
 
     Returns `(ffmpeg_cmd, shot_starts, total_timeline_dur)`.
     """
     if len(clip_paths) == 1:
-        cmd = ["ffmpeg", "-y", "-i", str(clip_paths[0]), "-an", "-c:v", "copy", str(video_timeline)]
+        cmd = [
+            "ffmpeg", "-y", "-i", str(clip_paths[0]),
+            "-an", "-c:v", "copy", "-video_track_timescale", "90000",
+            str(video_timeline),
+        ]
         return cmd, [0.0], shot_durations[0]
 
     style_trans_dur = float((style_pack.get("transitions") or {}).get("default_duration_sec", 0.45))
@@ -1200,7 +1548,6 @@ def _build_video_timeline_cmd(
     timeline_cursor = shot_durations[0]
     prev_lbl = "[vin0]"
     has_xfade = "xfade" in avail_filters
-    has_boxblur = "boxblur" in avail_filters
 
     for idx in range(1, len(clip_paths)):
         prev_shot = shots[idx - 1]
@@ -1222,19 +1569,14 @@ def _build_video_timeline_cmd(
             shot_starts.append(offset)
             timeline_cursor = offset + shot_durations[idx]
 
-            needs_post = (post_fx == "whip" and has_boxblur) or (post_fx == "warm_burn")
+            needs_post = post_fx == "warm_burn"
             mid_lbl = f"[vxf{idx}]" if needs_post else final_lbl
             fc_parts.append(
                 f"{prev_lbl}[vin{idx}]xfade=transition={xf_name}:duration={ov:.6f}:offset={offset:.6f}{mid_lbl}"
             )
-            if post_fx == "whip" and has_boxblur:
+            if post_fx == "warm_burn":
                 fc_parts.append(
-                    f"{mid_lbl}boxblur=luma_radius=18:luma_power=1:chroma_radius=9:chroma_power=1:"
-                    f"enable='between(t,{offset:.4f},{offset + ov:.4f})'{final_lbl}"
-                )
-            elif post_fx == "warm_burn":
-                fc_parts.append(
-                    f"{mid_lbl}colorbalance=rs=0.28:gs=0.10:bs=-0.22:rh=0.30:gh=0.12:bh=-0.18:"
+                    f"{mid_lbl}colorbalance=rs=0.22:gs=0.08:bs=-0.16:rh=0.24:gh=0.10:bh=-0.14:"
                     f"enable='between(t,{offset:.4f},{offset + ov:.4f})'{final_lbl}"
                 )
             prev_lbl = final_lbl
@@ -1249,9 +1591,9 @@ def _build_video_timeline_cmd(
         *inputs,
         "-filter_complex", ";".join(fc_parts),
         "-map", "[vout]",
-        "-an",
+        "-an", "-r", str(fps),
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
         str(video_timeline),
     ]
     return cmd, shot_starts, timeline_cursor
@@ -1509,43 +1851,262 @@ def _two_pass_loudnorm(input_av: Path, output_master: Path, dry_run: bool) -> li
 
     p1 = _run(pass1_cmd, timeout=300)
     match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", p1.stderr or "", re.DOTALL)
+    use_copy_silent = False
+    af = "loudnorm=I=-14:LRA=9:TP=-1.0:linear=true"
     if match:
         stats = json.loads(match.group(0))
-        af = (
-            f"loudnorm=I=-14:LRA=9:TP=-1.0:"
-            f"measured_I={stats['input_i']}:measured_LRA={stats['input_lra']}:"
-            f"measured_TP={stats['input_tp']}:measured_thresh={stats['input_thresh']}:"
-            f"offset={stats['target_offset']}:linear=true"
-        )
-    else:
-        af = "loudnorm=I=-14:LRA=9:TP=-1.0:linear=true"
+        try:
+            in_i = float(stats["input_i"])
+            in_lra = float(stats["input_lra"])
+            in_tp = float(stats["input_tp"])
+            in_th = float(stats["input_thresh"])
+            off = float(stats["target_offset"])
+            if all(math.isfinite(v) for v in (in_i, in_lra, in_tp, in_th, off)) and in_i > -70.0:
+                af = (
+                    f"loudnorm=I=-14:LRA=9:TP=-1.0:"
+                    f"measured_I={in_i:.2f}:measured_LRA={in_lra:.2f}:"
+                    f"measured_TP={in_tp:.2f}:measured_thresh={in_th:.2f}:"
+                    f"offset={off:.2f}:linear=true"
+                )
+            else:
+                use_copy_silent = True
+        except (KeyError, TypeError, ValueError):
+            use_copy_silent = True
 
-    pass2_cmd = [
-        "ffmpeg", "-y", "-i", str(input_av),
-        "-c:v", "copy", "-af", af,
-        "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
-        str(output_master),
-    ]
+    if use_copy_silent:
+        pass2_cmd = [
+            "ffmpeg", "-y", "-i", str(input_av),
+            "-c", "copy", "-movflags", "+faststart",
+            str(output_master),
+        ]
+    else:
+        pass2_cmd = [
+            "ffmpeg", "-y", "-i", str(input_av),
+            "-c:v", "copy", "-af", af,
+            "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+            str(output_master),
+        ]
     p2 = _run(pass2_cmd, timeout=300)
     if p2.returncode != 0:
         raise RuntimeError(f"Loudnorm pass 2 failed:\n{p2.stderr}")
     return [pass1_cmd, pass2_cmd]
 
 
-def extract_qa_artifacts(master_path: Path, qa_dir: Path, chunk_sec: int = 60) -> dict[str, Any]:
-    """Extract `-sseof -0.05` end-frame check + <=60s review chunks for `read_file` QA."""
+def _qa_format_ts(sec: float) -> str:
+    mins = int(sec // 60)
+    rem = sec - mins * 60
+    return f"{mins:02d}:{rem:04.1f}s"
+
+
+def _qa_compute_edl_timeline(
+    edl: dict[str, Any],
+    master_dur: float,
+    render_report: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], float]:
+    """Compute per-shot timeline start/duration/overlap records from render_report or EDL."""
+    shots = edl.get("shots") or []
+    if not shots:
+        return [], 0.0
+    style_pack = _load_style_pack(edl)
+    style_trans_dur = float((style_pack.get("transitions") or {}).get("default_duration_sec", 0.45))
+    fps = int(round(float(edl.get("fps") or 30)))
+
+    rep_starts = (render_report or {}).get("shot_starts_sec")
+    rep_durs = (render_report or {}).get("probed_durations")
+    use_rep = (
+        isinstance(rep_starts, list)
+        and len(rep_starts) == len(shots)
+        and isinstance(rep_durs, list)
+        and len(rep_durs) == len(shots)
+    )
+
+    if use_rep:
+        starts = [float(x) for x in rep_starts]
+        durs = [float(x) for x in rep_durs]
+    else:
+        durs = [max(2, int(round(_shot_output_duration(s) * fps))) / float(fps) for s in shots]
+        starts = [0.0]
+        cursor = durs[0]
+        for idx in range(1, len(shots)):
+            prev_shot = shots[idx - 1]
+            raw_t = str(prev_shot.get("transition_out") or prev_shot.get("transition") or "cut").lower()
+            if raw_t in XFADE_TRANSITIONS:
+                _, default_d, _ = XFADE_TRANSITIONS[raw_t]
+                explicit_td = prev_shot.get("transition_duration_sec")
+                req_d = float(explicit_td) if explicit_td is not None else (
+                    default_d if raw_t in {"flash_cut", "whip_pan_left", "whip_pan_right", "whip_pan_up", "whip_pan_down", "zoom_punch"}
+                    else style_trans_dur
+                )
+                max_ov = min(durs[idx - 1], durs[idx]) * 0.45
+                ov = max(2, int(round(min(req_d, max_ov) * fps))) / float(fps)
+                offset = max(0.0, cursor - ov)
+                starts.append(offset)
+                cursor = offset + durs[idx]
+            else:
+                starts.append(cursor)
+                cursor += durs[idx]
+
+    records: list[dict[str, Any]] = []
+    for idx, shot in enumerate(shots):
+        raw_t = str(shot.get("transition_out") or shot.get("transition") or "cut").lower()
+        ov = 0.0
+        if idx < len(shots) - 1 and raw_t in XFADE_TRANSITIONS:
+            ov = max(0.0, (starts[idx] + durs[idx]) - starts[idx + 1])
+        records.append(
+            {
+                "index": idx,
+                "shot": shot,
+                "shot_id": str(shot.get("shot_id") or f"S{idx + 1:02d}"),
+                "start_sec": starts[idx],
+                "dur_sec": durs[idx],
+                "transition_out": raw_t if idx < len(shots) - 1 else "cut",
+                "overlap_sec": ov,
+            }
+        )
+    expected_dur = starts[-1] + durs[-1]
+    return records, expected_dur
+
+
+def _qa_extract_frame_jpg(master_path: Path, t_sec: float, out_jpg: Path, cell_w: int, cell_h: int) -> bool:
+    proc = _run(
+        [
+            "ffmpeg", "-y", "-ss", f"{max(0.0, t_sec):.3f}", "-i", str(master_path),
+            "-frames:v", "1",
+            "-vf", f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=0x101218",
+            "-q:v", "3",
+            str(out_jpg),
+        ],
+        timeout=30,
+    )
+    return proc.returncode == 0 and out_jpg.is_file()
+
+
+def _qa_render_contact_sheet(
+    master_path: Path,
+    items: list[tuple[float, str]],
+    out_path: Path,
+    cols: int,
+    cell_w: int,
+    cell_h: int,
+) -> str | None:
+    """Extract frames at target timestamps and render a labeled contact sheet JPEG."""
+    if not items:
+        return None
+    with tempfile.TemporaryDirectory(prefix="trip_qa_") as tmp_s:
+        tmp_dir = Path(tmp_s)
+        frame_paths: list[tuple[Path | None, str]] = [None] * len(items)  # type: ignore[list-item]
+
+        def _grab(i: int, ts: float, lbl: str) -> tuple[int, Path | None, str]:
+            fp = tmp_dir / f"f_{i:04d}.jpg"
+            ok = _qa_extract_frame_jpg(master_path, ts, fp, cell_w, cell_h)
+            return i, (fp if ok else None), lbl
+
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(items)))) as pool:
+            futs = [pool.submit(_grab, i, ts, lbl) for i, (ts, lbl) in enumerate(items)]
+            for fut in as_completed(futs):
+                i, fp, lbl = fut.result()
+                frame_paths[i] = (fp, lbl)
+
+        n_cols = max(1, min(cols, len(items)))
+        n_rows = max(1, math.ceil(len(items) / n_cols))
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+            canvas = Image.new("RGB", (n_cols * cell_w, n_rows * cell_h), (16, 18, 24))
+            draw = ImageDraw.Draw(canvas)
+            font: Any = ImageFont.load_default()
+            for cand in (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/System/Library/Fonts/Menlo.ttc",
+            ):
+                if Path(cand).is_file():
+                    try:
+                        font = ImageFont.truetype(cand, 16 if cell_w >= 800 else 13)
+                        break
+                    except OSError:
+                        pass
+
+            for idx, (fp, lbl) in enumerate(frame_paths):
+                row, col = divmod(idx, n_cols)
+                x0, y0 = col * cell_w, row * cell_h
+                draw.rectangle([x0, y0, x0 + cell_w - 1, y0 + cell_h - 1], fill=(22, 24, 30), outline=(42, 46, 56))
+                if fp is not None and fp.is_file():
+                    try:
+                        with Image.open(fp) as im:
+                            im = im.convert("RGB")
+                            im.thumbnail((cell_w - 8, cell_h - 8))
+                            px = x0 + (cell_w - im.width) // 2
+                            py = y0 + (cell_h - im.height) // 2
+                            canvas.paste(im, (px, py))
+                    except Exception:  # noqa: BLE001
+                        pass
+                bbox = draw.textbbox((0, 0), lbl, font=font)
+                tw = min(cell_w - 24, (bbox[2] - bbox[0]) + 16)
+                th = (bbox[3] - bbox[1]) + 10
+                draw.rectangle([x0 + 8, y0 + 8, x0 + 8 + tw, y0 + 8 + th], fill=(10, 12, 16))
+                draw.text((x0 + 16, y0 + 12), lbl, font=font, fill=(246, 244, 238))
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            canvas.save(out_path, quality=90)
+            return str(out_path)
+        except ImportError:
+            valid = [fp for fp, _ in frame_paths if fp is not None and fp.is_file()]
+            if not valid:
+                return None
+            inputs: list[str] = []
+            for fp in valid:
+                inputs.extend(["-i", str(fp)])
+            fc = "".join(f"[{i}:v]" for i in range(len(valid))) + f"concat=n={len(valid)}:v=1:a=0,tile={n_cols}x{n_rows}[out]"
+            proc = _run(["ffmpeg", "-y", *inputs, "-filter_complex", fc, "-map", "[out]", "-frames:v", "1", "-q:v", "3", str(out_path)], timeout=60)
+            return str(out_path) if (proc.returncode == 0 and out_path.is_file()) else None
+
+
+def _qa_measure_signalstats(master_path: Path, sample_sec: float) -> dict[str, float]:
+    """Run FFmpeg signalstats on a single frame and return YAVG/YMIN/YMAX/SATAVG/YLOW/YHIGH."""
+    proc = _run(
+        [
+            "ffmpeg", "-y", "-ss", f"{max(0.0, sample_sec):.3f}", "-i", str(master_path),
+            "-frames:v", "1",
+            "-vf", "signalstats,metadata=mode=print:file=-",
+            "-f", "null", "-",
+        ],
+        timeout=30,
+    )
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    metrics: dict[str, float] = {}
+    for key, val in re.findall(r"lavfi\.signalstats\.(YMIN|YLOW|YAVG|YHIGH|YMAX|SATAVG)=([0-9]+(?:\.[0-9]+)?)", combined):
+        metrics[key] = round(float(val), 2)
+    return metrics
+
+
+def extract_qa_artifacts(
+    master_path: Path,
+    qa_dir: Path,
+    edl: dict[str, Any] | None = None,
+    render_report: dict[str, Any] | None = None,
+    chunk_sec: int = 60,
+) -> dict[str, Any]:
+    """Extract EDL-aware QA sheets, transition strips, collage sheet, signalstats metrics, and <=60s chunks."""
     qa_dir.mkdir(parents=True, exist_ok=True)
+    info = _probe_video_info(master_path, dry_run=False)
+    dur = float(info["duration_sec"]) if info.get("duration_sec") else 60.0
+    is_vertical = bool(info.get("width") and info.get("height") and info["height"] > info["width"])
+    chunk_scale = "540:960" if is_vertical else "960:540"
+    cell_w, cell_h = (360, 640) if is_vertical else (640, 360)
+
     end_frame = qa_dir / "end_frame_check.jpg"
     _run(
         ["ffmpeg", "-y", "-sseof", "-0.05", "-i", str(master_path), "-frames:v", "1", "-q:v", "2", str(end_frame)],
         timeout=30,
     )
+    if not end_frame.is_file() or end_frame.stat().st_size == 0:
+        _run(
+            ["ffmpeg", "-y", "-ss", f"{max(0.0, dur - 0.08):.3f}", "-i", str(master_path), "-frames:v", "1", "-q:v", "2", str(end_frame)],
+            timeout=30,
+        )
 
-    proc = _run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(master_path)],
-        timeout=15,
-    )
-    dur = float(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else 60.0
     n_chunks = max(1, math.ceil(dur / chunk_sec))
     chunks: list[str] = []
     for idx in range(n_chunks):
@@ -1555,7 +2116,7 @@ def extract_qa_artifacts(master_path: Path, qa_dir: Path, chunk_sec: int = 60) -
             [
                 "ffmpeg", "-y", "-ss", str(start), "-t", str(chunk_sec),
                 "-i", str(master_path),
-                "-vf", "scale=960:540", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-vf", f"scale={chunk_scale}", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
                 str(chunk_out),
             ],
@@ -1564,10 +2125,181 @@ def extract_qa_artifacts(master_path: Path, qa_dir: Path, chunk_sec: int = 60) -
         if chunk_out.exists():
             chunks.append(str(chunk_out))
 
+    # Overview 9-frame contact sheet (`qa_sheet_01.jpg`, ending at -0.05s)
+    overview_items: list[tuple[float, str]] = []
+    for k in range(9):
+        t_s = max(0.0, dur - 0.05) if k == 8 else min(max(0.0, dur - 0.05), dur * (0.04 + 0.90 * k / 8.0))
+        overview_items.append((t_s, f"#{k + 1:02d} | {_qa_format_ts(t_s)}"))
+    qa_sheet_path = _qa_render_contact_sheet(master_path, overview_items, qa_dir / "qa_sheet_01.jpg", cols=3, cell_w=cell_w, cell_h=cell_h)
+
+    video_alignment_path: str | None = None
+    chapter_cards_path: str | None = None
+    collages_path: str | None = None
+    transitions_path: str | None = None
+    metrics_path: str | None = None
+
+    if edl:
+        records, expected_dur = _qa_compute_edl_timeline(edl, dur, render_report=render_report)
+        drift_ms = round((dur - expected_dur) * 1000.0, 1)
+
+        video_items: list[tuple[float, str]] = []
+        graphic_items: list[tuple[float, str]] = []
+        collage_items: list[tuple[float, str]] = []
+        transition_items: list[tuple[float, str]] = []
+        telemetry_targets: list[tuple[dict[str, Any], float]] = []
+
+        for rec in records:
+            shot = rec["shot"]
+            sid = rec["shot_id"]
+            mtype = str(shot.get("media_type", "photo")).lower()
+            layout = str(shot.get("layout") or shot.get("aspect_handling") or "single").lower()
+            tiles = shot.get("tiles")
+            is_multi = (layout in MULTI_TILE_LAYOUTS) or (isinstance(tiles, list) and len(tiles) >= 2) or bool(shot.get("pair_source_path"))
+            has_video_tile = isinstance(tiles, list) and any(str(t.get("media_type", "")).lower() == "video" for t in tiles)
+
+            gtype = str(shot.get("graphic_type") or shot.get("overlay") or "card").lower()
+            frac = 0.86 if (mtype == "graphic" and gtype == "route_map") else 0.50
+            sample_t = min(max(0.0, dur - 0.05), rec["start_sec"] + rec["dur_sec"] * frac)
+            telemetry_targets.append((rec, sample_t))
+
+            if mtype == "video" or has_video_tile or is_multi:
+                tag = layout if layout != "single" else str(shot.get("orientation") or "video")
+                if isinstance(shot.get("speed_profile"), dict):
+                    tag += " ramp"
+                video_items.append((sample_t, f"{sid} | {tag} | {_qa_format_ts(sample_t)}"))
+
+            if mtype == "graphic":
+                graphic_items.append((sample_t, f"{sid} | {gtype} | {_qa_format_ts(sample_t)}"))
+
+            if is_multi:
+                n_t = len(tiles) if isinstance(tiles, list) else 2
+                collage_items.append((sample_t, f"{sid} | {layout} ({n_t}t) | {_qa_format_ts(sample_t)}"))
+
+            if rec["transition_out"] != "cut" and rec["overlap_sec"] > 0 and rec["index"] < len(records) - 1:
+                nxt = records[rec["index"] + 1]
+                ov = rec["overlap_sec"]
+                offset = nxt["start_sec"]
+                t_pre = max(0.0, offset - 0.05)
+                t_mid = min(max(0.0, dur - 0.05), offset + ov * 0.5)
+                t_post = min(max(0.0, dur - 0.05), offset + ov + 0.05)
+                pair_lbl = f"{sid}->{nxt['shot_id']} {rec['transition_out']}"
+                transition_items.append((t_pre, f"{pair_lbl} PRE ({t_pre:.2f}s)"))
+                transition_items.append((t_mid, f"{pair_lbl} MID ({t_mid:.2f}s)"))
+                transition_items.append((t_post, f"{pair_lbl} POST ({t_post:.2f}s)"))
+
+        if video_items:
+            video_alignment_path = _qa_render_contact_sheet(
+                master_path, video_items, qa_dir / "qa_video_alignment.jpg", cols=3, cell_w=cell_w, cell_h=cell_h
+            )
+        if graphic_items:
+            chapter_cards_path = _qa_render_contact_sheet(
+                master_path, graphic_items, qa_dir / "qa_chapter_cards.jpg", cols=3, cell_w=cell_w, cell_h=cell_h
+            )
+        if collage_items:
+            collage_w, collage_h = (540, 960) if is_vertical else (960, 540)
+            collages_path = _qa_render_contact_sheet(
+                master_path, collage_items, qa_dir / "qa_collages.jpg", cols=2, cell_w=collage_w, cell_h=collage_h
+            )
+        if transition_items:
+            transitions_path = _qa_render_contact_sheet(
+                master_path, transition_items, qa_dir / "qa_transitions.jpg", cols=3, cell_w=cell_w, cell_h=cell_h
+            )
+
+        # Signalstats telemetry per shot (parallelized for speed)
+        shot_stats_out: list[dict[str, Any]] = [{} for _ in telemetry_targets]
+
+        def _measure_one(pos: int, rec: dict[str, Any], ts: float) -> tuple[int, dict[str, Any]]:
+            m = _qa_measure_signalstats(master_path, ts)
+            sh = rec["shot"]
+            return pos, {
+                "shot_id": rec["shot_id"],
+                "media_type": str(sh.get("media_type", "photo")).lower(),
+                "layout": str(sh.get("layout") or sh.get("aspect_handling") or "single").lower(),
+                "sample_sec": round(ts, 3),
+                "YAVG": m.get("YAVG"),
+                "YMIN": m.get("YMIN"),
+                "YMAX": m.get("YMAX"),
+                "SATAVG": m.get("SATAVG"),
+                "flags": [],
+            }
+
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(telemetry_targets)))) as pool:
+            futs = [pool.submit(_measure_one, pos, rec, ts) for pos, (rec, ts) in enumerate(telemetry_targets)]
+            for fut in as_completed(futs):
+                pos, row = fut.result()
+                shot_stats_out[pos] = row
+
+        # Compute SDR photo baseline for detecting lifted/washed HDR clips
+        photo_ymins = [r["YMIN"] for r in shot_stats_out if r.get("media_type") == "photo" and r.get("YMIN") is not None]
+        photo_yavgs = [r["YAVG"] for r in shot_stats_out if r.get("media_type") == "photo" and r.get("YAVG") is not None]
+        photo_sats = [r["SATAVG"] for r in shot_stats_out if r.get("media_type") == "photo" and r.get("SATAVG") is not None]
+        baseline = {
+            "photo_count": len(photo_yavgs),
+            "median_YMIN": round(statistics.median(photo_ymins), 2) if photo_ymins else None,
+            "median_YAVG": round(statistics.median(photo_yavgs), 2) if photo_yavgs else None,
+            "median_SATAVG": round(statistics.median(photo_sats), 2) if photo_sats else None,
+        }
+
+        flagged_shots: list[dict[str, Any]] = []
+        for row in shot_stats_out:
+            ymin = row.get("YMIN")
+            yavg = row.get("YAVG")
+            ymax = row.get("YMAX")
+            sat = row.get("SATAVG")
+            flags: list[str] = []
+            if ymin is not None and ymin >= 34.0 and row.get("media_type") != "graphic":
+                flags.append("lifted_blacks")
+            if (
+                row.get("media_type") == "video"
+                and baseline["median_YMIN"] is not None
+                and ymin is not None
+                and (ymin - baseline["median_YMIN"]) >= 18.0
+                and (
+                    (baseline["median_YAVG"] is not None and yavg is not None and (yavg - baseline["median_YAVG"]) >= 20.0)
+                    or (baseline["median_SATAVG"] is not None and sat is not None and sat < max(12.0, baseline["median_SATAVG"] * 0.55))
+                )
+            ):
+                flags.append("washed_out_vs_sdr_photos")
+            if yavg is not None and ymin is not None and yavg >= 195.0 and ymin >= 40.0 and row.get("media_type") != "graphic":
+                flags.append("overexposed_highlights")
+            if yavg is not None and ymax is not None and yavg <= 20.0 and ymax <= 35.0:
+                flags.append("near_black_frame")
+            row["flags"] = flags
+            if flags:
+                flagged_shots.append({"shot_id": row["shot_id"], "sample_sec": row["sample_sec"], "flags": flags})
+
+        metrics_payload = {
+            "master": str(master_path),
+            "probed_duration_sec": round(dur, 3),
+            "expected_duration_sec": round(expected_dur, 3),
+            "drift_ms": drift_ms,
+            "drift_flag": abs(drift_ms) > 250.0,
+            "sdr_photo_baseline": baseline,
+            "shots": shot_stats_out,
+            "flagged_shots": flagged_shots,
+            "summary": {
+                "shots_analyzed": len(shot_stats_out),
+                "flagged_count": len(flagged_shots),
+                "video_alignment_count": len(video_items),
+                "chapter_card_count": len(graphic_items),
+                "collage_count": len(collage_items),
+                "transition_count": len(transition_items) // 3,
+            },
+        }
+        mp = qa_dir / "qa_metrics.json"
+        mp.write_text(json.dumps(metrics_payload, indent=2) + "\n", encoding="utf-8")
+        metrics_path = str(mp)
+
     return {
         "master": str(master_path),
         "duration_sec": round(dur, 2),
         "end_frame_check": str(end_frame) if end_frame.exists() else None,
+        "qa_sheets": [qa_sheet_path] if qa_sheet_path else [],
+        "qa_video_alignment": video_alignment_path,
+        "qa_chapter_cards": chapter_cards_path,
+        "qa_collages": collages_path,
+        "qa_transitions": transitions_path,
+        "qa_metrics": metrics_path,
         "qa_chunks": chunks,
     }
 
@@ -1581,8 +2313,10 @@ def render_trip(
     fps: int = 30,
     stabilize: bool = False,
     dry_run: bool = False,
+    workers: int = 1,
+    reuse_cache: bool = False,
 ) -> dict[str, Any]:
-    """Render all EDL shots, assemble frame-locked xfade video + 4-track J/L-cut audio, and master."""
+    """Render all EDL shots (parallel + cacheable), assemble cut-aligned xfade segments, mix 4-track audio, and master."""
     clips_dir = work_dir / "rendered_shots"
     cards_dir = work_dir / "graphic_cards"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -1590,24 +2324,26 @@ def render_trip(
     avail_filters = (
         _probe_filters()
         if not dry_run
-        else {"zscale", "vidstabdetect", "vidstabtransform", "acrossfade", "loudnorm", "xfade", "boxblur", "adelay", "amix"}
+        else {"zscale", "tonemap", "signalstats", "vidstabdetect", "vidstabtransform", "acrossfade", "loudnorm", "xfade", "boxblur", "adelay", "amix"}
     )
 
     style_pack = _load_style_pack(edl)
     style_id = str(style_pack.get("style_id") or edl.get("style_id") or "cinema_doc")
     look_id, look_vf, grain_vf = _resolve_grade_and_grain(edl, style_pack)
 
-    shots = edl.get("shots", [])
-    if not shots:
+    raw_shots = edl.get("shots", [])
+    if not raw_shots:
         raise ValueError("EDL contains no shots.")
 
     # Ensure even output dimensions
     width = width & ~1
     height = height & ~1
+    workers = max(1, int(workers or 1))
 
     planned_cmds: list[list[str]] = []
     clip_paths: list[Path] = []
-    shot_durations: list[float] = []
+    shots: list[dict[str, Any]] = []
+    target_durations: list[float] = []
 
     default_portrait_layout = str(
         edl.get("vertical_layout")
@@ -1615,76 +2351,217 @@ def render_trip(
         or "blurred_bg_pillarbox"
     )
 
+    for raw_shot in raw_shots:
+        raw_dur = _shot_output_duration(raw_shot)
+        shot_dur = max(2, int(round(raw_dur * fps))) / float(fps)
+        s_copy = dict(raw_shot)
+        s_copy["duration_sec"] = shot_dur
+        shots.append(s_copy)
+        target_durations.append(shot_dur)
+
+    # Plan every shot and check content-hash cache
+    shot_jobs: list[dict[str, Any]] = []
+    cache_hits = 0
+    cache_misses = 0
+
     for idx, shot in enumerate(shots):
         clip_out = clips_dir / f"shot_{idx + 1:03d}.mp4"
+        hash_file = clips_dir / f"shot_{idx + 1:03d}.sha256"
         clip_paths.append(clip_out)
-        # Quantize shot duration to exact integer frame count for zero A/V drift
-        raw_dur = _shot_output_duration(shot)
-        shot_dur = max(2, int(round(raw_dur * fps))) / float(fps)
-        shot = dict(shot)
-        shot["duration_sec"] = shot_dur
-        shot_durations.append(shot_dur)
 
         mtype = str(shot.get("media_type", "photo")).lower()
         orient = str(shot.get("orientation", "landscape")).lower()
         layout = str(shot.get("layout") or shot.get("aspect_handling") or "single").lower()
         has_tiles = isinstance(shot.get("tiles"), list) and len(shot["tiles"]) >= 2
+        prev_trans_out = (
+            str(shots[idx - 1].get("transition_out") or shots[idx - 1].get("transition") or "cut").lower()
+            if idx > 0
+            else "cut"
+        )
+        shot_trans_out = str(shot.get("transition_out") or shot.get("transition") or "cut").lower()
+        use_stab = stabilize or bool(shot.get("stabilize", False))
 
+        # Determine effective layout consistently for both cache key & dispatch
         if mtype == "graphic":
-            cmds = [_render_graphic_shot(shot, clip_out, width, height, fps, grain_vf, style_pack, cards_dir, dry_run)]
+            eff_layout = "graphic"
         elif layout in {"split_2up_video", "triptych_3up_video", "bento_living_grid", "polaroid_stack"} or (
             layout == "split_diptych_pair" and (has_tiles or shot.get("pair_source_path"))
         ):
+            eff_layout = layout
+        elif layout == "super8_frame":
+            eff_layout = "super8_frame"
+        elif orient == "portrait" and width > height:
+            eff_layout = layout if layout != "single" else default_portrait_layout
+            if eff_layout == "split_diptych_pair" and not (has_tiles or shot.get("pair_source_path")):
+                eff_layout = "blurred_bg_pillarbox"
+        else:
+            eff_layout = layout
+
+        cache_key = _compute_shot_cache_key(
+            shot=shot,
+            width=width,
+            height=height,
+            fps=fps,
+            stabilize=use_stab,
+            style_id=style_id,
+            look_vf=look_vf,
+            grain_vf=grain_vf,
+            style_pack=style_pack,
+            prev_transition_out=prev_trans_out,
+            shot_transition_out=shot_trans_out,
+            shot_index=idx,
+            is_last_shot=(idx == len(shots) - 1),
+            eff_layout=eff_layout,
+        )
+
+        if (
+            reuse_cache
+            and not dry_run
+            and clip_out.is_file()
+            and clip_out.stat().st_size > 0
+            and hash_file.is_file()
+            and hash_file.read_text(encoding="utf-8").strip() == cache_key
+        ):
+            cache_hits += 1
+            continue
+
+        cache_misses += 1
+
+        if mtype == "graphic":
             cmds = [
-                _render_multi_tile_shot(
-                    shot, layout, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, dry_run
+                _render_graphic_shot(
+                    shot, clip_out, width, height, fps, grain_vf, style_pack, cards_dir, dry_run,
+                    prev_transition_out=prev_trans_out,
+                    shot_transition_out=shot_trans_out,
+                    shot_index=idx,
+                    is_last_shot=(idx == len(shots) - 1),
                 )
             ]
-        elif layout == "super8_frame" or (orient == "portrait" and width > height):
-            eff_layout = layout if layout != "single" else default_portrait_layout
-            if eff_layout == "split_diptych_pair" and (has_tiles or shot.get("pair_source_path")):
-                cmds = [
-                    _render_multi_tile_shot(
-                        shot, eff_layout, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, dry_run
-                    )
-                ]
-            else:
-                cmds = [
-                    _render_portrait_or_framed_shot(
-                        shot, eff_layout, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, dry_run
-                    )
-                ]
-        elif mtype == "photo":
-            cmds = [_render_ken_burns_shot(shot, clip_out, width, height, fps, look_vf, grain_vf, style_pack)]
-        else:
-            use_stab = stabilize or bool(shot.get("stabilize", False))
+        elif eff_layout in {"split_2up_video", "triptych_3up_video", "bento_living_grid", "polaroid_stack", "split_diptych_pair"}:
+            cmds = [
+                _render_multi_tile_shot(
+                    shot, eff_layout, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, dry_run
+                )
+            ]
+        elif mtype == "video":
             cmds = _render_video_shot(
-                shot, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, use_stab, clips_dir, dry_run
+                shot, clip_out, width, height, fps, look_vf, grain_vf, style_pack,
+                avail_filters, use_stab, clips_dir, dry_run, layout=eff_layout,
             )
+        elif eff_layout in {"super8_frame", "blurred_bg_pillarbox"}:
+            cmds = [
+                _render_portrait_or_framed_shot(
+                    shot, eff_layout, clip_out, width, height, fps, look_vf, grain_vf, style_pack, avail_filters, dry_run
+                )
+            ]
+        else:
+            cmds = [_render_ken_burns_shot(shot, clip_out, width, height, fps, look_vf, grain_vf, style_pack)]
 
-        for cmd in cmds:
-            planned_cmds.append(cmd)
-            if not dry_run:
-                res = _run(cmd, timeout=300)
-                if res.returncode != 0:
-                    raise RuntimeError(f"Shot {idx + 1} ({shot.get('shot_id', '')}) render failed:\n{res.stderr}")
+        planned_cmds.extend(cmds)
+        shot_jobs.append(
+            {
+                "idx": idx,
+                "shot_id": shot.get("shot_id", f"shot_{idx + 1:03d}"),
+                "cmds": cmds,
+                "hash_file": hash_file,
+                "cache_key": cache_key,
+            }
+        )
 
-    # Step 1: Frame-locked video timeline via explicit timeline_cursor + xfade offsets
+    def _exec_shot_job(job: dict[str, Any]) -> None:
+        for cmd in job["cmds"]:
+            res = _run(cmd, timeout=300)
+            if res.returncode != 0:
+                raise RuntimeError(f"Shot {job['idx'] + 1} ({job['shot_id']}) render failed:\n{res.stderr}")
+        job["hash_file"].write_text(job["cache_key"] + "\n", encoding="utf-8")
+
+    if not dry_run and shot_jobs:
+        if workers > 1 and len(shot_jobs) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_exec_shot_job, job) for job in shot_jobs]
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            for job in shot_jobs:
+                _exec_shot_job(job)
+
+    # Probe exact rendered duration of every shot_NNN.mp4 before computing xfade offsets
+    if dry_run:
+        probed_durations = list(target_durations)
+    else:
+        probed_durations = [
+            _probe_clip_duration(clip_paths[idx], fallback=target_durations[idx])
+            for idx in range(len(shots))
+        ]
+
+    # Step 1: Cut-aligned segment video assembly (~10-15 shots per segment + lossless -c copy concat)
     video_timeline = work_dir / "timeline_video.mp4"
-    video_cmd, shot_starts, total_dur = _build_video_timeline_cmd(
-        shots=shots,
-        clip_paths=clip_paths,
-        shot_durations=shot_durations,
-        video_timeline=video_timeline,
-        fps=fps,
-        style_pack=style_pack,
-        avail_filters=avail_filters,
-    )
-    planned_cmds.append(video_cmd)
-    if not dry_run:
-        res = _run(video_cmd, timeout=600)
-        if res.returncode != 0:
-            raise RuntimeError(f"Video timeline assembly failed:\n{res.stderr}")
+    segments = _partition_cut_aligned_segments(shots, target_size=12, max_size=15, has_xfade=("xfade" in avail_filters))
+    shot_starts: list[float] = []
+    segment_reports: list[dict[str, Any]] = []
+
+    if len(segments) == 1:
+        video_cmd, shot_starts, total_dur = _build_video_timeline_cmd(
+            shots=shots,
+            clip_paths=clip_paths,
+            shot_durations=probed_durations,
+            video_timeline=video_timeline,
+            fps=fps,
+            style_pack=style_pack,
+            avail_filters=avail_filters,
+        )
+        planned_cmds.append(video_cmd)
+        if not dry_run:
+            res = _run(video_cmd, timeout=600)
+            if res.returncode != 0:
+                raise RuntimeError(f"Video timeline assembly failed:\n{res.stderr}")
+            total_dur = _probe_clip_duration(video_timeline, fallback=total_dur)
+        segment_reports.append({"segment": 1, "shots": [0, len(shots)], "duration_sec": round(total_dur, 3)})
+    else:
+        seg_dir = work_dir / "timeline_segments"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        seg_paths: list[Path] = []
+        seg_offset = 0.0
+        for seg_idx, (s0, s1) in enumerate(segments):
+            seg_out = seg_dir / f"seg_{seg_idx + 1:03d}.mp4"
+            seg_paths.append(seg_out)
+            seg_cmd, local_starts, seg_dur = _build_video_timeline_cmd(
+                shots=shots[s0:s1],
+                clip_paths=clip_paths[s0:s1],
+                shot_durations=probed_durations[s0:s1],
+                video_timeline=seg_out,
+                fps=fps,
+                style_pack=style_pack,
+                avail_filters=avail_filters,
+            )
+            planned_cmds.append(seg_cmd)
+            if not dry_run:
+                res = _run(seg_cmd, timeout=600)
+                if res.returncode != 0:
+                    raise RuntimeError(f"Video timeline segment {seg_idx + 1} (shots {s0}..{s1}) failed:\n{res.stderr}")
+                seg_dur = _probe_clip_duration(seg_out, fallback=seg_dur)
+            shot_starts.extend(seg_offset + t for t in local_starts)
+            seg_offset += seg_dur
+            segment_reports.append({"segment": seg_idx + 1, "shots": [s0, s1], "duration_sec": round(seg_dur, 3)})
+
+        concat_list = seg_dir / "concat_list.txt"
+        concat_lines = [f"file '{str(sp.resolve()).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'" for sp in seg_paths]
+        if not dry_run:
+            concat_list.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy", "-movflags", "+faststart",
+            str(video_timeline),
+        ]
+        planned_cmds.append(concat_cmd)
+        if not dry_run:
+            res = _run(concat_cmd, timeout=300)
+            if res.returncode != 0:
+                raise RuntimeError(f"Lossless segment concat failed:\n{res.stderr}")
+            total_dur = _probe_clip_duration(video_timeline, fallback=seg_offset)
+        else:
+            total_dur = seg_offset
 
     # Step 2: Frame-locked 4-track audio mix (NAT_A / NAT_B / BGM w/ sonic_postcard ducking / SFX)
     mixed_av = work_dir / "timeline_mixed.mp4"
@@ -1692,7 +2569,7 @@ def render_trip(
         edl=edl,
         shots=shots,
         shot_starts=shot_starts,
-        shot_durations=shot_durations,
+        shot_durations=probed_durations,
         total_dur=total_dur,
         video_timeline=video_timeline,
         mixed_output=mixed_av,
@@ -1710,35 +2587,55 @@ def render_trip(
     loudnorm_cmds = _two_pass_loudnorm(mixed_av, output_master, dry_run=dry_run)
     planned_cmds.extend(loudnorm_cmds)
 
-    return {
+    report = {
         "status": "dry_run" if dry_run else "rendered",
+        "renderer_version": RENDERER_VERSION,
         "output_master": str(output_master),
         "shot_count": len(shots),
         "style_id": style_id,
         "look_id": look_id,
+        "workers": workers,
+        "reuse_cache": reuse_cache,
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "segments": segment_reports,
         "estimated_duration_sec": round(total_dur, 3),
         "shot_starts_sec": [round(t, 3) for t in shot_starts],
+        "probed_durations": [round(d, 4) for d in probed_durations],
         "command_count": len(planned_cmds),
         "commands": planned_cmds if dry_run else None,
     }
+    if not dry_run:
+        (work_dir / "render_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Deterministic FFmpeg master renderer and QA extractor (v0.2.0).")
-    parser.add_argument("--edl", help="Path to validated EDL JSON file.")
+    parser = argparse.ArgumentParser(description="Deterministic FFmpeg master renderer and QA extractor (v0.2.1).")
+    parser.add_argument("--edl", help="Path to validated EDL JSON file (used for rendering and EDL-aware --extract-qa).")
     parser.add_argument("--output", "-o", default="./work/trip_master_1080p.mp4", help="Output master MP4 path.")
     parser.add_argument("--work-dir", default="./work", help="Working directory for intermediate clips.")
     parser.add_argument("--width", type=int, default=None, help="Output width (defaults to EDL resolution or 1920).")
     parser.add_argument("--height", type=int, default=None, help="Output height (defaults to EDL resolution or 1080).")
     parser.add_argument("--fps", type=int, default=None, help="Output frame rate (defaults to EDL fps or 30).")
     parser.add_argument("--stabilize", action="store_true", help="Enable 2-pass vidstab stabilization on video clips.")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel shot rendering worker count (default: 1).")
+    parser.add_argument("--reuse-cache", action="store_true", help="Reuse unchanged rendered shot_NNN.mp4 clips via content hash.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned FFmpeg commands without rendering.")
-    parser.add_argument("--extract-qa", help="Path to rendered MP4 to extract -sseof -0.05 frame + <=60s QA chunks.")
+    parser.add_argument("--extract-qa", help="Path to rendered MP4 to extract QA sheets, transitions, collages, telemetry, and <=60s chunks.")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir).resolve()
     if args.extract_qa:
-        qa_report = extract_qa_artifacts(Path(args.extract_qa).expanduser().resolve(), work_dir / "qa")
+        edl_obj = json.loads(Path(args.edl).expanduser().resolve().read_text(encoding="utf-8")) if args.edl else None
+        rep_path = work_dir / "render_report.json"
+        render_rep = json.loads(rep_path.read_text(encoding="utf-8")) if rep_path.is_file() else None
+        qa_report = extract_qa_artifacts(
+            Path(args.extract_qa).expanduser().resolve(),
+            work_dir / "qa",
+            edl=edl_obj,
+            render_report=render_rep,
+        )
         print(json.dumps(qa_report, indent=2))
         return 0
 
@@ -1774,6 +2671,8 @@ def main() -> int:
         fps=fps,
         stabilize=args.stabilize,
         dry_run=args.dry_run,
+        workers=args.workers,
+        reuse_cache=args.reuse_cache,
     )
     print(json.dumps(report, indent=2))
     return 0

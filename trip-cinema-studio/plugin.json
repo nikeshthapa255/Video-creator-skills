@@ -1,7 +1,7 @@
 {
   "name": "trip-cinema-studio",
   "displayName": "Trip Cinema Studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "repository": "https://github.com/nikeshthapa255/Video-creator-skills",
   "description": "Turn raw trip photos and 80%-video 4K clips into a styled 16:9 (or 9:16 teaser) cinematic travel film with 7 declarative Style Packs, Video-First Timeline Strips, closed-form speed ramps, multi-video grids, 4-track J/L-cut audio, and chunked multimodal QA.",
   "suggestedPrompts": [
